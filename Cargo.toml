@@ -1,0 +1,28 @@
+[package]
+name = "transglass"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Shell",
+    "Win32_System_Console"
+] }
+lazy_static = "1.4"
+dashmap = "5.5"
+self_update = "0.39"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+eframe = "0.28" # 强大的 GUI 框架
+tray-icon = "0.19" # 系统托盘支持
+image = "0.25" # 图像处理，用于托盘图标
+raw-window-handle = "0.6"
+
+[build-dependencies]
+embed-manifest = "1.0"
