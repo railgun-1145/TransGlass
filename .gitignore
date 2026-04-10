@@ -1,0 +1,24 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Rust / Cargo
+target/
+**/target/
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
