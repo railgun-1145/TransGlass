@@ -213,6 +213,7 @@ unsafe fn is_own_hwnd(hwnd: HWND) -> bool {
 // --- 事件钩子 ---
 // --- GUI 应用程序 ---
 struct TransGlassApp {
+    #[allow(dead_code)]
     config: HotkeyConfig,
     should_exit: bool,
 }
@@ -270,11 +271,8 @@ impl TransGlassApp {
         let _ = EGUI_CTX.set(cc.egui_ctx.clone());
 
         if let Ok(handle) = cc.window_handle() {
-            match handle.as_raw() {
-                RawWindowHandle::Win32(h) => {
-                    ROOT_HWND.store(h.hwnd.get(), Ordering::Relaxed);
-                }
-                _ => {}
+            if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                ROOT_HWND.store(h.hwnd.get(), Ordering::Relaxed);
             }
         }
 
@@ -290,11 +288,9 @@ impl eframe::App for TransGlassApp {
         // 1. 处理托盘和菜单事件 (逻辑保持不变)
 
         // 2. 拦截关闭
-        if ctx.input(|i| i.viewport().close_requested()) {
-            if !self.should_exit {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                hide_root_window();
-            }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.should_exit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            hide_root_window();
         }
 
         if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
@@ -402,7 +398,7 @@ impl eframe::App for TransGlassApp {
             ui.add_space(15.0);
             ui.separator();
             ui.add_space(10.0);
-            
+
             // 底部控制
             ui.horizontal(|ui| {
                 if ui.button("♻ 全部还原").clicked() {
@@ -414,7 +410,7 @@ impl eframe::App for TransGlassApp {
                     }
                 });
             });
-            
+
             ui.add_space(12.0);
             ui.group(|ui| {
                 ui.vertical_centered(|ui| {
@@ -516,43 +512,40 @@ fn main() -> Result<(), eframe::Error> {
         let _ = windows::Win32::System::Console::FreeConsole();
     }
 
-    thread::spawn(|| loop {
-        let event = match MenuEvent::receiver().recv() {
-            Ok(e) => e,
-            Err(_) => break,
-        };
-        match event.id.0.as_str() {
-            "show" => {
-                show_root_window();
-            }
-            "reset_all" => unsafe { restore_all_windows() },
-            "exit" => {
-                if EXITING.swap(true, Ordering::SeqCst) {
-                    continue;
+    thread::spawn(|| {
+        while let Ok(event) = MenuEvent::receiver().recv() {
+            match event.id.0.as_str() {
+                "show" => {
+                    show_root_window();
                 }
-                thread::spawn(|| unsafe { restore_all_windows() });
-                unsafe { ExitProcess(0) };
+                "reset_all" => unsafe { restore_all_windows() },
+                "exit" => {
+                    if EXITING.swap(true, Ordering::SeqCst) {
+                        continue;
+                    }
+                    unsafe { restore_all_windows() };
+                    thread::sleep(std::time::Duration::from_millis(150));
+                    unsafe { ExitProcess(0) };
+                }
+                _ => {}
             }
-            _ => {}
         }
     });
 
-    thread::spawn(|| loop {
-        let event = match TrayIconEvent::receiver().recv() {
-            Ok(e) => e,
-            Err(_) => break,
-        };
-        if matches!(
-            event,
-            TrayIconEvent::Click {
-                button: MouseButton::Left,
-                ..
-            } | TrayIconEvent::DoubleClick {
-                button: MouseButton::Left,
-                ..
+    thread::spawn(|| {
+        while let Ok(event) = TrayIconEvent::receiver().recv() {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    ..
+                } | TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                }
+            ) {
+                show_root_window();
             }
-        ) {
-            show_root_window();
         }
     });
 
