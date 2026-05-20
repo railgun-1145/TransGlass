@@ -316,7 +316,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                     );
                 }
                 let hwnd = GetAncestor(hit, GA_ROOT);
-                if hwnd.0.is_null() || is_own_hwnd(hwnd) {
+                if hwnd.0.is_null() || is_own_hwnd(hwnd) || is_shell_hwnd(hwnd) {
                     return CallNextHookEx(
                         HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
                         code,
@@ -487,6 +487,9 @@ unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), Strin
     if is_own_hwnd(hwnd) {
         return Ok(());
     }
+    if is_shell_hwnd(hwnd) {
+        return Ok(());
+    }
     let hwnd_val = hwnd.0 as isize;
 
     let mut state = if let Some(s) = GLOBAL_REGISTRY.get_mut(&hwnd_val) {
@@ -567,6 +570,9 @@ unsafe fn toggle_topmost(hwnd: HWND) {
     if is_own_hwnd(hwnd) {
         return;
     }
+    if is_shell_hwnd(hwnd) {
+        return;
+    }
     if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&(hwnd.0 as isize)) {
         state.user_pref_topmost = !state.user_pref_topmost;
         let _ = apply_transparency_to_hwnd(
@@ -585,6 +591,9 @@ unsafe fn toggle_mouse_passthrough(hwnd: HWND) {
         return;
     }
     if is_own_hwnd(hwnd) {
+        return;
+    }
+    if is_shell_hwnd(hwnd) {
         return;
     }
     let hwnd_val = hwnd.0 as isize;
@@ -623,6 +632,9 @@ unsafe fn toggle_pen_passthrough(hwnd: HWND) {
         return;
     }
     if is_own_hwnd(hwnd) {
+        return;
+    }
+    if is_shell_hwnd(hwnd) {
         return;
     }
     let hwnd_val = hwnd.0 as isize;
@@ -684,6 +696,31 @@ unsafe fn restore_all_windows() {
         restore_window(HWND(hwnd_val as *mut _));
     }
     request_ui_repaint();
+}
+
+unsafe fn is_shell_hwnd(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+    let desktop = GetDesktopWindow();
+    if !desktop.0.is_null() && hwnd.0 == desktop.0 {
+        return true;
+    }
+    let shell = GetShellWindow();
+    if !shell.0.is_null() && hwnd.0 == shell.0 {
+        return true;
+    }
+
+    let mut class_buf: [u16; 256] = [0; 256];
+    let len = GetClassNameW(hwnd, &mut class_buf);
+    if len <= 0 {
+        return false;
+    }
+    let name = String::from_utf16_lossy(&class_buf[..len as usize]);
+    matches!(
+        name.as_str(),
+        "Progman" | "WorkerW" | "Shell_TrayWnd" | "NotifyIconOverflowWindow"
+    )
 }
 
 unsafe fn is_own_hwnd(hwnd: HWND) -> bool {
@@ -1042,6 +1079,10 @@ impl eframe::App for TransGlassApp {
 
                     for (hwnd_val, state) in entries {
                         if unsafe { is_own_hwnd(HWND(hwnd_val as *mut _)) } {
+                            continue;
+                        }
+                        if unsafe { is_shell_hwnd(HWND(hwnd_val as *mut _)) } {
+                            to_restore.push(hwnd_val);
                             continue;
                         }
 
