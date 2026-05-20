@@ -247,37 +247,26 @@ unsafe fn uninstall_mouse_hook() {
     }
 }
 
-struct ExStyleRestoreGuard {
-    hwnd: HWND,
-    orig: u32,
-}
-
-impl Drop for ExStyleRestoreGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = SetWindowLongW(self.hwnd, GWL_EXSTYLE, self.orig as i32);
-        }
+unsafe fn set_hwnd_mouse_transparent(hwnd: HWND, enabled: bool) {
+    let current = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    let next = if enabled {
+        current | WS_EX_TRANSPARENT.0
+    } else {
+        current & !WS_EX_TRANSPARENT.0
+    };
+    if next == current {
+        return;
     }
-}
-
-unsafe fn screen_point_to_absolute(pt: POINT) -> (i32, i32) {
-    let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1);
-    let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1);
-
-    let rx = (pt.x - vx).clamp(0, vw - 1);
-    let ry = (pt.y - vy).clamp(0, vh - 1);
-
-    let dx = ((rx as i64) * 65535 / (vw as i64 - 1).max(1)) as i32;
-    let dy = ((ry as i64) * 65535 / (vh as i64 - 1).max(1)) as i32;
-    (dx, dy)
-}
-
-unsafe fn any_mouse_button_down() -> bool {
-    GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0
-        || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0
-        || GetAsyncKeyState(VK_MBUTTON.0 as i32) < 0
+    let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, next as i32);
+    let _ = SetWindowPos(
+        hwnd,
+        HWND(0 as *mut _),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER,
+    );
 }
 
 unsafe fn is_pen_input(info: &MSLLHOOKSTRUCT) -> bool {
@@ -380,84 +369,53 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                 | WM_MOUSEHWHEEL
                 | WM_MOUSEMOVE
         ) {
+            if GLOBAL_REGISTRY.is_empty() {
+                return CallNextHookEx(
+                    HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+                    code,
+                    wparam,
+                    lparam,
+                );
+            }
+
             let pt = POINT {
                 x: info.pt.x,
                 y: info.pt.y,
             };
             let hit = WindowFromPoint(pt);
-            if !hit.0.is_null() {
-                let root = GetAncestor(hit, GA_ROOT);
-                let root_val = root.0 as isize;
-                if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
+            if hit.0.is_null() {
+                return CallNextHookEx(
+                    HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+                    code,
+                    wparam,
+                    lparam,
+                );
+            }
+
+            let root = GetAncestor(hit, GA_ROOT);
+            if root.0.is_null() {
+                return CallNextHookEx(
+                    HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+                    code,
+                    wparam,
+                    lparam,
+                );
+            }
+
+            let root_val = root.0 as isize;
+            if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
+                if state.mouse_passthrough != state.pen_passthrough {
                     let is_pen = match get_input_mode() {
                         InputMode::Auto => is_pen_input(&info),
                         InputMode::ForceMouse => false,
                         InputMode::ForcePen => true,
                     };
-                    let wants = if is_pen {
+                    let passthrough = if is_pen {
                         state.pen_passthrough
                     } else {
                         state.mouse_passthrough
                     };
-                    let all = state.mouse_passthrough && state.pen_passthrough;
-                    if wants && !all {
-                        if msg == WM_MOUSEMOVE && !any_mouse_button_down() {
-                            return CallNextHookEx(
-                                HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
-                                code,
-                                wparam,
-                                lparam,
-                            );
-                        }
-
-                        let orig = GetWindowLongW(root, GWL_EXSTYLE) as u32;
-                        let _guard = ExStyleRestoreGuard { hwnd: root, orig };
-                        let _ = SetWindowLongW(
-                            root,
-                            GWL_EXSTYLE,
-                            (orig | WS_EX_TRANSPARENT.0) as i32,
-                        );
-                        let _ = SetWindowPos(
-                            root,
-                            HWND(0 as *mut _),
-                            0,
-                            0,
-                            0,
-                            0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                        );
-
-                        let (dx, dy) = screen_point_to_absolute(pt);
-                        let wheel_delta = ((info.mouseData >> 16) as i16) as i32;
-                        let (flags, mouse_data) = match msg {
-                            WM_LBUTTONDOWN => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN, 0),
-                            WM_LBUTTONUP => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP, 0),
-                            WM_RBUTTONDOWN => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_RIGHTDOWN, 0),
-                            WM_RBUTTONUP => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_RIGHTUP, 0),
-                            WM_MBUTTONDOWN => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_MIDDLEDOWN, 0),
-                            WM_MBUTTONUP => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_MIDDLEUP, 0),
-                            WM_MOUSEWHEEL => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_WHEEL, wheel_delta as u32),
-                            WM_MOUSEHWHEEL => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_HWHEEL, wheel_delta as u32),
-                            WM_MOUSEMOVE => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE, 0),
-                            _ => (MOUSE_EVENT_FLAGS(0), 0),
-                        };
-
-                        let inp = INPUT {
-                            r#type: INPUT_MOUSE,
-                            Anonymous: INPUT_0 {
-                                mi: MOUSEINPUT {
-                                    dx,
-                                    dy,
-                                    mouseData: mouse_data,
-                                    dwFlags: flags,
-                                    time: 0,
-                                    dwExtraInfo: TRANSG_GLASS_INJECT_EXTRA_INFO,
-                                },
-                            },
-                        };
-                        let _ = SendInput(&[inp], std::mem::size_of::<INPUT>() as i32);
-                        return LRESULT(1);
-                    }
+                    set_hwnd_mouse_transparent(root, passthrough);
                 }
             }
         }
@@ -577,7 +535,7 @@ unsafe fn apply_transparency_to_hwnd(
     let mut next_style = current_style | WS_EX_LAYERED.0;
     if mouse_passthrough && pen_passthrough {
         next_style |= WS_EX_TRANSPARENT.0;
-    } else {
+    } else if !mouse_passthrough && !pen_passthrough {
         next_style &= !WS_EX_TRANSPARENT.0;
     }
     if next_style != current_style {
