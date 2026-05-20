@@ -8,41 +8,466 @@ use self_update::backends::github::Update;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
 use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::thread;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Threading::*;
+use windows::Win32::UI::Input::{GetCurrentInputMessageSource, INPUT_MESSAGE_SOURCE, IMDT_PEN};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // --- 核心状态注册表 ---
 #[derive(Clone)]
-pub struct WindowState {
-    pub original_ex_style: u32,
-    pub current_alpha: u8,
-    pub original_is_topmost: bool,
-    pub user_pref_topmost: bool,
-    pub title: String,
+struct WindowState {
+    original_ex_style: u32,
+    current_alpha: u8,
+    original_is_topmost: bool,
+    user_pref_topmost: bool,
+    mouse_passthrough: bool,
+    pen_passthrough: bool,
+    title: String,
 }
 
 lazy_static! {
     static ref GLOBAL_REGISTRY: DashMap<isize, WindowState> = DashMap::new();
+    static ref MOUSE_BINDINGS: RwLock<MouseBindings> = RwLock::new(MouseBindings::default());
+}
+
+#[derive(Clone, Copy)]
+struct PendingChange {
+    hwnd_val: isize,
+    alpha: Option<u8>,
+    topmost: Option<bool>,
+    mouse_passthrough: Option<bool>,
+    pen_passthrough: Option<bool>,
 }
 
 static EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
 static WINDOW_VISIBLE: AtomicBool = AtomicBool::new(true);
 static EXITING: AtomicBool = AtomicBool::new(false);
+static APP_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static ROOT_HWND: AtomicIsize = AtomicIsize::new(0);
+static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
+static HOTKEY_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+static INPUT_MODE: AtomicI32 = AtomicI32::new(0);
+const TRANSG_GLASS_INJECT_EXTRA_INFO: usize = 0x5452474Cu64 as usize;
+const WM_RELOAD_HOTKEYS: u32 = WM_APP + 77;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    Auto = 0,
+    ForceMouse = 1,
+    ForcePen = 2,
+}
+
+fn get_input_mode() -> InputMode {
+    match INPUT_MODE.load(Ordering::Relaxed) {
+        1 => InputMode::ForceMouse,
+        2 => InputMode::ForcePen,
+        _ => InputMode::Auto,
+    }
+}
+
+fn input_mode_label() -> &'static str {
+    match get_input_mode() {
+        InputMode::Auto => "自动",
+        InputMode::ForceMouse => "强制鼠标",
+        InputMode::ForcePen => "强制笔",
+    }
+}
+
+fn cycle_input_mode() {
+    let next = match get_input_mode() {
+        InputMode::Auto => InputMode::ForceMouse,
+        InputMode::ForceMouse => InputMode::ForcePen,
+        InputMode::ForcePen => InputMode::Auto,
+    };
+    INPUT_MODE.store(next as i32, Ordering::Relaxed);
+    request_ui_repaint();
+}
+
+fn request_app_exit() {
+    APP_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+    let hwnd_val = ROOT_HWND.load(Ordering::Relaxed);
+    if hwnd_val != 0 {
+        let hwnd = HWND(hwnd_val as *mut _);
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+    if let Some(ctx) = EGUI_CTX.get() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ctx.request_repaint();
+    }
+}
+
+struct SingleInstanceGuard(HANDLE);
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.0.is_invalid() {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+unsafe fn focus_existing_instance_window() -> bool {
+    let title = windows::core::w!("TransGlass 控制面板");
+    for _ in 0..40 {
+        if let Ok(hwnd) = FindWindowW(PCWSTR::null(), title) {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+            return true;
+        }
+        Sleep(50);
+    }
+    false
+}
+
+fn request_hotkey_reload() {
+    let tid = HOTKEY_THREAD_ID.load(Ordering::Relaxed);
+    if tid != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(tid, WM_RELOAD_HOTKEYS, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+unsafe fn acquire_single_instance() -> Option<SingleInstanceGuard> {
+    let name = windows::core::w!("Local\\TransGlass_SingleInstance_C1E0B6B4-18A0-4D5D-9D7A-2C5DFD4D0A2F");
+    if let Ok(handle) = CreateMutexW(None, true, name) {
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(handle);
+            let _ = focus_existing_instance_window();
+            ExitProcess(0);
+        }
+        return Some(SingleInstanceGuard(handle));
+    }
+    None
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MouseAction {
+    None,
+    Increase,
+    Decrease,
+    ToggleTopmost,
+    ToggleClickThrough,
+    TogglePenPassthrough,
+    CycleInputMode,
+    ResetCurrent,
+    ResetAll,
+    Update,
+}
+
+#[derive(Clone, Copy)]
+struct MouseBindings {
+    xbutton1: MouseAction,
+    xbutton2: MouseAction,
+}
+
+impl Default for MouseBindings {
+    fn default() -> Self {
+        Self {
+            xbutton1: MouseAction::Decrease,
+            xbutton2: MouseAction::Increase,
+        }
+    }
+}
 
 fn request_ui_repaint() {
     if let Some(ctx) = EGUI_CTX.get() {
         ctx.request_repaint();
     }
+}
+
+fn parse_mouse_action(s: &str) -> MouseAction {
+    match s.trim().to_lowercase().as_str() {
+        "increase" | "inc" | "up" => MouseAction::Increase,
+        "decrease" | "dec" | "down" => MouseAction::Decrease,
+        "toggle_topmost" | "topmost" | "toggle_top" => MouseAction::ToggleTopmost,
+        "toggle_click_through" | "toggle_mouse_passthrough" | "click_through" | "toggle_click" => {
+            MouseAction::ToggleClickThrough
+        }
+        "toggle_pen_passthrough" | "pen_passthrough" => MouseAction::TogglePenPassthrough,
+        "cycle_input_mode" | "toggle_input_mode" | "input_mode" => MouseAction::CycleInputMode,
+        "reset_current" | "reset" => MouseAction::ResetCurrent,
+        "reset_all" => MouseAction::ResetAll,
+        "update" => MouseAction::Update,
+        _ => MouseAction::None,
+    }
+}
+
+fn set_mouse_bindings(cfg: &HotkeyConfig) {
+    let mut b = MouseBindings::default();
+    if let Some(spec) = cfg.mouse.as_ref() {
+        if let Some(s) = spec.xbutton1.as_ref() {
+            b.xbutton1 = parse_mouse_action(s);
+        }
+        if let Some(s) = spec.xbutton2.as_ref() {
+            b.xbutton2 = parse_mouse_action(s);
+        }
+    }
+    if let Ok(mut w) = MOUSE_BINDINGS.write() {
+        *w = b;
+    }
+}
+
+unsafe fn install_mouse_hook() {
+    if MOUSE_HOOK.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+    let hook = SetWindowsHookExW(
+        WH_MOUSE_LL,
+        Some(mouse_hook_proc),
+        HINSTANCE(std::ptr::null_mut()),
+        0,
+    );
+    if let Ok(hook) = hook {
+        if !hook.0.is_null() {
+            MOUSE_HOOK.store(hook.0 as isize, Ordering::SeqCst);
+        }
+    }
+}
+
+unsafe fn uninstall_mouse_hook() {
+    let hook = MOUSE_HOOK.swap(0, Ordering::SeqCst);
+    if hook != 0 {
+        let _ = UnhookWindowsHookEx(HHOOK(hook as *mut _));
+    }
+}
+
+struct ExStyleRestoreGuard {
+    hwnd: HWND,
+    orig: u32,
+}
+
+impl Drop for ExStyleRestoreGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SetWindowLongW(self.hwnd, GWL_EXSTYLE, self.orig as i32);
+        }
+    }
+}
+
+unsafe fn screen_point_to_absolute(pt: POINT) -> (i32, i32) {
+    let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1);
+    let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1);
+
+    let rx = (pt.x - vx).clamp(0, vw - 1);
+    let ry = (pt.y - vy).clamp(0, vh - 1);
+
+    let dx = ((rx as i64) * 65535 / (vw as i64 - 1).max(1)) as i32;
+    let dy = ((ry as i64) * 65535 / (vh as i64 - 1).max(1)) as i32;
+    (dx, dy)
+}
+
+unsafe fn any_mouse_button_down() -> bool {
+    GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0
+        || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0
+        || GetAsyncKeyState(VK_MBUTTON.0 as i32) < 0
+}
+
+unsafe fn is_pen_input(info: &MSLLHOOKSTRUCT) -> bool {
+    let mut src = INPUT_MESSAGE_SOURCE::default();
+    if GetCurrentInputMessageSource(&mut src).is_ok() {
+        return src.deviceType == IMDT_PEN;
+    }
+    (info.dwExtraInfo & 0xFFFFFF00) == 0xFF515700
+}
+
+unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let msg = wparam.0 as u32;
+        let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
+        if info.dwExtraInfo == TRANSG_GLASS_INJECT_EXTRA_INFO {
+            return CallNextHookEx(
+                HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+                code,
+                wparam,
+                lparam,
+            );
+        }
+
+        if msg == WM_XBUTTONDOWN {
+            let button = ((info.mouseData >> 16) & 0xffff) as u16;
+            let action = if let Ok(r) = MOUSE_BINDINGS.read() {
+                match button {
+                    1 => r.xbutton1,
+                    2 => r.xbutton2,
+                    _ => MouseAction::None,
+                }
+            } else {
+                MouseAction::None
+            };
+            if action != MouseAction::None {
+                let pt = POINT {
+                    x: info.pt.x,
+                    y: info.pt.y,
+                };
+                let hit = WindowFromPoint(pt);
+                if hit.0.is_null() {
+                    return CallNextHookEx(
+                        HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+                        code,
+                        wparam,
+                        lparam,
+                    );
+                }
+                let hwnd = GetAncestor(hit, GA_ROOT);
+                if hwnd.0.is_null() || is_own_hwnd(hwnd) {
+                    return CallNextHookEx(
+                        HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+                        code,
+                        wparam,
+                        lparam,
+                    );
+                }
+                match action {
+                    MouseAction::Increase => {
+                        let _ = adjust_window_transparency(hwnd, 25);
+                    }
+                    MouseAction::Decrease => {
+                        let _ = adjust_window_transparency(hwnd, -25);
+                    }
+                    MouseAction::ToggleTopmost => {
+                        toggle_topmost(hwnd);
+                    }
+                    MouseAction::ToggleClickThrough => {
+                        toggle_mouse_passthrough(hwnd);
+                    }
+                    MouseAction::TogglePenPassthrough => {
+                        toggle_pen_passthrough(hwnd);
+                    }
+                    MouseAction::CycleInputMode => {
+                        cycle_input_mode();
+                    }
+                    MouseAction::ResetCurrent => {
+                        restore_window(hwnd);
+                    }
+                    MouseAction::ResetAll => {
+                        restore_all_windows();
+                    }
+                    MouseAction::Update => {
+                        thread::spawn(|| {
+                            let _ = run_self_update();
+                        });
+                    }
+                    MouseAction::None => {}
+                }
+            }
+        } else if matches!(
+            msg,
+            WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_RBUTTONDOWN
+                | WM_RBUTTONUP
+                | WM_MBUTTONDOWN
+                | WM_MBUTTONUP
+                | WM_MOUSEWHEEL
+                | WM_MOUSEHWHEEL
+                | WM_MOUSEMOVE
+        ) {
+            let pt = POINT {
+                x: info.pt.x,
+                y: info.pt.y,
+            };
+            let hit = WindowFromPoint(pt);
+            if !hit.0.is_null() {
+                let root = GetAncestor(hit, GA_ROOT);
+                let root_val = root.0 as isize;
+                if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
+                    let is_pen = match get_input_mode() {
+                        InputMode::Auto => is_pen_input(&info),
+                        InputMode::ForceMouse => false,
+                        InputMode::ForcePen => true,
+                    };
+                    let wants = if is_pen {
+                        state.pen_passthrough
+                    } else {
+                        state.mouse_passthrough
+                    };
+                    let all = state.mouse_passthrough && state.pen_passthrough;
+                    if wants && !all {
+                        if msg == WM_MOUSEMOVE && !any_mouse_button_down() {
+                            return CallNextHookEx(
+                                HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+                                code,
+                                wparam,
+                                lparam,
+                            );
+                        }
+
+                        let orig = GetWindowLongW(root, GWL_EXSTYLE) as u32;
+                        let _guard = ExStyleRestoreGuard { hwnd: root, orig };
+                        let _ = SetWindowLongW(
+                            root,
+                            GWL_EXSTYLE,
+                            (orig | WS_EX_TRANSPARENT.0) as i32,
+                        );
+                        let _ = SetWindowPos(
+                            root,
+                            HWND(0 as *mut _),
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                        );
+
+                        let (dx, dy) = screen_point_to_absolute(pt);
+                        let wheel_delta = ((info.mouseData >> 16) as i16) as i32;
+                        let (flags, mouse_data) = match msg {
+                            WM_LBUTTONDOWN => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN, 0),
+                            WM_LBUTTONUP => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP, 0),
+                            WM_RBUTTONDOWN => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_RIGHTDOWN, 0),
+                            WM_RBUTTONUP => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_RIGHTUP, 0),
+                            WM_MBUTTONDOWN => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_MIDDLEDOWN, 0),
+                            WM_MBUTTONUP => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_MIDDLEUP, 0),
+                            WM_MOUSEWHEEL => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_WHEEL, wheel_delta as u32),
+                            WM_MOUSEHWHEEL => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_HWHEEL, wheel_delta as u32),
+                            WM_MOUSEMOVE => (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE, 0),
+                            _ => (MOUSE_EVENT_FLAGS(0), 0),
+                        };
+
+                        let inp = INPUT {
+                            r#type: INPUT_MOUSE,
+                            Anonymous: INPUT_0 {
+                                mi: MOUSEINPUT {
+                                    dx,
+                                    dy,
+                                    mouseData: mouse_data,
+                                    dwFlags: flags,
+                                    time: 0,
+                                    dwExtraInfo: TRANSG_GLASS_INJECT_EXTRA_INFO,
+                                },
+                            },
+                        };
+                        let _ = SendInput(&[inp], std::mem::size_of::<INPUT>() as i32);
+                        return LRESULT(1);
+                    }
+                }
+            }
+        }
+    }
+    CallNextHookEx(
+        HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+        code,
+        wparam,
+        lparam,
+    )
 }
 
 fn show_root_window() {
@@ -87,7 +512,7 @@ fn hide_root_window() {
 
 // --- 底层核心逻辑 ---
 
-pub unsafe fn get_window_title(hwnd: HWND) -> String {
+unsafe fn get_window_title(hwnd: HWND) -> String {
     let mut text: [u16; 512] = [0; 512];
     let len = GetWindowTextW(hwnd, &mut text);
     if len > 0 {
@@ -97,7 +522,7 @@ pub unsafe fn get_window_title(hwnd: HWND) -> String {
     }
 }
 
-pub unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), String> {
+unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), String> {
     if hwnd.0.is_null() {
         return Err("Invalid HWND".into());
     }
@@ -119,6 +544,8 @@ pub unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), S
                 current_alpha: 255,
                 original_is_topmost: is_top,
                 user_pref_topmost: is_top,
+                mouse_passthrough: false,
+                pen_passthrough: false,
                 title,
             },
         );
@@ -128,15 +555,33 @@ pub unsafe fn adjust_window_transparency(hwnd: HWND, delta: i32) -> Result<(), S
     let new_alpha = (state.current_alpha as i32 + delta).clamp(30, 255) as u8;
     state.current_alpha = new_alpha;
 
-    apply_transparency_to_hwnd(hwnd, new_alpha, state.user_pref_topmost)?;
+    apply_transparency_to_hwnd(
+        hwnd,
+        new_alpha,
+        state.user_pref_topmost,
+        state.mouse_passthrough,
+        state.pen_passthrough,
+    )?;
     request_ui_repaint();
     Ok(())
 }
 
-unsafe fn apply_transparency_to_hwnd(hwnd: HWND, alpha: u8, topmost: bool) -> Result<(), String> {
+unsafe fn apply_transparency_to_hwnd(
+    hwnd: HWND,
+    alpha: u8,
+    topmost: bool,
+    mouse_passthrough: bool,
+    pen_passthrough: bool,
+) -> Result<(), String> {
     let current_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-    if (current_style & WS_EX_LAYERED.0) == 0 {
-        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, (current_style | WS_EX_LAYERED.0) as i32);
+    let mut next_style = current_style | WS_EX_LAYERED.0;
+    if mouse_passthrough && pen_passthrough {
+        next_style |= WS_EX_TRANSPARENT.0;
+    } else {
+        next_style &= !WS_EX_TRANSPARENT.0;
+    }
+    if next_style != current_style {
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, next_style as i32);
     }
     SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA).map_err(|e| e.to_string())?;
 
@@ -152,12 +597,12 @@ unsafe fn apply_transparency_to_hwnd(hwnd: HWND, alpha: u8, topmost: bool) -> Re
         0,
         0,
         0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS | SWP_FRAMECHANGED,
     );
     Ok(())
 }
 
-pub unsafe fn toggle_topmost(hwnd: HWND) {
+unsafe fn toggle_topmost(hwnd: HWND) {
     if hwnd.0.is_null() {
         return;
     }
@@ -166,12 +611,94 @@ pub unsafe fn toggle_topmost(hwnd: HWND) {
     }
     if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&(hwnd.0 as isize)) {
         state.user_pref_topmost = !state.user_pref_topmost;
-        let _ = apply_transparency_to_hwnd(hwnd, state.current_alpha, state.user_pref_topmost);
+        let _ = apply_transparency_to_hwnd(
+            hwnd,
+            state.current_alpha,
+            state.user_pref_topmost,
+            state.mouse_passthrough,
+            state.pen_passthrough,
+        );
     }
     request_ui_repaint();
 }
 
-pub unsafe fn restore_window(hwnd: HWND) {
+unsafe fn toggle_mouse_passthrough(hwnd: HWND) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    if is_own_hwnd(hwnd) {
+        return;
+    }
+    let hwnd_val = hwnd.0 as isize;
+    if GLOBAL_REGISTRY.get(&hwnd_val).is_none() {
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let is_top = (ex_style & WS_EX_TOPMOST.0) != 0;
+        let title = get_window_title(hwnd);
+        GLOBAL_REGISTRY.insert(
+            hwnd_val,
+            WindowState {
+                original_ex_style: ex_style,
+                current_alpha: 255,
+                original_is_topmost: is_top,
+                user_pref_topmost: is_top,
+                mouse_passthrough: false,
+                pen_passthrough: false,
+                title,
+            },
+        );
+    }
+    if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&hwnd_val) {
+        state.mouse_passthrough = !state.mouse_passthrough;
+        let _ = apply_transparency_to_hwnd(
+            hwnd,
+            state.current_alpha,
+            state.user_pref_topmost,
+            state.mouse_passthrough,
+            state.pen_passthrough,
+        );
+    }
+    request_ui_repaint();
+}
+
+unsafe fn toggle_pen_passthrough(hwnd: HWND) {
+    if hwnd.0.is_null() {
+        return;
+    }
+    if is_own_hwnd(hwnd) {
+        return;
+    }
+    let hwnd_val = hwnd.0 as isize;
+    if GLOBAL_REGISTRY.get(&hwnd_val).is_none() {
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let is_top = (ex_style & WS_EX_TOPMOST.0) != 0;
+        let title = get_window_title(hwnd);
+        GLOBAL_REGISTRY.insert(
+            hwnd_val,
+            WindowState {
+                original_ex_style: ex_style,
+                current_alpha: 255,
+                original_is_topmost: is_top,
+                user_pref_topmost: is_top,
+                mouse_passthrough: false,
+                pen_passthrough: false,
+                title,
+            },
+        );
+    }
+    if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&hwnd_val) {
+        state.pen_passthrough = !state.pen_passthrough;
+        let _ = apply_transparency_to_hwnd(
+            hwnd,
+            state.current_alpha,
+            state.user_pref_topmost,
+            state.mouse_passthrough,
+            state.pen_passthrough,
+        );
+    }
+    request_ui_repaint();
+}
+
+unsafe fn restore_window(hwnd: HWND) {
     if hwnd.0.is_null() {
         return;
     }
@@ -193,7 +720,7 @@ pub unsafe fn restore_window(hwnd: HWND) {
     request_ui_repaint();
 }
 
-pub unsafe fn restore_all_windows() {
+unsafe fn restore_all_windows() {
     let hwnds: Vec<isize> = GLOBAL_REGISTRY.iter().map(|kv| *kv.key()).collect();
     for hwnd_val in hwnds {
         restore_window(HWND(hwnd_val as *mut _));
@@ -212,10 +739,26 @@ unsafe fn is_own_hwnd(hwnd: HWND) -> bool {
 
 // --- 事件钩子 ---
 // --- GUI 应用程序 ---
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HotkeyCaptureTarget {
+    Increase,
+    Decrease,
+    ToggleTop,
+    ToggleMouse,
+    TogglePen,
+    CycleInputMode,
+    ResetCurrent,
+    ResetAll,
+    Update,
+    Reload,
+}
+
 struct TransGlassApp {
-    #[allow(dead_code)]
-    config: HotkeyConfig,
     should_exit: bool,
+    hotkey_editor_open: bool,
+    hotkey_draft: HotkeyConfig,
+    hotkey_message: Option<String>,
+    hotkey_capture: Option<HotkeyCaptureTarget>,
 }
 
 impl TransGlassApp {
@@ -252,10 +795,7 @@ impl TransGlassApp {
             }
         }
 
-        if !font_loaded {
-            // 如果系统字体加载失败，记录日志或通过 label 提示
-            eprintln!("Warning: Failed to load system Chinese fonts.");
-        }
+        let _ = font_loaded;
         cc.egui_ctx.set_fonts(fonts);
 
         // 2. 仿 Trae 风格的深色 UI
@@ -277,15 +817,190 @@ impl TransGlassApp {
         }
 
         Self {
-            config: load_or_create_hotkey_config(),
             should_exit: false,
+            hotkey_editor_open: false,
+            hotkey_draft: load_or_create_hotkey_config(),
+            hotkey_message: None,
+            hotkey_capture: None,
         }
     }
+
+    fn open_hotkey_editor(&mut self) {
+        self.hotkey_draft = load_or_create_hotkey_config();
+        self.hotkey_message = None;
+        self.hotkey_capture = None;
+        self.hotkey_editor_open = true;
+    }
+
+    fn validate_hotkey_spec(spec: &HotkeySpec) -> Result<(), String> {
+        unsafe {
+            let mods = parse_modifiers(&spec.modifiers);
+            if mods.0 == 0 {
+                return Err("修饰键不能为空（建议至少包含 ALT/CTRL/SHIFT/WIN 之一）".into());
+            }
+            let vk = parse_vk(&spec.key);
+            if vk == 0 {
+                return Err(format!("无效按键：{}", spec.key));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_config(cfg: &HotkeyConfig) -> Result<(), String> {
+        let mut used: std::collections::HashMap<(String, String), String> = std::collections::HashMap::new();
+
+        let mut check = |name: &str, spec: &HotkeySpec| -> Result<(), String> {
+            Self::validate_hotkey_spec(spec)?;
+            let key = (spec.modifiers.trim().to_uppercase(), spec.key.trim().to_uppercase());
+            if let Some(prev) = used.insert(key.clone(), name.to_string()) {
+                return Err(format!("快捷键冲突：{} 与 {} 使用了相同组合（{} + {}）", prev, name, key.0, key.1));
+            }
+            Ok(())
+        };
+
+        check("增加透明度", &cfg.increase)?;
+        check("减少透明度", &cfg.decrease)?;
+        check("切换置顶", &cfg.toggle_top)?;
+        if let Some(spec) = cfg.toggle_click_through.as_ref() {
+            check("切换鼠标点透", spec)?;
+        }
+        if let Some(spec) = cfg.toggle_pen_passthrough.as_ref() {
+            check("切换笔点透", spec)?;
+        }
+        if let Some(spec) = cfg.input_mode_cycle.as_ref() {
+            check("输入模式切换", spec)?;
+        }
+        check("还原当前窗口", &cfg.reset_current)?;
+        check("还原所有窗口", &cfg.reset_all)?;
+        check("检查更新", &cfg.update)?;
+        if let Some(spec) = cfg.reload.as_ref() {
+            check("重载配置", spec)?;
+        }
+        Ok(())
+    }
+
+    fn apply_hotkey_capture(&mut self, mods: String, key: String) {
+        if let Some(target) = self.hotkey_capture.take() {
+            let spec = HotkeySpec { modifiers: mods, key };
+            if let Err(e) = Self::validate_hotkey_spec(&spec) {
+                self.hotkey_message = Some(e);
+                return;
+            }
+            match target {
+                HotkeyCaptureTarget::Increase => self.hotkey_draft.increase = spec,
+                HotkeyCaptureTarget::Decrease => self.hotkey_draft.decrease = spec,
+                HotkeyCaptureTarget::ToggleTop => self.hotkey_draft.toggle_top = spec,
+                HotkeyCaptureTarget::ToggleMouse => self.hotkey_draft.toggle_click_through = Some(spec),
+                HotkeyCaptureTarget::TogglePen => self.hotkey_draft.toggle_pen_passthrough = Some(spec),
+                HotkeyCaptureTarget::CycleInputMode => self.hotkey_draft.input_mode_cycle = Some(spec),
+                HotkeyCaptureTarget::ResetCurrent => self.hotkey_draft.reset_current = spec,
+                HotkeyCaptureTarget::ResetAll => self.hotkey_draft.reset_all = spec,
+                HotkeyCaptureTarget::Update => self.hotkey_draft.update = spec,
+                HotkeyCaptureTarget::Reload => self.hotkey_draft.reload = Some(spec),
+            }
+            self.hotkey_message = Some("已录入快捷键".into());
+        }
+    }
+
+    fn save_and_reload_hotkeys(&mut self) {
+        if let Err(e) = Self::validate_config(&self.hotkey_draft) {
+            self.hotkey_message = Some(e);
+            return;
+        }
+        let path = get_config_path();
+        match serde_json::to_string_pretty(&self.hotkey_draft)
+            .map_err(|e| e.to_string())
+            .and_then(|s| fs::write(&path, s).map_err(|e| e.to_string()))
+        {
+            Ok(_) => {
+                request_hotkey_reload();
+                self.hotkey_message = Some("已保存并应用".into());
+            }
+            Err(e) => {
+                self.hotkey_message = Some(format!("保存失败：{}", e));
+            }
+        }
+    }
+}
+
+fn egui_key_to_vk_name(key: egui::Key) -> Option<String> {
+    use egui::Key::*;
+    let s = match key {
+        A => "A",
+        B => "B",
+        C => "C",
+        D => "D",
+        E => "E",
+        F => "F",
+        G => "G",
+        H => "H",
+        I => "I",
+        J => "J",
+        K => "K",
+        L => "L",
+        M => "M",
+        N => "N",
+        O => "O",
+        P => "P",
+        Q => "Q",
+        R => "R",
+        S => "S",
+        T => "T",
+        U => "U",
+        V => "V",
+        W => "W",
+        X => "X",
+        Y => "Y",
+        Z => "Z",
+        Num0 => "0",
+        Num1 => "1",
+        Num2 => "2",
+        Num3 => "3",
+        Num4 => "4",
+        Num5 => "5",
+        Num6 => "6",
+        Num7 => "7",
+        Num8 => "8",
+        Num9 => "9",
+        F1 => "F1",
+        F2 => "F2",
+        F3 => "F3",
+        F4 => "F4",
+        F5 => "F5",
+        F6 => "F6",
+        F7 => "F7",
+        F8 => "F8",
+        F9 => "F9",
+        F10 => "F10",
+        F11 => "F11",
+        F12 => "F12",
+        _ => return None,
+    };
+    Some(s.to_string())
+}
+
+fn egui_modifiers_to_string(m: egui::Modifiers) -> String {
+    let mut parts: Vec<&'static str> = Vec::new();
+    if m.ctrl {
+        parts.push("CTRL");
+    }
+    if m.alt {
+        parts.push("ALT");
+    }
+    if m.shift {
+        parts.push("SHIFT");
+    }
+    parts.join("+")
 }
 
 impl eframe::App for TransGlassApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 1. 处理托盘和菜单事件 (逻辑保持不变)
+
+        if APP_EXIT_REQUESTED.load(Ordering::Relaxed) && !self.should_exit {
+            self.should_exit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         // 2. 拦截关闭
         if ctx.input(|i| i.viewport().close_requested()) && !self.should_exit {
@@ -297,15 +1012,47 @@ impl eframe::App for TransGlassApp {
             WINDOW_VISIBLE.store(false, Ordering::Relaxed);
         }
 
+        if self.hotkey_capture.is_some() {
+            let mut captured: Option<(String, String)> = None;
+            ctx.input(|i| {
+                for e in &i.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = e
+                    {
+                        if let Some(k) = egui_key_to_vk_name(*key) {
+                            captured = Some((egui_modifiers_to_string(*modifiers), k));
+                            break;
+                        }
+                    }
+                }
+            });
+            if let Some((mods, key)) = captured {
+                self.apply_hotkey_capture(mods, key);
+            }
+        }
+
         // 3. UI 绘制 (更简洁现代的布局)
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.heading(egui::RichText::new("TransGlass").color(egui::Color32::from_rgb(0, 150, 255)).strong().size(22.0));
+                ui.label(egui::RichText::new(format!("输入模式：{}", input_mode_label())).small().weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(" 🗙 隐藏 ").clicked() {
                         hide_root_window();
                     }
+                    ui.menu_button(" ☰ ", |ui| {
+                        ui.menu_button("设置", |ui| {
+                            if ui.button("快捷键").clicked() {
+                                self.open_hotkey_editor();
+                                ui.close_menu();
+                            }
+                        });
+                    });
                 });
             });
             ui.add_space(10.0);
@@ -333,7 +1080,7 @@ impl eframe::App for TransGlassApp {
                         .collect();
 
                     let mut to_restore: Vec<isize> = Vec::new();
-                    let mut changes: Vec<(isize, Option<u8>, Option<bool>)> = Vec::new();
+                    let mut changes: Vec<PendingChange> = Vec::new();
 
                     for (hwnd_val, state) in entries {
                         if unsafe { is_own_hwnd(HWND(hwnd_val as *mut _)) } {
@@ -360,12 +1107,46 @@ impl eframe::App for TransGlassApp {
                                         .show_value(false)
                                         .trailing_fill(true);
                                     if ui.add(slider).changed() {
-                                        changes.push((hwnd_val, Some(alpha_f32 as u8), None));
+                                        changes.push(PendingChange {
+                                            hwnd_val,
+                                            alpha: Some(alpha_f32 as u8),
+                                            topmost: None,
+                                            mouse_passthrough: None,
+                                            pen_passthrough: None,
+                                        });
                                     }
                                     ui.add_space(10.0);
                                     let mut topmost = state.user_pref_topmost;
                                     if ui.checkbox(&mut topmost, "置顶").changed() {
-                                        changes.push((hwnd_val, None, Some(topmost)));
+                                        changes.push(PendingChange {
+                                            hwnd_val,
+                                            alpha: None,
+                                            topmost: Some(topmost),
+                                            mouse_passthrough: None,
+                                            pen_passthrough: None,
+                                        });
+                                    }
+                                    ui.add_space(10.0);
+                                    let mut mouse_passthrough = state.mouse_passthrough;
+                                    if ui.checkbox(&mut mouse_passthrough, "鼠标点透").changed() {
+                                        changes.push(PendingChange {
+                                            hwnd_val,
+                                            alpha: None,
+                                            topmost: None,
+                                            mouse_passthrough: Some(mouse_passthrough),
+                                            pen_passthrough: None,
+                                        });
+                                    }
+                                    ui.add_space(10.0);
+                                    let mut pen_passthrough = state.pen_passthrough;
+                                    if ui.checkbox(&mut pen_passthrough, "笔点透").changed() {
+                                        changes.push(PendingChange {
+                                            hwnd_val,
+                                            alpha: None,
+                                            topmost: None,
+                                            mouse_passthrough: None,
+                                            pen_passthrough: Some(pen_passthrough),
+                                        });
                                     }
                                 });
                             });
@@ -376,21 +1157,33 @@ impl eframe::App for TransGlassApp {
                         unsafe { restore_window(HWND(hwnd_val as *mut _)); }
                     }
 
-                    for (hwnd_val, alpha_opt, top_opt) in changes {
+                    for c in changes {
                         let mut apply_alpha: Option<u8> = None;
                         let mut apply_top: Option<bool> = None;
-                        if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&hwnd_val) {
-                            if let Some(a) = alpha_opt {
+                        let mut apply_mouse: Option<bool> = None;
+                        let mut apply_pen: Option<bool> = None;
+                        if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&c.hwnd_val) {
+                            if let Some(a) = c.alpha {
                                 state.current_alpha = a;
                             }
-                            if let Some(t) = top_opt {
+                            if let Some(t) = c.topmost {
                                 state.user_pref_topmost = t;
+                            }
+                            if let Some(m) = c.mouse_passthrough {
+                                state.mouse_passthrough = m;
+                            }
+                            if let Some(p) = c.pen_passthrough {
+                                state.pen_passthrough = p;
                             }
                             apply_alpha = Some(state.current_alpha);
                             apply_top = Some(state.user_pref_topmost);
+                            apply_mouse = Some(state.mouse_passthrough);
+                            apply_pen = Some(state.pen_passthrough);
                         }
-                        if let (Some(a), Some(t)) = (apply_alpha, apply_top) {
-                            unsafe { let _ = apply_transparency_to_hwnd(HWND(hwnd_val as *mut _), a, t); }
+                        if let (Some(a), Some(t), Some(m), Some(p)) = (apply_alpha, apply_top, apply_mouse, apply_pen) {
+                            unsafe {
+                                let _ = apply_transparency_to_hwnd(HWND(c.hwnd_val as *mut _), a, t, m, p);
+                            }
                         }
                     }
                 });
@@ -415,10 +1208,301 @@ impl eframe::App for TransGlassApp {
             ui.group(|ui| {
                 ui.vertical_centered(|ui| {
                     ui.label(egui::RichText::new("快捷键提示").strong().size(12.0));
-                    ui.label(egui::RichText::new("Alt + Z/X: 调节透明度 | Alt + T: 窗口置顶\nAlt + R: 还原当前窗口 | Alt + Shift + R: 还原全部").small().weak());
+                    ui.label(egui::RichText::new("快捷键可在  ☰  → 设置 → 快捷键  中修改").small().weak());
                 });
             });
         });
+
+        if self.hotkey_editor_open {
+            let defaults = default_config();
+            let mut open = self.hotkey_editor_open;
+            egui::Window::new("快捷键设置")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    let path = get_config_path();
+                    ui.label(format!("配置文件：{}", path.display()));
+                    ui.add_space(8.0);
+
+                    egui::Grid::new("hotkey_editor_grid")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label("");
+                            ui.label("修饰键");
+                            ui.label("按键");
+                            ui.label("");
+                            ui.end_row();
+
+                            ui.label("增加透明度");
+                            ui.text_edit_singleline(&mut self.hotkey_draft.increase.modifiers);
+                            ui.text_edit_singleline(&mut self.hotkey_draft.increase.key);
+                            if ui.button("录入").clicked() {
+                                self.hotkey_capture = Some(HotkeyCaptureTarget::Increase);
+                                self.hotkey_message = Some("请按下组合键".into());
+                            }
+                            ui.end_row();
+
+                            ui.label("减少透明度");
+                            ui.text_edit_singleline(&mut self.hotkey_draft.decrease.modifiers);
+                            ui.text_edit_singleline(&mut self.hotkey_draft.decrease.key);
+                            if ui.button("录入").clicked() {
+                                self.hotkey_capture = Some(HotkeyCaptureTarget::Decrease);
+                                self.hotkey_message = Some("请按下组合键".into());
+                            }
+                            ui.end_row();
+
+                            ui.label("切换置顶");
+                            ui.text_edit_singleline(&mut self.hotkey_draft.toggle_top.modifiers);
+                            ui.text_edit_singleline(&mut self.hotkey_draft.toggle_top.key);
+                            if ui.button("录入").clicked() {
+                                self.hotkey_capture = Some(HotkeyCaptureTarget::ToggleTop);
+                                self.hotkey_message = Some("请按下组合键".into());
+                            }
+                            ui.end_row();
+
+                            let mut enable_mouse = self.hotkey_draft.toggle_click_through.is_some();
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut enable_mouse, "鼠标点透");
+                            });
+                            if enable_mouse && self.hotkey_draft.toggle_click_through.is_none() {
+                                self.hotkey_draft.toggle_click_through = defaults.toggle_click_through.clone();
+                            }
+                            if !enable_mouse {
+                                self.hotkey_draft.toggle_click_through = None;
+                            }
+                            let mut mouse_mods = self
+                                .hotkey_draft
+                                .toggle_click_through
+                                .clone()
+                                .unwrap_or_else(|| defaults.toggle_click_through.clone().unwrap())
+                                .modifiers;
+                            let mut mouse_key = self
+                                .hotkey_draft
+                                .toggle_click_through
+                                .clone()
+                                .unwrap_or_else(|| defaults.toggle_click_through.clone().unwrap())
+                                .key;
+                            ui.add_enabled(enable_mouse, egui::TextEdit::singleline(&mut mouse_mods));
+                            ui.add_enabled(enable_mouse, egui::TextEdit::singleline(&mut mouse_key));
+                            if ui.add_enabled(enable_mouse, egui::Button::new("录入")).clicked() {
+                                self.hotkey_capture = Some(HotkeyCaptureTarget::ToggleMouse);
+                                self.hotkey_message = Some("请按下组合键".into());
+                            }
+                            if enable_mouse {
+                                self.hotkey_draft.toggle_click_through = Some(HotkeySpec {
+                                    modifiers: mouse_mods,
+                                    key: mouse_key,
+                                });
+                            }
+                            ui.end_row();
+
+                            let mut enable_pen = self.hotkey_draft.toggle_pen_passthrough.is_some();
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut enable_pen, "笔点透");
+                            });
+                            if enable_pen && self.hotkey_draft.toggle_pen_passthrough.is_none() {
+                                self.hotkey_draft.toggle_pen_passthrough = defaults.toggle_pen_passthrough.clone();
+                            }
+                            if !enable_pen {
+                                self.hotkey_draft.toggle_pen_passthrough = None;
+                            }
+                            let mut pen_mods = self
+                                .hotkey_draft
+                                .toggle_pen_passthrough
+                                .clone()
+                                .unwrap_or_else(|| defaults.toggle_pen_passthrough.clone().unwrap())
+                                .modifiers;
+                            let mut pen_key = self
+                                .hotkey_draft
+                                .toggle_pen_passthrough
+                                .clone()
+                                .unwrap_or_else(|| defaults.toggle_pen_passthrough.clone().unwrap())
+                                .key;
+                            ui.add_enabled(enable_pen, egui::TextEdit::singleline(&mut pen_mods));
+                            ui.add_enabled(enable_pen, egui::TextEdit::singleline(&mut pen_key));
+                            if ui.add_enabled(enable_pen, egui::Button::new("录入")).clicked() {
+                                self.hotkey_capture = Some(HotkeyCaptureTarget::TogglePen);
+                                self.hotkey_message = Some("请按下组合键".into());
+                            }
+                            if enable_pen {
+                                self.hotkey_draft.toggle_pen_passthrough = Some(HotkeySpec {
+                                    modifiers: pen_mods,
+                                    key: pen_key,
+                                });
+                            }
+                            ui.end_row();
+
+                            let mut enable_mode = self.hotkey_draft.input_mode_cycle.is_some();
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut enable_mode, "输入模式切换");
+                            });
+                            if enable_mode && self.hotkey_draft.input_mode_cycle.is_none() {
+                                self.hotkey_draft.input_mode_cycle = defaults.input_mode_cycle.clone();
+                            }
+                            if !enable_mode {
+                                self.hotkey_draft.input_mode_cycle = None;
+                            }
+                            let mut mode_mods = self
+                                .hotkey_draft
+                                .input_mode_cycle
+                                .clone()
+                                .unwrap_or_else(|| defaults.input_mode_cycle.clone().unwrap())
+                                .modifiers;
+                            let mut mode_key = self
+                                .hotkey_draft
+                                .input_mode_cycle
+                                .clone()
+                                .unwrap_or_else(|| defaults.input_mode_cycle.clone().unwrap())
+                                .key;
+                            ui.add_enabled(enable_mode, egui::TextEdit::singleline(&mut mode_mods));
+                            ui.add_enabled(enable_mode, egui::TextEdit::singleline(&mut mode_key));
+                            if ui.add_enabled(enable_mode, egui::Button::new("录入")).clicked() {
+                                self.hotkey_capture = Some(HotkeyCaptureTarget::CycleInputMode);
+                                self.hotkey_message = Some("请按下组合键".into());
+                            }
+                            if enable_mode {
+                                self.hotkey_draft.input_mode_cycle = Some(HotkeySpec {
+                                    modifiers: mode_mods,
+                                    key: mode_key,
+                                });
+                            }
+                            ui.end_row();
+
+                            ui.label("还原当前窗口");
+                            ui.text_edit_singleline(&mut self.hotkey_draft.reset_current.modifiers);
+                            ui.text_edit_singleline(&mut self.hotkey_draft.reset_current.key);
+                            if ui.button("录入").clicked() {
+                                self.hotkey_capture = Some(HotkeyCaptureTarget::ResetCurrent);
+                                self.hotkey_message = Some("请按下组合键".into());
+                            }
+                            ui.end_row();
+
+                            ui.label("还原所有窗口");
+                            ui.text_edit_singleline(&mut self.hotkey_draft.reset_all.modifiers);
+                            ui.text_edit_singleline(&mut self.hotkey_draft.reset_all.key);
+                            if ui.button("录入").clicked() {
+                                self.hotkey_capture = Some(HotkeyCaptureTarget::ResetAll);
+                                self.hotkey_message = Some("请按下组合键".into());
+                            }
+                            ui.end_row();
+
+                            ui.label("检查更新");
+                            ui.text_edit_singleline(&mut self.hotkey_draft.update.modifiers);
+                            ui.text_edit_singleline(&mut self.hotkey_draft.update.key);
+                            if ui.button("录入").clicked() {
+                                self.hotkey_capture = Some(HotkeyCaptureTarget::Update);
+                                self.hotkey_message = Some("请按下组合键".into());
+                            }
+                            ui.end_row();
+
+                            let mut enable_reload = self.hotkey_draft.reload.is_some();
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut enable_reload, "重载配置");
+                            });
+                            if enable_reload && self.hotkey_draft.reload.is_none() {
+                                self.hotkey_draft.reload = defaults.reload.clone();
+                            }
+                            if !enable_reload {
+                                self.hotkey_draft.reload = None;
+                            }
+                            let mut reload_mods = self
+                                .hotkey_draft
+                                .reload
+                                .clone()
+                                .unwrap_or_else(|| defaults.reload.clone().unwrap())
+                                .modifiers;
+                            let mut reload_key = self
+                                .hotkey_draft
+                                .reload
+                                .clone()
+                                .unwrap_or_else(|| defaults.reload.clone().unwrap())
+                                .key;
+                            ui.add_enabled(enable_reload, egui::TextEdit::singleline(&mut reload_mods));
+                            ui.add_enabled(enable_reload, egui::TextEdit::singleline(&mut reload_key));
+                            if ui.add_enabled(enable_reload, egui::Button::new("录入")).clicked() {
+                                self.hotkey_capture = Some(HotkeyCaptureTarget::Reload);
+                                self.hotkey_message = Some("请按下组合键".into());
+                            }
+                            if enable_reload {
+                                self.hotkey_draft.reload = Some(HotkeySpec {
+                                    modifiers: reload_mods,
+                                    key: reload_key,
+                                });
+                            }
+                            ui.end_row();
+                        });
+
+                    ui.add_space(10.0);
+                    if self.hotkey_draft.mouse.is_none() {
+                        self.hotkey_draft.mouse = defaults.mouse.clone();
+                    }
+                    if let Some(spec) = self.hotkey_draft.mouse.as_mut() {
+                        ui.label("鼠标侧键绑定");
+
+                        let mut x1 = spec.xbutton1.clone().unwrap_or_else(|| "none".into());
+                        let mut x2 = spec.xbutton2.clone().unwrap_or_else(|| "none".into());
+
+                        ui.horizontal(|ui| {
+                            ui.label("XButton1");
+                            egui::ComboBox::from_id_source("xbutton1_combo")
+                                .selected_text(x1.as_str())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut x1, "none".into(), "none");
+                                    ui.selectable_value(&mut x1, "decrease".into(), "decrease");
+                                    ui.selectable_value(&mut x1, "increase".into(), "increase");
+                                    ui.selectable_value(&mut x1, "toggle_topmost".into(), "toggle_topmost");
+                                    ui.selectable_value(&mut x1, "toggle_click_through".into(), "toggle_click_through");
+                                    ui.selectable_value(&mut x1, "toggle_pen_passthrough".into(), "toggle_pen_passthrough");
+                                    ui.selectable_value(&mut x1, "cycle_input_mode".into(), "cycle_input_mode");
+                                    ui.selectable_value(&mut x1, "reset_current".into(), "reset_current");
+                                    ui.selectable_value(&mut x1, "reset_all".into(), "reset_all");
+                                    ui.selectable_value(&mut x1, "update".into(), "update");
+                                });
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("XButton2");
+                            egui::ComboBox::from_id_source("xbutton2_combo")
+                                .selected_text(x2.as_str())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut x2, "none".into(), "none");
+                                    ui.selectable_value(&mut x2, "decrease".into(), "decrease");
+                                    ui.selectable_value(&mut x2, "increase".into(), "increase");
+                                    ui.selectable_value(&mut x2, "toggle_topmost".into(), "toggle_topmost");
+                                    ui.selectable_value(&mut x2, "toggle_click_through".into(), "toggle_click_through");
+                                    ui.selectable_value(&mut x2, "toggle_pen_passthrough".into(), "toggle_pen_passthrough");
+                                    ui.selectable_value(&mut x2, "cycle_input_mode".into(), "cycle_input_mode");
+                                    ui.selectable_value(&mut x2, "reset_current".into(), "reset_current");
+                                    ui.selectable_value(&mut x2, "reset_all".into(), "reset_all");
+                                    ui.selectable_value(&mut x2, "update".into(), "update");
+                                });
+                        });
+
+                        spec.xbutton1 = if x1 == "none" { None } else { Some(x1) };
+                        spec.xbutton2 = if x2 == "none" { None } else { Some(x2) };
+                    }
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("保存并应用").clicked() {
+                            self.save_and_reload_hotkeys();
+                        }
+                        if ui.button("恢复默认").clicked() {
+                            self.hotkey_draft = default_config();
+                            self.hotkey_message = Some("已恢复默认（尚未保存）".into());
+                        }
+                        if ui.button("关闭").clicked() {
+                            self.hotkey_editor_open = false;
+                        }
+                    });
+                    if let Some(msg) = self.hotkey_message.as_ref() {
+                        ui.add_space(6.0);
+                        ui.label(msg);
+                    }
+                });
+            self.hotkey_editor_open = open;
+        }
     }
 }
 
@@ -512,6 +1596,8 @@ fn main() -> Result<(), eframe::Error> {
         let _ = windows::Win32::System::Console::FreeConsole();
     }
 
+    let _single_instance = unsafe { acquire_single_instance() };
+
     thread::spawn(|| {
         while let Ok(event) = MenuEvent::receiver().recv() {
             match event.id.0.as_str() {
@@ -524,8 +1610,8 @@ fn main() -> Result<(), eframe::Error> {
                         continue;
                     }
                     unsafe { restore_all_windows() };
-                    thread::sleep(std::time::Duration::from_millis(150));
-                    unsafe { ExitProcess(0) };
+                    unsafe { uninstall_mouse_hook() };
+                    request_app_exit();
                 }
                 _ => {}
             }
@@ -552,8 +1638,12 @@ fn main() -> Result<(), eframe::Error> {
     let _tray_icon = create_tray_icon();
 
     thread::spawn(|| unsafe {
-        let cfg = load_or_create_hotkey_config();
-        bind_hotkeys(&cfg);
+        HOTKEY_THREAD_ID.store(GetCurrentThreadId(), Ordering::Relaxed);
+        let mut init = MSG::default();
+        let _ = PeekMessageW(&mut init, None, 0, 0, PM_NOREMOVE);
+
+        reload_hotkeys_and_mouse();
+        install_mouse_hook();
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -570,27 +1660,37 @@ fn main() -> Result<(), eframe::Error> {
                         toggle_topmost(hwnd);
                     }
                     4 => {
-                        restore_window(hwnd);
+                        toggle_mouse_passthrough(hwnd);
                     }
                     5 => {
-                        restore_all_windows();
+                        toggle_pen_passthrough(hwnd);
                     }
                     6 => {
+                        restore_window(hwnd);
+                    }
+                    7 => {
+                        restore_all_windows();
+                    }
+                    8 => {
                         thread::spawn(|| {
                             let _ = run_self_update();
                         });
                     }
-                    7 => {
-                        let cfg = load_or_create_hotkey_config();
-                        unregister_all_hotkeys();
-                        bind_hotkeys(&cfg);
+                    9 => {
+                        reload_hotkeys_and_mouse();
+                    }
+                    10 => {
+                        cycle_input_mode();
                     }
                     _ => {}
                 }
+            } else if msg.message == WM_RELOAD_HOTKEYS {
+                reload_hotkeys_and_mouse();
             }
             let _ = TranslateMessage(&msg);
             let _ = DispatchMessageW(&msg);
         }
+        uninstall_mouse_hook();
         restore_all_windows();
     });
 
@@ -630,14 +1730,24 @@ struct HotkeySpec {
 }
 
 #[derive(Deserialize, Serialize, Clone)]
+struct MouseBindingsSpec {
+    xbutton1: Option<String>,
+    xbutton2: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
 struct HotkeyConfig {
     increase: HotkeySpec,
     decrease: HotkeySpec,
     toggle_top: HotkeySpec,
+    toggle_click_through: Option<HotkeySpec>,
+    toggle_pen_passthrough: Option<HotkeySpec>,
+    input_mode_cycle: Option<HotkeySpec>,
     reset_current: HotkeySpec,
     reset_all: HotkeySpec,
     update: HotkeySpec,
     reload: Option<HotkeySpec>,
+    mouse: Option<MouseBindingsSpec>,
 }
 
 fn default_config() -> HotkeyConfig {
@@ -654,6 +1764,18 @@ fn default_config() -> HotkeyConfig {
             modifiers: "ALT".into(),
             key: "T".into(),
         },
+        toggle_click_through: Some(HotkeySpec {
+            modifiers: "ALT".into(),
+            key: "P".into(),
+        }),
+        toggle_pen_passthrough: Some(HotkeySpec {
+            modifiers: "ALT+SHIFT".into(),
+            key: "P".into(),
+        }),
+        input_mode_cycle: Some(HotkeySpec {
+            modifiers: "ALT+SHIFT".into(),
+            key: "M".into(),
+        }),
         reset_current: HotkeySpec {
             modifiers: "ALT".into(),
             key: "R".into(),
@@ -669,6 +1791,10 @@ fn default_config() -> HotkeyConfig {
         reload: Some(HotkeySpec {
             modifiers: "ALT+SHIFT".into(),
             key: "C".into(),
+        }),
+        mouse: Some(MouseBindingsSpec {
+            xbutton1: Some("decrease".into()),
+            xbutton2: Some("increase".into()),
         }),
     }
 }
@@ -746,18 +1872,38 @@ unsafe fn bind_hotkeys(cfg: &HotkeyConfig) {
     try_register_hotkey(1, &cfg.increase, "Increase");
     try_register_hotkey(2, &cfg.decrease, "Decrease");
     try_register_hotkey(3, &cfg.toggle_top, "ToggleTopmost");
-    try_register_hotkey(4, &cfg.reset_current, "ResetCurrent");
-    try_register_hotkey(5, &cfg.reset_all, "ResetAll");
-    try_register_hotkey(6, &cfg.update, "Update");
+    let toggle_click = cfg.toggle_click_through.clone().unwrap_or(HotkeySpec {
+        modifiers: "ALT".into(),
+        key: "P".into(),
+    });
+    try_register_hotkey(4, &toggle_click, "ToggleClickThrough");
+    let toggle_pen = cfg.toggle_pen_passthrough.clone().unwrap_or(HotkeySpec {
+        modifiers: "ALT+SHIFT".into(),
+        key: "P".into(),
+    });
+    try_register_hotkey(5, &toggle_pen, "TogglePenPassthrough");
+    if let Some(spec) = cfg.input_mode_cycle.as_ref() {
+        try_register_hotkey(10, spec, "CycleInputMode");
+    }
+    try_register_hotkey(6, &cfg.reset_current, "ResetCurrent");
+    try_register_hotkey(7, &cfg.reset_all, "ResetAll");
+    try_register_hotkey(8, &cfg.update, "Update");
     let reload = cfg.reload.clone().unwrap_or(HotkeySpec {
         modifiers: "ALT+SHIFT".into(),
         key: "C".into(),
     });
-    try_register_hotkey(7, &reload, "ReloadConfig");
+    try_register_hotkey(9, &reload, "ReloadConfig");
 }
 
 unsafe fn unregister_all_hotkeys() {
-    for id in 1..=7 {
+    for id in 1..=10 {
         let _ = UnregisterHotKey(None, id);
     }
+}
+
+unsafe fn reload_hotkeys_and_mouse() {
+    let cfg = load_or_create_hotkey_config();
+    unregister_all_hotkeys();
+    set_mouse_bindings(&cfg);
+    bind_hotkeys(&cfg);
 }
