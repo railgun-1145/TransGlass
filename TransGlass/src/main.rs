@@ -68,6 +68,7 @@ static ROOT_HWND: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_HOOK_FAILED: AtomicBool = AtomicBool::new(false);
 static HOTKEY_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+static HAS_ACTIVE_DRAG: AtomicBool = AtomicBool::new(false);
 const TRANSG_GLASS_INJECT_EXTRA_INFO: usize = 0x5452474Cu64 as usize;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
