@@ -150,10 +150,21 @@ git checkout master        # 看 0.2.0 线（需 bd2ee41）
 git checkout unified       # 回到 0.1.1 主线
 ```
 
-## 6. 还没做（移植清单）
+## 6. 移植清单的进展（2026-11-26 更新）
 
-要从 0.2.0 搬到 0.1.1 的部分，按价值排序：
+| 项 | 状态 |
+| :--- | :--- |
+| 自检（原计划搬 0.2.0 的 `run_test!` 那套） | ✅ 已做，但**没有照搬**：0.2.0 那 35 处断言的条件全是字面量 `true`（假测试），且在主程序 `main()` 里无条件执行后被 `FreeConsole()` 吞掉。改为真实探测并重写成 `--self-test`：配置解析、键名合法性、重复绑定、逐槽位 `RegisterHotKey`、`WH_MOUSE_LL` / `WH_KEYBOARD_LL`、单实例、权限、DPI、显示器、目录可写；支持 `--strict` 当门禁 |
+| `SendInput` 转发 + `ExtraInfo` 笔识别 | ⏳ 未做。与 0.1.1 的 `INPUT_MODE` 三态是两套思路，要先定取舍 |
+| CI 合并 | ⏳ 未做（`release.yml` 与 `windows-build.yml` 仍分开） |
 
-1. 热键诊断自检（`run_test!` 那套，35 处）—— 0.1.1 缺，排障时会很有用。
-2. `SendInput` 转发 + `ExtraInfo` 笔识别 —— 0.2.0 的穿透实现更细，但和 0.1.1 的 `INPUT_MODE` 是两套思路，需要设计取舍。
-3. CI：把 `release.yml` 的自动发版和 `windows-build.yml` 的构建合成一个工作流。
+## 7. 2026-11-26 这一轮新增
+
+- **`--self-test` / `--strict`**：真实环境自检，输出 PASS/WARN/FAIL + 日志 + 退出码
+- **热键优先模式**：`"hotkey_priority": true` 时改用 `WH_KEYBOARD_LL` 强占组合键，被别的程序占用也能生效；面板上有开关
+- **`--quit`**：让已运行实例优雅退出（具名事件），不再"点一次多一个进程"
+- **`run_and_return: true`**：修掉 eframe 关窗时直接 `process::exit` 导致 `TrayIcon` 永不 drop、每次退出漏一个托盘图标的问题
+- **不再静默失败**：热键注册失败 / 配置解析失败都会进面板横幅；配置写坏会先备份成 `.broken-<时间戳>.bak` 再重建
+- **`parse_vk` 扩展**：支持 F1–F24、方向键、SPACE/TAB/ENTER/ESC/DEL/INS/HOME/END/PGUP/PGDN 及常用符号键，非法键名会明确报错
+
+这些改动在 `feat/self-test` 分支，已合入 `unified`。

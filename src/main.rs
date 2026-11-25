@@ -7,7 +7,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use self_update::backends::github::Update;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
 use std::sync::OnceLock;
 use std::sync::RwLock;
@@ -17,11 +17,14 @@ use tray_icon::{
     MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 use windows::core::PCWSTR;
+use windows::core::w;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Input::{GetCurrentInputMessageSource, INPUT_MESSAGE_SOURCE, IMDT_PEN};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+mod selftest;
 
 // --- 核心状态注册表 ---
 #[derive(Clone)]
@@ -60,6 +63,123 @@ static INPUT_MODE: AtomicI32 = AtomicI32::new(0);
 const TRANSG_GLASS_INJECT_EXTRA_INFO: usize = 0x5452474Cu64 as usize;
 const WM_RELOAD_HOTKEYS: u32 = WM_APP + 77;
 
+/// 热键优先模式：true = 用 WH_KEYBOARD_LL 抢在其它程序前面吞掉组合键
+static PRIORITY_MODE: AtomicBool = AtomicBool::new(false);
+static KEYBOARD_HOOK: AtomicIsize = AtomicIsize::new(0);
+/// 优先模式下当前生效的组合键快照：(注册 id, modifiers 位, vk)
+static HOTKEY_MATCH: RwLock<Vec<(i32, u32, u32)>> = RwLock::new(Vec::new());
+/// 抑制长按重复触发（RegisterHotKey 不会连发，钩子会）
+static LAST_FIRED_VK: AtomicU32 = AtomicU32::new(0);
+
+const QUIT_EVENT_NAME: PCWSTR = w!("Local\\TransGlass_Quit_Event");
+
+/// 把当前配置里的组合键做成快照，供键盘钩子在按键回调里无阻塞读取。
+fn refresh_hotkey_match(cfg: &HotkeyConfig) {
+    let mut list = Vec::new();
+    for (id, _name, spec) in hotkey_slots(cfg) {
+        let mods = unsafe { parse_modifiers(&spec.modifiers) };
+        if let Some(vk) = unsafe { parse_vk(&spec.key) } {
+            list.push((id, mods.0, vk));
+        }
+    }
+    if let Ok(mut slot) = HOTKEY_MATCH.write() {
+        *slot = list;
+    }
+}
+
+unsafe fn current_hotkey_mods() -> u32 {
+    // 与 parse_modifiers 的位定义保持一致：MOD_ALT=1, MOD_CONTROL=2, MOD_SHIFT=4, MOD_WIN=8
+    let mut m = 0u32;
+    if GetAsyncKeyState(VK_MENU.0 as i32) < 0 {
+        m |= 1;
+    }
+    if GetAsyncKeyState(VK_CONTROL.0 as i32) < 0 {
+        m |= 2;
+    }
+    if GetAsyncKeyState(VK_SHIFT.0 as i32) < 0 {
+        m |= 4;
+    }
+    if GetAsyncKeyState(VK_LWIN.0 as i32) < 0 || GetAsyncKeyState(VK_RWIN.0 as i32) < 0 {
+        m |= 8;
+    }
+    m
+}
+
+/// 优先模式的核心：低级键盘钩子。命中已配置的组合键就投递给热键线程并吞掉按键，
+/// 这样即使别的程序先 RegisterHotKey 占用了这个键，也轮不到它收到。
+unsafe extern "system" fn keyboard_priority_hook(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code < 0 || !PRIORITY_MODE.load(Ordering::Relaxed) {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+    let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+    let msg = wparam.0 as u32;
+
+    if msg == WM_KEYUP || msg == WM_SYSKEYUP {
+        if kb.vkCode == LAST_FIRED_VK.load(Ordering::Relaxed) {
+            LAST_FIRED_VK.store(0, Ordering::Relaxed);
+        }
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+    if msg != WM_KEYDOWN && msg != WM_SYSKEYDOWN {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+    // 修饰键自身不参与匹配，否则按下 Alt 就会被当成一次组合
+    if matches!(
+        kb.vkCode,
+        0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5
+    ) {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+
+    let mods = current_hotkey_mods();
+    let hit = HOTKEY_MATCH.read().ok().and_then(|list| {
+        list.iter()
+            .find(|(_, m, vk)| *vk == kb.vkCode && *m == mods)
+            .map(|(id, _, _)| *id)
+    });
+
+    if let Some(id) = hit {
+        // 长按不连发（与 RegisterHotKey 行为一致）：记录本次已触发，抬起时清空
+        if LAST_FIRED_VK.swap(kb.vkCode, Ordering::Relaxed) != kb.vkCode {
+            let tid = HOTKEY_THREAD_ID.load(Ordering::Relaxed);
+            if tid != 0 {
+                let _ = PostThreadMessageW(tid, WM_HOTKEY, WPARAM(id as usize), LPARAM(0));
+            }
+        }
+        return LRESULT(1);
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
+unsafe fn install_keyboard_priority_hook() -> bool {
+    if KEYBOARD_HOOK.load(Ordering::Relaxed) != 0 {
+        return true;
+    }
+    match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_priority_hook), None, 0) {
+        Ok(hook) => {
+            KEYBOARD_HOOK.store(hook.0 as isize, Ordering::SeqCst);
+            true
+        }
+        Err(e) => {
+            push_issue(format!(
+                "热键优先模式：低级键盘钩子安装失败（{e}），已退回普通注册模式"
+            ));
+            false
+        }
+    }
+}
+
+unsafe fn uninstall_keyboard_priority_hook() {
+    let raw = KEYBOARD_HOOK.swap(0, Ordering::SeqCst);
+    if raw != 0 {
+        let _ = UnhookWindowsHookEx(HHOOK(raw as *mut core::ffi::c_void));
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     Auto = 0,
@@ -93,8 +213,41 @@ fn cycle_input_mode() {
     request_ui_repaint();
 }
 
+/// 退出路径诊断（设 `TRANSGLASS_DEBUG_EXIT=1` 才写，默认关闭）。
+fn debug_exit_note(kind: &str) {
+    if std::env::var_os("TRANSGLASS_DEBUG_EXIT").is_none() {
+        return;
+    }
+    let path = std::env::temp_dir().join("transglass_exit.txt");
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write as _;
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "{ms} {kind}");
+    }
+}
+
 fn request_app_exit() {
     APP_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+    debug_exit_note("exit-requested");
+
+    // 兜底：窗口隐藏时 egui 不再重绘，只靠 WM_CLOSE 可能永远走不到退出流程，
+    // 进程会一直挂在后台，用户再从托盘启动时就容易看到"图标越来越多"。
+    // 正常情况下 eframe 会关窗退出、main 返回时 TrayIcon 被 drop（图标随之删除）；
+    // 这里只兜底进程残留。
+    thread::spawn(|| {
+        thread::sleep(std::time::Duration::from_millis(1500));
+        debug_exit_note("fallback-exit");
+        unsafe {
+            restore_all_windows();
+            uninstall_mouse_hook();
+            uninstall_keyboard_priority_hook();
+        }
+        unsafe { ExitProcess(0) };
+    });
+
     let hwnd_val = ROOT_HWND.load(Ordering::Relaxed);
     if hwnd_val != 0 {
         let hwnd = HWND(hwnd_val as *mut _);
@@ -106,6 +259,31 @@ fn request_app_exit() {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         ctx.request_repaint();
     }
+}
+
+/// 第二个实例带 `--quit` 启动时，通知已在运行的实例优雅退出。
+fn request_running_instance_quit() -> bool {
+    unsafe {
+        // SYNCHRONIZE | EVENT_MODIFY_STATE：少了后者 SetEvent 会 ACCESS_DENIED
+        match OpenEventW(SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0002), false, QUIT_EVENT_NAME) {
+            Ok(event) => {
+                let _ = SetEvent(event);
+                let _ = CloseHandle(event);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+fn spawn_quit_listener() {
+    thread::spawn(|| unsafe {
+        if let Ok(event) = CreateEventW(None, true, false, QUIT_EVENT_NAME) {
+            let _ = ResetEvent(event);
+            WaitForSingleObject(event, INFINITE);
+            request_app_exit();
+        }
+    });
 }
 
 struct SingleInstanceGuard(HANDLE);
@@ -143,9 +321,14 @@ fn request_hotkey_reload() {
     }
 }
 
+/// 单实例互斥体名。自检模块也引用它，避免两边各写一份字符串而漂移。
+pub(crate) const SINGLE_INSTANCE_NAME: PCWSTR =
+    w!("Local\\TransGlass_SingleInstance_C1E0B6B4-18A0-4D5D-9D7A-2C5DFD4D0A2F");
+
 unsafe fn acquire_single_instance() -> Option<SingleInstanceGuard> {
-    let name = windows::core::w!("Local\\TransGlass_SingleInstance_C1E0B6B4-18A0-4D5D-9D7A-2C5DFD4D0A2F");
-    if let Ok(handle) = CreateMutexW(None, true, name) {
+    // 先复位 last error，否则线程上残留的 183 会让新建的互斥体被误判成"已存在"
+    SetLastError(ERROR_SUCCESS);
+    if let Ok(handle) = CreateMutexW(None, true, SINGLE_INSTANCE_NAME) {
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let _ = CloseHandle(handle);
             let _ = focus_existing_instance_window();
@@ -754,6 +937,7 @@ struct TransGlassApp {
     hotkey_draft: HotkeyConfig,
     hotkey_message: Option<String>,
     hotkey_capture: Option<HotkeyCaptureTarget>,
+    hotkey_priority_ui: bool,
 }
 
 impl TransGlassApp {
@@ -817,6 +1001,7 @@ impl TransGlassApp {
             hotkey_draft: load_or_create_hotkey_config(),
             hotkey_message: None,
             hotkey_capture: None,
+            hotkey_priority_ui: current_priority_flag(),
         }
     }
 
@@ -834,7 +1019,7 @@ impl TransGlassApp {
                 return Err("修饰键不能为空（建议至少包含 ALT/CTRL/SHIFT/WIN 之一）".into());
             }
             let vk = parse_vk(&spec.key);
-            if vk == 0 {
+            if vk.is_none() {
                 return Err(format!("无效按键：{}", spec.key));
             }
         }
@@ -1053,6 +1238,62 @@ impl eframe::App for TransGlassApp {
             ui.add_space(10.0);
             ui.separator();
             ui.add_space(10.0);
+
+            // 配置/热键问题提示（以前这些错误是静默吞掉的）
+            let issues = snapshot_issues();
+            if !issues.is_empty() {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(60, 40, 10))
+                    .inner_margin(egui::Margin::same(6.0))
+                    .rounding(4.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("⚠ 有 {} 条配置/热键问题", issues.len()))
+                                .color(egui::Color32::from_rgb(255, 190, 80))
+                                .strong()
+                                .small(),
+                        );
+                        for msg in issues.iter().take(4) {
+                            ui.label(
+                                egui::RichText::new(format!("• {msg}"))
+                                    .color(egui::Color32::from_rgb(255, 200, 120))
+                                    .small(),
+                            );
+                        }
+                        if issues.len() > 4 {
+                            ui.label(
+                                egui::RichText::new(format!("…还有 {} 条，详见 --self-test 报告", issues.len() - 4))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                    });
+                ui.add_space(8.0);
+            }
+
+            // 热键优先开关：开启后用低级键盘钩子强占组合键
+            let mut priority = self.hotkey_priority_ui;
+            let resp = ui
+                .checkbox(&mut priority, "快捷键优先（强占组合键）")
+                .on_hover_text(
+                    "开启：用低级键盘钩子抢在其它程序前面拦截已配置的组合键，\n\
+                     即使这个键被别的软件占用，TransGlass 也能收到。\n\
+                     关闭：使用系统热键注册，先到先得——被占用就没有反应。",
+                );
+            if resp.changed() {
+                self.hotkey_priority_ui = priority;
+                match save_priority_flag(priority) {
+                    Ok(()) => {
+                        self.hotkey_message = Some(if priority {
+                            "已开启快捷键优先（强占组合键）".to_string()
+                        } else {
+                            "已关闭快捷键优先，改用系统热键注册".to_string()
+                        })
+                    }
+                    Err(e) => push_issue(format!("保存快捷键优先设置失败: {e}")),
+                }
+            }
+            ui.add_space(6.0);
 
             // 正在管理的窗口
             ui.label(egui::RichText::new("已调节的窗口").strong().color(egui::Color32::LIGHT_GRAY));
@@ -1591,11 +1832,25 @@ fn load_custom_icon() -> Option<tray_icon::Icon> {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    // 自检模式：不进 GUI、不建托盘，跑完直接退出
+    //   0 = 全部通过，1 = 有失败项，2 = 严格模式下有警告项
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // --quit：让已在运行的实例优雅退出（不会新开一个进程，也不会多留一个托盘图标）
+    if args.iter().any(|a| a == "--quit") {
+        request_running_instance_quit();
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--self-test") {
+        let strict = args.iter().any(|a| a == "--strict");
+        std::process::exit(selftest::run(strict));
+    }
+
     unsafe {
         let _ = windows::Win32::System::Console::FreeConsole();
     }
 
     let _single_instance = unsafe { acquire_single_instance() };
+    spawn_quit_listener();
 
     thread::spawn(|| {
         while let Ok(event) = MenuEvent::receiver().recv() {
@@ -1634,7 +1889,7 @@ fn main() -> Result<(), eframe::Error> {
         }
     });
 
-    let _tray_icon = create_tray_icon();
+    let tray_icon = create_tray_icon();
 
     thread::spawn(|| unsafe {
         HOTKEY_THREAD_ID.store(GetCurrentThreadId(), Ordering::Relaxed);
@@ -1698,15 +1953,22 @@ fn main() -> Result<(), eframe::Error> {
             .with_inner_size([320.0, 450.0])
             .with_title("TransGlass 控制面板")
             .with_visible(true),
-        run_and_return: false,
+        // 必须是 true：false 时 eframe 会在关闭后直接 std::process::exit，
+        // main 里的局部变量（尤其是 TrayIcon）不会 drop，托盘图标就会变成 ghost
+        run_and_return: true,
         ..Default::default()
     };
 
-    eframe::run_native(
+    debug_exit_note("run-native-enter");
+    let result = eframe::run_native(
         "TransGlass 控制面板",
         options,
         Box::new(|cc| Ok(Box::new(TransGlassApp::new(cc)))),
-    )
+    );
+    debug_exit_note("run-native-return");
+    // 显式删除托盘图标：drop 会触发 Shell_NotifyIconW(NIM_DELETE)
+    drop(tray_icon);
+    result
 }
 
 fn run_self_update() -> Result<(), Box<dyn std::error::Error>> {
@@ -1747,6 +2009,9 @@ struct HotkeyConfig {
     update: HotkeySpec,
     reload: Option<HotkeySpec>,
     mouse: Option<MouseBindingsSpec>,
+    /// true = 用低级键盘钩子强占组合键（即使被其它程序占用也能生效）
+    #[serde(default)]
+    hotkey_priority: Option<bool>,
 }
 
 fn default_config() -> HotkeyConfig {
@@ -1795,6 +2060,7 @@ fn default_config() -> HotkeyConfig {
             xbutton1: Some("decrease".into()),
             xbutton2: Some("increase".into()),
         }),
+        hotkey_priority: Some(false),
     }
 }
 
@@ -1805,18 +2071,54 @@ fn get_config_path() -> PathBuf {
         .join("transglass_hotkeys.json")
 }
 
+/// 解析失败的配置文件不直接覆盖：先改名备份，再写一份默认配置，用户还能找回原文件。
+fn backup_broken_config(path: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("transglass_hotkeys.json");
+    let backup = path.with_file_name(format!("{name}.broken-{stamp}.bak"));
+    let _ = fs::rename(path, &backup);
+    backup
+}
+
 fn load_or_create_hotkey_config() -> HotkeyConfig {
     let path = get_config_path();
-    if let Ok(data) = fs::read_to_string(&path) {
-        if let Ok(cfg) = serde_json::from_str::<HotkeyConfig>(&data) {
-            return cfg;
+    match fs::read_to_string(&path) {
+        Ok(data) => {
+            // 记事本/某些编辑器存 UTF-8 会带 BOM，serde_json 不认，先剥掉
+            let text = data.trim_start_matches('\u{feff}');
+            match serde_json::from_str::<HotkeyConfig>(text) {
+                Ok(cfg) => return cfg,
+                Err(e) => {
+                    let backup = backup_broken_config(&path);
+                    push_issue(format!(
+                        "配置文件解析失败（{e}），原文件已备份为 {}，已改用默认热键",
+                        backup.display()
+                    ));
+                    return write_default_config(&path);
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => write_default_config(&path),
+        Err(e) => {
+            push_issue(format!(
+                "读不到配置文件（{e}），本次使用默认热键，改动不会保存"
+            ));
+            default_config()
         }
     }
+}
+
+fn write_default_config(path: &Path) -> HotkeyConfig {
     let cfg = default_config();
-    let _ = fs::write(
-        &path,
-        serde_json::to_string_pretty(&cfg).unwrap_or_default(),
-    );
+    if let Err(e) = fs::write(path, serde_json::to_string_pretty(&cfg).unwrap_or_default()) {
+        push_issue(format!("无法写入默认配置文件（{e}）"));
+    }
     cfg
 }
 
@@ -1834,75 +2136,187 @@ unsafe fn parse_modifiers(s: &str) -> HOT_KEY_MODIFIERS {
     m
 }
 
-unsafe fn parse_vk(s: &str) -> u32 {
-    let up = s.trim().to_uppercase();
-    if up.len() == 1 {
-        let ch = up.chars().next().unwrap();
-        if ch.is_ascii_alphabetic() || ch.is_ascii_digit() {
-            return ch as u32;
+/// 把用户可读的配置/热键问题攒起来，供 UI 显示。
+///
+/// 修 bug 前：`try_register_hotkey` 直接吞掉 `RegisterHotKey` 的结果、
+/// `load_or_create_hotkey_config` 解析失败时静默重建默认配置并覆盖原文件，
+/// 用户既不知道热键没绑上，也不知道自己的配置被换了。
+static RUNTIME_ISSUES: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+pub(crate) fn push_issue(msg: impl Into<String>) {
+    let msg = msg.into();
+    if let Ok(mut issues) = RUNTIME_ISSUES.write() {
+        if !issues.iter().any(|m| m == &msg) {
+            issues.push(msg);
         }
     }
-    match up.as_str() {
-        "F1" => 0x70,
-        "F2" => 0x71,
-        "F3" => 0x72,
-        "F4" => 0x73,
-        "F5" => 0x74,
-        "F6" => 0x75,
-        "F7" => 0x76,
-        "F8" => 0x77,
-        "F9" => 0x78,
-        "F10" => 0x79,
-        "F11" => 0x7A,
-        "F12" => 0x7B,
-        _ => 0,
+}
+
+pub(crate) fn snapshot_issues() -> Vec<String> {
+    RUNTIME_ISSUES
+        .read()
+        .map(|issues| issues.clone())
+        .unwrap_or_default()
+}
+
+pub(crate) fn clear_issues() {
+    if let Ok(mut issues) = RUNTIME_ISSUES.write() {
+        issues.clear();
     }
 }
 
-unsafe fn try_register_hotkey(id: i32, spec: &HotkeySpec, _name: &str) {
+/// 所有热键槽位的 id 分配。新增功能必须在这里登记，否则重载时会漏注销。
+pub(crate) const HOTKEY_IDS: [i32; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+unsafe fn parse_vk(s: &str) -> Option<u32> {
+    let up = s.trim().to_uppercase();
+    if up.chars().count() == 1 {
+        let ch = up.chars().next().unwrap();
+        if ch.is_ascii_alphabetic() || ch.is_ascii_digit() {
+            return Some(ch as u32);
+        }
+    }
+    // 常用命名键。以前只认字母数字和 F1-F12，其余静默变 0 → 注册被跳过，
+    // 用户以为配好了实际没绑上。
+    let vk = match up.as_str() {
+        "F1" => 0x70, "F2" => 0x71, "F3" => 0x72, "F4" => 0x73,
+        "F5" => 0x74, "F6" => 0x75, "F7" => 0x76, "F8" => 0x77,
+        "F9" => 0x78, "F10" => 0x79, "F11" => 0x7A, "F12" => 0x7B,
+        "F13" => 0x7C, "F14" => 0x7D, "F15" => 0x7E, "F16" => 0x7F,
+        "F17" => 0x80, "F18" => 0x81, "F19" => 0x82, "F20" => 0x83,
+        "F21" => 0x84, "F22" => 0x85, "F23" => 0x86, "F24" => 0x87,
+        "SPACE" => 0x20, "TAB" => 0x09, "ENTER" | "RETURN" => 0x0D,
+        "ESC" | "ESCAPE" => 0x1B, "BACKSPACE" | "BACK" => 0x08,
+        "DELETE" | "DEL" => 0x2E, "INSERT" | "INS" => 0x2D,
+        "HOME" => 0x24, "END" => 0x23,
+        "PAGEUP" | "PGUP" => 0x21, "PAGEDOWN" | "PGDN" => 0x22,
+        "LEFT" => 0x25, "UP" => 0x26, "RIGHT" => 0x27, "DOWN" => 0x28,
+        "`" | "OEM_3" => 0xC0, "-" | "MINUS" => 0xBD, "=" | "PLUS" | "OEM_PLUS" => 0xBB,
+        "[" | "OEM_4" => 0xDB, "]" | "OEM_6" => 0xDD, "\\" | "OEM_5" => 0xDC,
+        ";" | "OEM_1" => 0xBA, "'" | "OEM_7" => 0xDE,
+        "," | "OEM_COMMA" => 0xBC, "." | "OEM_PERIOD" => 0xBE, "/" | "OEM_2" => 0xBF,
+        _ => return None,
+    };
+    Some(vk)
+}
+
+/// 注册单个热键；失败时把原因记进 `RUNTIME_ISSUES`，不再静默吞掉。
+unsafe fn try_register_hotkey(id: i32, spec: &HotkeySpec, name: &str) -> bool {
     let mods = parse_modifiers(&spec.modifiers);
-    let vk = parse_vk(&spec.key);
-    if vk != 0 {
-        let _ = RegisterHotKey(None, id, mods, vk);
+    let Some(vk) = parse_vk(&spec.key) else {
+        push_issue(format!(
+            "热键「{name}」的键名 `{}` 无法识别，已跳过（支持 A-Z、0-9、F1-F24、方向键、SPACE 等）",
+            spec.key
+        ));
+        return false;
+    };
+    match RegisterHotKey(None, id, mods, vk) {
+        Ok(()) => true,
+        Err(e) => {
+            let win32 = GetLastError().0;
+            let hint = if win32 == 1409 || e.code().is_err() {
+                "，可能已被其它程序占用"
+            } else {
+                ""
+            };
+            push_issue(format!(
+                "热键「{name}」({}+{}) 注册失败{}(Win32 {win32})，该功能快捷键不可用",
+                spec.modifiers, spec.key, hint
+            ));
+            false
+        }
     }
 }
 
-unsafe fn bind_hotkeys(cfg: &HotkeyConfig) {
-    try_register_hotkey(1, &cfg.increase, "Increase");
-    try_register_hotkey(2, &cfg.decrease, "Decrease");
-    try_register_hotkey(3, &cfg.toggle_top, "ToggleTopmost");
+/// 热键槽位表：(注册 id, 名称, 配置项)。
+///
+/// 主程序的 `bind_hotkeys()` 与自检模块共用这一份，避免两处各写一遍默认值而漂移。
+pub(crate) fn hotkey_slots(cfg: &HotkeyConfig) -> Vec<(i32, &'static str, HotkeySpec)> {
     let toggle_click = cfg.toggle_click_through.clone().unwrap_or(HotkeySpec {
         modifiers: "ALT".into(),
         key: "P".into(),
     });
-    try_register_hotkey(4, &toggle_click, "ToggleClickThrough");
     let toggle_pen = cfg.toggle_pen_passthrough.clone().unwrap_or(HotkeySpec {
         modifiers: "ALT+SHIFT".into(),
         key: "P".into(),
     });
-    try_register_hotkey(5, &toggle_pen, "TogglePenPassthrough");
-    if let Some(spec) = cfg.input_mode_cycle.as_ref() {
-        try_register_hotkey(10, spec, "CycleInputMode");
-    }
-    try_register_hotkey(6, &cfg.reset_current, "ResetCurrent");
-    try_register_hotkey(7, &cfg.reset_all, "ResetAll");
-    try_register_hotkey(8, &cfg.update, "Update");
     let reload = cfg.reload.clone().unwrap_or(HotkeySpec {
         modifiers: "ALT+SHIFT".into(),
         key: "C".into(),
     });
-    try_register_hotkey(9, &reload, "ReloadConfig");
+
+    let mut slots = vec![
+        (1, "增加透明度", cfg.increase.clone()),
+        (2, "减少透明度", cfg.decrease.clone()),
+        (3, "切换置顶", cfg.toggle_top.clone()),
+        (4, "切换鼠标点透", toggle_click),
+        (5, "切换笔点透", toggle_pen),
+        (6, "还原当前窗口", cfg.reset_current.clone()),
+        (7, "还原全部窗口", cfg.reset_all.clone()),
+        (8, "检查更新", cfg.update.clone()),
+        (9, "重载热键配置", reload),
+    ];
+    if let Some(spec) = cfg.input_mode_cycle.as_ref() {
+        slots.push((10, "切换输入模式", spec.clone()));
+    }
+    slots
+}
+
+unsafe fn bind_hotkeys(cfg: &HotkeyConfig) {
+    for (id, name, spec) in hotkey_slots(cfg) {
+        try_register_hotkey(id, &spec, name);
+    }
 }
 
 unsafe fn unregister_all_hotkeys() {
-    for id in 1..=10 {
+    // 用统一的 id 表，避免硬编码范围：以后加槽位忘了改这里，重载后旧绑定会残留
+    for id in HOTKEY_IDS {
         let _ = UnregisterHotKey(None, id);
     }
 }
 
 unsafe fn reload_hotkeys_and_mouse() {
+    clear_issues();
     let cfg = load_or_create_hotkey_config();
     unregister_all_hotkeys();
     set_mouse_bindings(&cfg);
-    bind_hotkeys(&cfg);
+
+    // 热键优先模式：用低级键盘钩子强占组合键；否则走普通的系统热键注册
+    let priority = cfg.hotkey_priority.unwrap_or(false);
+    PRIORITY_MODE.store(priority, Ordering::SeqCst);
+    refresh_hotkey_match(&cfg);
+
+    if priority {
+        // 优先模式下不能再 RegisterHotKey：按键已经被自己吞掉，WM_HOTKEY 根本不会来，
+        // 而且注册会白占着键位。
+        uninstall_keyboard_priority_hook();
+        if !install_keyboard_priority_hook() {
+            PRIORITY_MODE.store(false, Ordering::SeqCst);
+            bind_hotkeys(&cfg);
+        }
+    } else {
+        uninstall_keyboard_priority_hook();
+        bind_hotkeys(&cfg);
+    }
+}
+
+/// 保存「热键优先」开关并立即生效。
+fn save_priority_flag(enabled: bool) -> Result<(), String> {
+    let path = get_config_path();
+    let mut cfg = load_or_create_hotkey_config();
+    cfg.hotkey_priority = Some(enabled);
+    let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    fs::write(&path, text).map_err(|e| e.to_string())?;
+    request_hotkey_reload();
+    Ok(())
+}
+
+fn current_priority_flag() -> bool {
+    fs::read_to_string(get_config_path())
+        .ok()
+        .and_then(|raw| {
+            serde_json::from_str::<HotkeyConfig>(raw.trim_start_matches('\u{feff}')).ok()
+        })
+        .and_then(|cfg| cfg.hotkey_priority)
+        .unwrap_or(false)
 }
