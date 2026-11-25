@@ -23,6 +23,8 @@ use windows::Win32::UI::Input::{GetCurrentInputMessageSource, INPUT_MESSAGE_SOUR
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+mod selftest;
+
 // --- 核心状态注册表 ---
 #[derive(Clone)]
 struct WindowState {
@@ -1591,6 +1593,11 @@ fn load_custom_icon() -> Option<tray_icon::Icon> {
 }
 
 fn main() -> Result<(), eframe::Error> {
+    // 自检模式：不进 GUI、不建托盘，跑完直接退出（退出码 0 = 全过）
+    if std::env::args().any(|a| a == "--self-test" || a == "-T") {
+        std::process::exit(selftest::run());
+    }
+
     unsafe {
         let _ = windows::Win32::System::Console::FreeConsole();
     }
