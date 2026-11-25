@@ -1,4 +1,4 @@
-; TransGlass Inno Setup Script
+﻿; TransGlass Inno Setup Script
 ; 构建可分发安装包（含卸载、开机自启可选）
 
 #define MyAppName "TransGlass"
@@ -13,7 +13,7 @@
 #endif
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.0"
+  #define MyAppVersion "0.1.2"
 #endif
 
 [Setup]
