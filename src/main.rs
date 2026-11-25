@@ -63,6 +63,123 @@ static INPUT_MODE: AtomicI32 = AtomicI32::new(0);
 const TRANSG_GLASS_INJECT_EXTRA_INFO: usize = 0x5452474Cu64 as usize;
 const WM_RELOAD_HOTKEYS: u32 = WM_APP + 77;
 
+/// 热键优先模式：true = 用 WH_KEYBOARD_LL 抢在其它程序前面吞掉组合键
+static PRIORITY_MODE: AtomicBool = AtomicBool::new(false);
+static KEYBOARD_HOOK: AtomicIsize = AtomicIsize::new(0);
+/// 优先模式下当前生效的组合键快照：(注册 id, modifiers 位, vk)
+static HOTKEY_MATCH: RwLock<Vec<(i32, u32, u32)>> = RwLock::new(Vec::new());
+/// 抑制长按重复触发（RegisterHotKey 不会连发，钩子会）
+static LAST_FIRED_VK: AtomicU32 = AtomicU32::new(0);
+
+const QUIT_EVENT_NAME: PCWSTR = w!("Local\\TransGlass_Quit_Event");
+
+/// 把当前配置里的组合键做成快照，供键盘钩子在按键回调里无阻塞读取。
+fn refresh_hotkey_match(cfg: &HotkeyConfig) {
+    let mut list = Vec::new();
+    for (id, _name, spec) in hotkey_slots(cfg) {
+        let mods = unsafe { parse_modifiers(&spec.modifiers) };
+        if let Some(vk) = unsafe { parse_vk(&spec.key) } {
+            list.push((id, mods.0, vk));
+        }
+    }
+    if let Ok(mut slot) = HOTKEY_MATCH.write() {
+        *slot = list;
+    }
+}
+
+unsafe fn current_hotkey_mods() -> u32 {
+    // 与 parse_modifiers 的位定义保持一致：MOD_ALT=1, MOD_CONTROL=2, MOD_SHIFT=4, MOD_WIN=8
+    let mut m = 0u32;
+    if GetAsyncKeyState(VK_MENU.0 as i32) < 0 {
+        m |= 1;
+    }
+    if GetAsyncKeyState(VK_CONTROL.0 as i32) < 0 {
+        m |= 2;
+    }
+    if GetAsyncKeyState(VK_SHIFT.0 as i32) < 0 {
+        m |= 4;
+    }
+    if GetAsyncKeyState(VK_LWIN.0 as i32) < 0 || GetAsyncKeyState(VK_RWIN.0 as i32) < 0 {
+        m |= 8;
+    }
+    m
+}
+
+/// 优先模式的核心：低级键盘钩子。命中已配置的组合键就投递给热键线程并吞掉按键，
+/// 这样即使别的程序先 RegisterHotKey 占用了这个键，也轮不到它收到。
+unsafe extern "system" fn keyboard_priority_hook(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code < 0 || !PRIORITY_MODE.load(Ordering::Relaxed) {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+    let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+    let msg = wparam.0 as u32;
+
+    if msg == WM_KEYUP || msg == WM_SYSKEYUP {
+        if kb.vkCode == LAST_FIRED_VK.load(Ordering::Relaxed) {
+            LAST_FIRED_VK.store(0, Ordering::Relaxed);
+        }
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+    if msg != WM_KEYDOWN && msg != WM_SYSKEYDOWN {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+    // 修饰键自身不参与匹配，否则按下 Alt 就会被当成一次组合
+    if matches!(
+        kb.vkCode,
+        0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5
+    ) {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+
+    let mods = current_hotkey_mods();
+    let hit = HOTKEY_MATCH.read().ok().and_then(|list| {
+        list.iter()
+            .find(|(_, m, vk)| *vk == kb.vkCode && *m == mods)
+            .map(|(id, _, _)| *id)
+    });
+
+    if let Some(id) = hit {
+        // 长按不连发（与 RegisterHotKey 行为一致）：记录本次已触发，抬起时清空
+        if LAST_FIRED_VK.swap(kb.vkCode, Ordering::Relaxed) != kb.vkCode {
+            let tid = HOTKEY_THREAD_ID.load(Ordering::Relaxed);
+            if tid != 0 {
+                let _ = PostThreadMessageW(tid, WM_HOTKEY, WPARAM(id as usize), LPARAM(0));
+            }
+        }
+        return LRESULT(1);
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
+unsafe fn install_keyboard_priority_hook() -> bool {
+    if KEYBOARD_HOOK.load(Ordering::Relaxed) != 0 {
+        return true;
+    }
+    match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_priority_hook), None, 0) {
+        Ok(hook) => {
+            KEYBOARD_HOOK.store(hook.0 as isize, Ordering::SeqCst);
+            true
+        }
+        Err(e) => {
+            push_issue(format!(
+                "热键优先模式：低级键盘钩子安装失败（{e}），已退回普通注册模式"
+            ));
+            false
+        }
+    }
+}
+
+unsafe fn uninstall_keyboard_priority_hook() {
+    let raw = KEYBOARD_HOOK.swap(0, Ordering::SeqCst);
+    if raw != 0 {
+        let _ = UnhookWindowsHookEx(HHOOK(raw as *mut core::ffi::c_void));
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InputMode {
     Auto = 0,
@@ -98,6 +215,21 @@ fn cycle_input_mode() {
 
 fn request_app_exit() {
     APP_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+
+    // 兜底：窗口隐藏时 egui 不再重绘，只靠 WM_CLOSE 可能永远走不到退出流程，
+    // 进程会一直挂在后台，用户再从托盘启动时就容易看到"图标越来越多"。
+    // 正常情况下 eframe 会关窗退出、main 返回时 TrayIcon 被 drop（图标随之删除）；
+    // 这里只兜底进程残留。
+    thread::spawn(|| {
+        thread::sleep(std::time::Duration::from_millis(1500));
+        unsafe {
+            restore_all_windows();
+            uninstall_mouse_hook();
+            uninstall_keyboard_priority_hook();
+        }
+        unsafe { ExitProcess(0) };
+    });
+
     let hwnd_val = ROOT_HWND.load(Ordering::Relaxed);
     if hwnd_val != 0 {
         let hwnd = HWND(hwnd_val as *mut _);
@@ -109,6 +241,31 @@ fn request_app_exit() {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         ctx.request_repaint();
     }
+}
+
+/// 第二个实例带 `--quit` 启动时，通知已在运行的实例优雅退出。
+fn request_running_instance_quit() -> bool {
+    unsafe {
+        // SYNCHRONIZE | EVENT_MODIFY_STATE：少了后者 SetEvent 会 ACCESS_DENIED
+        match OpenEventW(SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0002), false, QUIT_EVENT_NAME) {
+            Ok(event) => {
+                let _ = SetEvent(event);
+                let _ = CloseHandle(event);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+fn spawn_quit_listener() {
+    thread::spawn(|| unsafe {
+        if let Ok(event) = CreateEventW(None, true, false, QUIT_EVENT_NAME) {
+            let _ = ResetEvent(event);
+            WaitForSingleObject(event, INFINITE);
+            request_app_exit();
+        }
+    });
 }
 
 struct SingleInstanceGuard(HANDLE);
@@ -762,6 +919,7 @@ struct TransGlassApp {
     hotkey_draft: HotkeyConfig,
     hotkey_message: Option<String>,
     hotkey_capture: Option<HotkeyCaptureTarget>,
+    hotkey_priority_ui: bool,
 }
 
 impl TransGlassApp {
@@ -825,6 +983,7 @@ impl TransGlassApp {
             hotkey_draft: load_or_create_hotkey_config(),
             hotkey_message: None,
             hotkey_capture: None,
+            hotkey_priority_ui: current_priority_flag(),
         }
     }
 
@@ -1093,6 +1252,30 @@ impl eframe::App for TransGlassApp {
                     });
                 ui.add_space(8.0);
             }
+
+            // 热键优先开关：开启后用低级键盘钩子强占组合键
+            let mut priority = self.hotkey_priority_ui;
+            let resp = ui
+                .checkbox(&mut priority, "快捷键优先（强占组合键）")
+                .on_hover_text(
+                    "开启：用低级键盘钩子抢在其它程序前面拦截已配置的组合键，\n\
+                     即使这个键被别的软件占用，TransGlass 也能收到。\n\
+                     关闭：使用系统热键注册，先到先得——被占用就没有反应。",
+                );
+            if resp.changed() {
+                self.hotkey_priority_ui = priority;
+                match save_priority_flag(priority) {
+                    Ok(()) => {
+                        self.hotkey_message = Some(if priority {
+                            "已开启快捷键优先（强占组合键）".to_string()
+                        } else {
+                            "已关闭快捷键优先，改用系统热键注册".to_string()
+                        })
+                    }
+                    Err(e) => push_issue(format!("保存快捷键优先设置失败: {e}")),
+                }
+            }
+            ui.add_space(6.0);
 
             // 正在管理的窗口
             ui.label(egui::RichText::new("已调节的窗口").strong().color(egui::Color32::LIGHT_GRAY));
@@ -1634,6 +1817,11 @@ fn main() -> Result<(), eframe::Error> {
     // 自检模式：不进 GUI、不建托盘，跑完直接退出
     //   0 = 全部通过，1 = 有失败项，2 = 严格模式下有警告项
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // --quit：让已在运行的实例优雅退出（不会新开一个进程，也不会多留一个托盘图标）
+    if args.iter().any(|a| a == "--quit") {
+        request_running_instance_quit();
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--self-test") {
         let strict = args.iter().any(|a| a == "--strict");
         std::process::exit(selftest::run(strict));
@@ -1644,6 +1832,7 @@ fn main() -> Result<(), eframe::Error> {
     }
 
     let _single_instance = unsafe { acquire_single_instance() };
+    spawn_quit_listener();
 
     thread::spawn(|| {
         while let Ok(event) = MenuEvent::receiver().recv() {
@@ -1795,6 +1984,9 @@ struct HotkeyConfig {
     update: HotkeySpec,
     reload: Option<HotkeySpec>,
     mouse: Option<MouseBindingsSpec>,
+    /// true = 用低级键盘钩子强占组合键（即使被其它程序占用也能生效）
+    #[serde(default)]
+    hotkey_priority: Option<bool>,
 }
 
 fn default_config() -> HotkeyConfig {
@@ -1843,6 +2035,7 @@ fn default_config() -> HotkeyConfig {
             xbutton1: Some("decrease".into()),
             xbutton2: Some("increase".into()),
         }),
+        hotkey_priority: Some(false),
     }
 }
 
@@ -2062,5 +2255,43 @@ unsafe fn reload_hotkeys_and_mouse() {
     let cfg = load_or_create_hotkey_config();
     unregister_all_hotkeys();
     set_mouse_bindings(&cfg);
-    bind_hotkeys(&cfg);
+
+    // 热键优先模式：用低级键盘钩子强占组合键；否则走普通的系统热键注册
+    let priority = cfg.hotkey_priority.unwrap_or(false);
+    PRIORITY_MODE.store(priority, Ordering::SeqCst);
+    refresh_hotkey_match(&cfg);
+
+    if priority {
+        // 优先模式下不能再 RegisterHotKey：按键已经被自己吞掉，WM_HOTKEY 根本不会来，
+        // 而且注册会白占着键位。
+        uninstall_keyboard_priority_hook();
+        if !install_keyboard_priority_hook() {
+            PRIORITY_MODE.store(false, Ordering::SeqCst);
+            bind_hotkeys(&cfg);
+        }
+    } else {
+        uninstall_keyboard_priority_hook();
+        bind_hotkeys(&cfg);
+    }
+}
+
+/// 保存「热键优先」开关并立即生效。
+fn save_priority_flag(enabled: bool) -> Result<(), String> {
+    let path = get_config_path();
+    let mut cfg = load_or_create_hotkey_config();
+    cfg.hotkey_priority = Some(enabled);
+    let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    fs::write(&path, text).map_err(|e| e.to_string())?;
+    request_hotkey_reload();
+    Ok(())
+}
+
+fn current_priority_flag() -> bool {
+    fs::read_to_string(get_config_path())
+        .ok()
+        .and_then(|raw| {
+            serde_json::from_str::<HotkeyConfig>(raw.trim_start_matches('\u{feff}')).ok()
+        })
+        .and_then(|cfg| cfg.hotkey_priority)
+        .unwrap_or(false)
 }

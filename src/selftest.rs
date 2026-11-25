@@ -75,6 +75,10 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     CallNextHookEx(None, code, wparam, lparam)
 }
 
+unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
 /// 在独立线程里**先全部注册、再统一注销**。
 ///
 /// 用注册失败（1409）来暴露"两个功能抢同一个键"这种真实冲突——
@@ -251,6 +255,11 @@ pub fn run(strict: bool) -> i32 {
     } else {
         rep.fail("键名解析", format!("无法识别的键: {}", bad_keys.join(", ")));
     }
+    if cfg.hotkey_priority.unwrap_or(false) {
+        rep.info("模式", "热键优先已开启（低级键盘钩子强占组合键）");
+    } else {
+        rep.info("模式", "普通模式（系统热键注册，先到先得）");
+    }
     if duplicates.is_empty() {
         rep.pass("重复绑定", "没有两个功能抢同一个组合键");
     } else {
@@ -267,14 +276,23 @@ pub fn run(strict: bool) -> i32 {
     } else if probe_items.is_empty() {
         rep.warn("跳过", "没有键名合法的槽位可测");
     } else {
+        let priority = cfg.hotkey_priority.unwrap_or(false);
         for (id, label, ok, err) in probe_hotkey_registration(probe_items) {
             if ok {
                 rep.pass(&label, format!("id={id} 注册成功（本次探测已注销）"));
             } else if err == ERROR_HOTKEY_ALREADY_REGISTERED {
-                rep.fail(
-                    &label,
-                    format!("id={id} 组合键已被其它程序占用 (ERROR_HOTKEY_ALREADY_REGISTERED)"),
-                );
+                // 优先模式下这个键仍会被钩子拦到，不算致命
+                if priority {
+                    rep.warn(
+                        &label,
+                        format!("id={id} 组合键被其它程序占用，但优先模式会用键盘钩子抢到"),
+                    );
+                } else {
+                    rep.fail(
+                        &label,
+                        format!("id={id} 组合键已被其它程序占用 (ERROR_HOTKEY_ALREADY_REGISTERED)"),
+                    );
+                }
             } else {
                 rep.fail(&label, format!("id={id} 注册失败，Win32 错误码 {err}"));
             }
@@ -292,6 +310,18 @@ pub fn run(strict: bool) -> i32 {
             Err(e) => rep.fail(
                 "WH_MOUSE_LL",
                 format!("安装失败: {e}（点透会不可用，通常是安全软件拦截）"),
+            ),
+        }
+
+        // 优先模式依赖低级键盘钩子，这里单独探测一次
+        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) {
+            Ok(hook) => {
+                let _ = UnhookWindowsHookEx(hook);
+                rep.pass("WH_KEYBOARD_LL", "安装并卸载成功（热键优先模式可用）");
+            }
+            Err(e) => rep.warn(
+                "WH_KEYBOARD_LL",
+                format!("安装失败: {e}（开启「快捷键优先」会退回普通注册模式）"),
             ),
         }
     }
