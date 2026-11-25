@@ -17,6 +17,7 @@ use tray_icon::{
     MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 use windows::core::PCWSTR;
+use windows::core::w;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Input::{GetCurrentInputMessageSource, INPUT_MESSAGE_SOURCE, IMDT_PEN};
@@ -145,9 +146,14 @@ fn request_hotkey_reload() {
     }
 }
 
+/// 单实例互斥体名。自检模块也引用它，避免两边各写一份字符串而漂移。
+pub(crate) const SINGLE_INSTANCE_NAME: PCWSTR =
+    w!("Local\\TransGlass_SingleInstance_C1E0B6B4-18A0-4D5D-9D7A-2C5DFD4D0A2F");
+
 unsafe fn acquire_single_instance() -> Option<SingleInstanceGuard> {
-    let name = windows::core::w!("Local\\TransGlass_SingleInstance_C1E0B6B4-18A0-4D5D-9D7A-2C5DFD4D0A2F");
-    if let Ok(handle) = CreateMutexW(None, true, name) {
+    // 先复位 last error，否则线程上残留的 183 会让新建的互斥体被误判成"已存在"
+    SetLastError(ERROR_SUCCESS);
+    if let Ok(handle) = CreateMutexW(None, true, SINGLE_INSTANCE_NAME) {
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let _ = CloseHandle(handle);
             let _ = focus_existing_instance_window();
@@ -1593,9 +1599,12 @@ fn load_custom_icon() -> Option<tray_icon::Icon> {
 }
 
 fn main() -> Result<(), eframe::Error> {
-    // 自检模式：不进 GUI、不建托盘，跑完直接退出（退出码 0 = 全过）
-    if std::env::args().any(|a| a == "--self-test" || a == "-T") {
-        std::process::exit(selftest::run());
+    // 自检模式：不进 GUI、不建托盘，跑完直接退出
+    //   0 = 全部通过，1 = 有失败项，2 = 严格模式下有警告项
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--self-test") {
+        let strict = args.iter().any(|a| a == "--strict");
+        std::process::exit(selftest::run(strict));
     }
 
     unsafe {
@@ -1815,7 +1824,9 @@ fn get_config_path() -> PathBuf {
 fn load_or_create_hotkey_config() -> HotkeyConfig {
     let path = get_config_path();
     if let Ok(data) = fs::read_to_string(&path) {
-        if let Ok(cfg) = serde_json::from_str::<HotkeyConfig>(&data) {
+        // 记事本/某些编辑器存 UTF-8 会带 BOM，serde_json 不认，先剥掉
+        let text = data.trim_start_matches('\u{feff}');
+        if let Ok(cfg) = serde_json::from_str::<HotkeyConfig>(text) {
             return cfg;
         }
     }
@@ -1874,31 +1885,44 @@ unsafe fn try_register_hotkey(id: i32, spec: &HotkeySpec, _name: &str) {
     }
 }
 
-unsafe fn bind_hotkeys(cfg: &HotkeyConfig) {
-    try_register_hotkey(1, &cfg.increase, "Increase");
-    try_register_hotkey(2, &cfg.decrease, "Decrease");
-    try_register_hotkey(3, &cfg.toggle_top, "ToggleTopmost");
+/// 热键槽位表：(注册 id, 名称, 配置项)。
+///
+/// 主程序的 `bind_hotkeys()` 与自检模块共用这一份，避免两处各写一遍默认值而漂移。
+pub(crate) fn hotkey_slots(cfg: &HotkeyConfig) -> Vec<(i32, &'static str, HotkeySpec)> {
     let toggle_click = cfg.toggle_click_through.clone().unwrap_or(HotkeySpec {
         modifiers: "ALT".into(),
         key: "P".into(),
     });
-    try_register_hotkey(4, &toggle_click, "ToggleClickThrough");
     let toggle_pen = cfg.toggle_pen_passthrough.clone().unwrap_or(HotkeySpec {
         modifiers: "ALT+SHIFT".into(),
         key: "P".into(),
     });
-    try_register_hotkey(5, &toggle_pen, "TogglePenPassthrough");
-    if let Some(spec) = cfg.input_mode_cycle.as_ref() {
-        try_register_hotkey(10, spec, "CycleInputMode");
-    }
-    try_register_hotkey(6, &cfg.reset_current, "ResetCurrent");
-    try_register_hotkey(7, &cfg.reset_all, "ResetAll");
-    try_register_hotkey(8, &cfg.update, "Update");
     let reload = cfg.reload.clone().unwrap_or(HotkeySpec {
         modifiers: "ALT+SHIFT".into(),
         key: "C".into(),
     });
-    try_register_hotkey(9, &reload, "ReloadConfig");
+
+    let mut slots = vec![
+        (1, "增加透明度", cfg.increase.clone()),
+        (2, "减少透明度", cfg.decrease.clone()),
+        (3, "切换置顶", cfg.toggle_top.clone()),
+        (4, "切换鼠标点透", toggle_click),
+        (5, "切换笔点透", toggle_pen),
+        (6, "还原当前窗口", cfg.reset_current.clone()),
+        (7, "还原全部窗口", cfg.reset_all.clone()),
+        (8, "检查更新", cfg.update.clone()),
+        (9, "重载热键配置", reload),
+    ];
+    if let Some(spec) = cfg.input_mode_cycle.as_ref() {
+        slots.push((10, "切换输入模式", spec.clone()));
+    }
+    slots
+}
+
+unsafe fn bind_hotkeys(cfg: &HotkeyConfig) {
+    for (id, name, spec) in hotkey_slots(cfg) {
+        try_register_hotkey(id, &spec, name);
+    }
 }
 
 unsafe fn unregister_all_hotkeys() {

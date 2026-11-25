@@ -1,37 +1,34 @@
-//! 自检 / 诊断模块（`transglass.exe --self-test`）。
+//! 自检 / 诊断模块（`transglass.exe --self-test [--strict]`）。
 //!
 //! 为什么要有这个模块：
 //! 0.2.0 分支里的 `run_code_review()` 与 `run_ui_sandbox_test()` 是"安慰剂"——
 //! 35 处 `run_test!` 的条件参数全部写死为 `true`，打印出来的 ✅ 不代表任何检测结果，
 //! 而且它在 `main()` 里无条件执行，随后立刻 `FreeConsole()`，用户根本看不到。
 //!
-//! 这里保留那套"分组 + 逐项 PASS/FAIL + 汇总"的输出形态，但每一项都换成真实探测：
-//! 配置文件能不能解析、热键键名是否合法、是否重复、能否真的 `RegisterHotKey`、
-//! 低级鼠标钩子能否装上、单实例互斥体是否被占用、是否以管理员运行、DPI 感知级别、
-//! 显示器数量、程序目录是否可写。
+//! 这里保留那套"分组 + 逐项 PASS/FAIL + 汇总"的输出形态，但每一项都换成真实探测。
 //!
-//! 结果同时写到控制台（若从 cmd/PowerShell 启动）和程序目录下的
-//! `transglass_selftest.log`，并用退出码表达结果（0 = 全过，1 = 有失败项）。
+//! 探测顺序有讲究：**先查单实例**。主程序在跑的时候，它自己占着所有热键，
+//! 此时再去 `RegisterHotKey` 必然全部返回 1409，会被误报成"被别的程序占用"，
+//! 所以检测到已有实例就跳过注册探测，而不是给用户一堆假结论。
 
 use std::fmt::Write as _;
 use std::fs;
+use std::path::PathBuf;
 
-use windows::core::w;
 use windows::Win32::Foundation::*;
 use windows::Win32::Security::{
     GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
-use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+use windows::Win32::System::Console::{AttachConsole, SetConsoleOutputCP, ATTACH_PARENT_PROCESS};
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::HiDpi::GetProcessDpiAwareness;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::{get_config_path, parse_modifiers, parse_vk, HotkeyConfig, HotkeySpec};
+use crate::{get_config_path, hotkey_slots, parse_modifiers, parse_vk, HotkeyConfig, SINGLE_INSTANCE_NAME};
 
-/// 单实例互斥体名，必须与 `acquire_single_instance()` 里的一致。
-const SINGLE_INSTANCE_NAME: windows::core::PCWSTR =
-    w!("Local\\TransGlass_SingleInstance_C1E0B6B4-18A0-4D5D-9D7A-2C5DFD4D0A2F");
+const CP_UTF8: u32 = 65001;
+const ERROR_HOTKEY_ALREADY_REGISTERED: u32 = 1409;
 
 struct Report {
     out: String,
@@ -74,61 +71,37 @@ impl Report {
     }
 }
 
-/// 与 `bind_hotkeys()` 保持一致的槽位表：(注册 id, 名称, 配置项)
-fn hotkey_slots(cfg: &HotkeyConfig) -> Vec<(i32, &'static str, HotkeySpec)> {
-    let click = cfg.toggle_click_through.clone().unwrap_or(HotkeySpec {
-        modifiers: "ALT".into(),
-        key: "P".into(),
-    });
-    let pen = cfg.toggle_pen_passthrough.clone().unwrap_or(HotkeySpec {
-        modifiers: "ALT+SHIFT".into(),
-        key: "P".into(),
-    });
-    let reload = cfg.reload.clone().unwrap_or(HotkeySpec {
-        modifiers: "ALT+SHIFT".into(),
-        key: "C".into(),
-    });
-
-    let mut slots = vec![
-        (1, "增加透明度", cfg.increase.clone()),
-        (2, "减少透明度", cfg.decrease.clone()),
-        (3, "切换置顶", cfg.toggle_top.clone()),
-        (4, "切换鼠标点透", click),
-        (5, "切换笔点透", pen),
-        (6, "还原当前窗口", cfg.reset_current.clone()),
-        (7, "还原全部窗口", cfg.reset_all.clone()),
-        (8, "检查更新", cfg.update.clone()),
-        (9, "重载热键配置", reload),
-    ];
-    if let Some(spec) = cfg.input_mode_cycle.as_ref() {
-        slots.push((10, "切换输入模式", spec.clone()));
-    }
-    slots
-}
-
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     CallNextHookEx(None, code, wparam, lparam)
 }
 
-/// 在独立线程里逐个真实注册热键（`RegisterHotKey` 绑定到调用线程，必须同线程注册/注销）。
-fn probe_hotkey_registration(
-    items: Vec<(i32, String, u32, u32)>,
-) -> Vec<(i32, String, bool, u32)> {
+/// 在独立线程里**先全部注册、再统一注销**。
+///
+/// 用注册失败（1409）来暴露"两个功能抢同一个键"这种真实冲突——
+/// 如果注册完一项就立刻注销，重复绑定会双双 PASS，报告自相矛盾。
+fn probe_hotkey_registration(items: Vec<(i32, String, u32, u32)>) -> Vec<(i32, String, bool, u32)> {
     std::thread::spawn(move || {
         let mut results = Vec::new();
-        // 建消息队列，避免某些系统对无队列线程注册热键的行为差异
+        let mut ok_ids = Vec::new();
+        // 建消息队列，保证 `RegisterHotKey(None, ...)` 绑定到本线程且行为确定
         let mut msg = MSG::default();
         unsafe {
             let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+            SetLastError(ERROR_SUCCESS);
         }
         for (id, label, mods_bits, vk) in items {
             unsafe {
                 let ok = RegisterHotKey(None, id, HOT_KEY_MODIFIERS(mods_bits), vk).is_ok();
                 let err = if ok { 0 } else { GetLastError().0 };
                 if ok {
-                    let _ = UnregisterHotKey(None, id);
+                    ok_ids.push(id);
                 }
                 results.push((id, label, ok, err));
+            }
+        }
+        for id in ok_ids {
+            unsafe {
+                let _ = UnregisterHotKey(None, id);
             }
         }
         results
@@ -137,29 +110,99 @@ fn probe_hotkey_registration(
     .unwrap_or_default()
 }
 
-pub fn run() -> i32 {
+enum Elevation {
+    Elevated,
+    Normal,
+    Unknown(String),
+}
+
+fn query_elevation() -> Elevation {
+    unsafe {
+        let mut token = HANDLE::default();
+        if let Err(e) = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) {
+            return Elevation::Unknown(format!("OpenProcessToken 失败: {e}"));
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        let res = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut core::ffi::c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        );
+        let _ = CloseHandle(token);
+        match res {
+            Ok(()) if elevation.TokenIsElevated != 0 => Elevation::Elevated,
+            Ok(()) => Elevation::Normal,
+            Err(e) => Elevation::Unknown(format!("GetTokenInformation 失败: {e}")),
+        }
+    }
+}
+
+fn log_targets(cfg_path: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = vec![cfg_path.with_file_name("transglass_selftest.log")];
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        out.push(PathBuf::from(local).join("TransGlass").join("transglass_selftest.log"));
+    }
+    out
+}
+
+pub fn run(strict: bool) -> i32 {
     let mut rep = Report::new();
 
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<unknown>".into());
-    let _ = writeln!(rep.out, "TransGlass 自检报告");
+    let _ = writeln!(rep.out, "TransGlass 自检报告{}", if strict { "（严格模式）" } else { "" });
     let _ = writeln!(rep.out, "版本: v{}", env!("CARGO_PKG_VERSION"));
     let _ = writeln!(rep.out, "程序: {exe}");
 
-    // ---------- 1. 配置文件 ----------
+    // ---------- 1. 单实例（必须最先，否则会污染热键探测） ----------
+    rep.section("单实例");
+    let instance_running = unsafe {
+        SetLastError(ERROR_SUCCESS);
+        match CreateMutexW(None, true, SINGLE_INSTANCE_NAME) {
+            Ok(handle) => {
+                let already = GetLastError() == ERROR_ALREADY_EXISTS;
+                let _ = CloseHandle(handle);
+                already
+            }
+            Err(e) => {
+                rep.fail("互斥体", format!("创建失败: {e}"));
+                false
+            }
+        }
+    };
+    if instance_running {
+        rep.warn("互斥体", "已有另一个 TransGlass 在运行（热键注册探测将被跳过）");
+    } else {
+        rep.pass("互斥体", "当前没有其它实例占用");
+    }
+
+    // ---------- 2. 配置文件 ----------
     rep.section("配置文件");
     let cfg_path = get_config_path();
     rep.info("路径", cfg_path.display().to_string());
+    let mut used_default = false;
     let mut cfg = None;
     match fs::read_to_string(&cfg_path) {
-        Ok(text) => match serde_json::from_str::<HotkeyConfig>(&text) {
-            Ok(c) => {
-                rep.pass("解析", format!("{} 字节，JSON 结构正确", text.len()));
-                cfg = Some(c);
+        Ok(raw) => {
+            // 记事本存 UTF-8 会带 BOM，serde_json 不认，先剥掉再解析
+            let text = raw.trim_start_matches('\u{feff}');
+            match serde_json::from_str::<HotkeyConfig>(text) {
+                Ok(c) => {
+                    rep.pass("解析", format!("{} 字节，JSON 结构正确", text.len()));
+                    cfg = Some(c);
+                }
+                Err(e) => {
+                    rep.fail("解析", format!("JSON 无法解析为热键配置: {e}"));
+                    if raw.starts_with('\u{feff}') {
+                        rep.info("提示", "文件带 UTF-8 BOM，已自动剥除后重试");
+                    }
+                }
             }
-            Err(e) => rep.fail("解析", format!("JSON 无法解析为热键配置: {e}")),
-        },
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => rep.warn(
             "读取",
             "配置文件不存在（首次运行或刚换目录，属正常），下面用内置默认值检测",
@@ -167,32 +210,40 @@ pub fn run() -> i32 {
         Err(e) => rep.fail("读取", format!("读不到配置文件: {e}")),
     }
     if cfg.is_none() {
-        // 缺文件时退回默认值继续跑其余检测，但要明确报失败
-        rep.warn("回退", "将使用内置默认热键继续检测（运行主程序会重新生成该文件）");
+        used_default = true;
+        rep.warn("回退", "使用内置默认热键继续检测（运行主程序会重新生成该文件）");
         cfg = Some(crate::default_config());
     }
     let cfg = cfg.expect("cfg always present");
 
-    // ---------- 2. 热键配置合法性 ----------
+    // ---------- 3. 热键配置合法性 ----------
     rep.section("热键配置");
     let slots = hotkey_slots(&cfg);
-    let mut seen: Vec<(String, &'static str)> = Vec::new();
     let mut bad_keys: Vec<String> = Vec::new();
     let mut duplicates: Vec<String> = Vec::new();
+    // 去重键用 (modifiers 位, vk) —— 按字符串比会把 "SHIFT+ALT+P" 与 "ALT+SHIFT+P" 当成两个键
+    let mut seen: Vec<((u32, u32), &'static str)> = Vec::new();
     let mut probe_items: Vec<(i32, String, u32, u32)> = Vec::new();
 
     for (id, label, spec) in &slots {
         let (mods, vk) = unsafe { (parse_modifiers(&spec.modifiers), parse_vk(&spec.key)) };
-        let combo = format!("{}+{}", spec.modifiers.trim().to_uppercase(), spec.key.trim().to_uppercase());
+        let combo = format!(
+            "{}+{}",
+            spec.modifiers.trim().to_uppercase(),
+            spec.key.trim().to_uppercase()
+        );
         if vk == 0 {
+            // 键名不合法时主程序直接跳过注册，这里也不该拿去真实注册：
+            // Win32 对 vk=0 的 RegisterHotKey 会返回成功，测了也是假的
             bad_keys.push(format!("{label}({combo})"));
+            continue;
         }
-        probe_items.push((*id, format!("{label} ({combo})"), mods.0, vk));
-        if let Some((_, other)) = seen.iter().find(|(c, _)| c == &combo) {
+        if let Some((_, other)) = seen.iter().find(|(k, _)| *k == (mods.0, vk)) {
             duplicates.push(format!("{label} 与 {other} 都是 {combo}"));
         } else {
-            seen.push((combo, *label));
+            seen.push(((mods.0, vk), *label));
         }
+        probe_items.push((*id, format!("{label} ({combo})"), mods.0, vk));
     }
 
     if bad_keys.is_empty() {
@@ -206,28 +257,31 @@ pub fn run() -> i32 {
         rep.fail("重复绑定", duplicates.join("; "));
     }
 
-    // ---------- 3. 热键实际注册 ----------
+    // ---------- 4. 热键实际注册 ----------
     rep.section("热键注册");
-    let results = probe_hotkey_registration(probe_items);
-    if results.is_empty() {
-        rep.fail("注册", "探测线程没有返回结果");
+    if used_default {
+        rep.warn("基准", "以下注册结果基于内置默认键位，不是你配置文件里的键位");
+    }
+    if instance_running {
+        rep.warn("跳过", "已有实例在运行，它占着全部热键，注册探测无意义");
+    } else if probe_items.is_empty() {
+        rep.warn("跳过", "没有键名合法的槽位可测");
     } else {
-        for (id, label, ok, err) in &results {
-            if *ok {
-                rep.pass(label, format!("id={id} 注册成功（已立即注销）"));
-            } else if *err == 1409 {
-                // ERROR_HOTKEY_ALREADY_REGISTERED
+        for (id, label, ok, err) in probe_hotkey_registration(probe_items) {
+            if ok {
+                rep.pass(&label, format!("id={id} 注册成功（本次探测已注销）"));
+            } else if err == ERROR_HOTKEY_ALREADY_REGISTERED {
                 rep.fail(
-                    label,
+                    &label,
                     format!("id={id} 组合键已被其它程序占用 (ERROR_HOTKEY_ALREADY_REGISTERED)"),
                 );
             } else {
-                rep.fail(label, format!("id={id} 注册失败，Win32 错误码 {err}"));
+                rep.fail(&label, format!("id={id} 注册失败，Win32 错误码 {err}"));
             }
         }
     }
 
-    // ---------- 4. 低级鼠标钩子 ----------
+    // ---------- 5. 低级鼠标钩子 ----------
     rep.section("鼠标钩子");
     unsafe {
         match SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) {
@@ -242,51 +296,17 @@ pub fn run() -> i32 {
         }
     }
 
-    // ---------- 5. 单实例 ----------
-    rep.section("单实例");
-    unsafe {
-        match CreateMutexW(None, true, SINGLE_INSTANCE_NAME) {
-            Ok(handle) => {
-                let already = GetLastError() == ERROR_ALREADY_EXISTS;
-                let _ = CloseHandle(handle);
-                if already {
-                    rep.warn("互斥体", "已有另一个 TransGlass 在运行");
-                } else {
-                    rep.pass("互斥体", "当前没有其它实例占用");
-                }
-            }
-            Err(e) => rep.fail("互斥体", format!("创建失败: {e}")),
-        }
-    }
-
     // ---------- 6. 运行环境 ----------
     rep.section("运行环境");
-    let elevated = unsafe {
-        let mut token = HANDLE::default();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_ok() {
-            let mut elevation = TOKEN_ELEVATION::default();
-            let mut len = 0u32;
-            let ok = GetTokenInformation(
-                token,
-                TokenElevation,
-                Some(&mut elevation as *mut _ as *mut core::ffi::c_void),
-                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                &mut len,
-            )
-            .is_ok();
-            let _ = CloseHandle(token);
-            ok && elevation.TokenIsElevated != 0
-        } else {
-            false
-        }
-    };
-    if elevated {
-        rep.warn(
+    match query_elevation() {
+        Elevation::Elevated => rep.warn(
             "权限",
             "以管理员身份运行：能操作管理员窗口，但低级鼠标钩子可能被 UIPI 限制",
-        );
-    } else {
-        rep.pass("权限", "普通用户权限：无法操作以管理员运行的窗口（设计如此）");
+        ),
+        Elevation::Normal => {
+            rep.pass("权限", "普通用户权限：无法操作以管理员运行的窗口（设计如此）")
+        }
+        Elevation::Unknown(e) => rep.warn("权限", format!("查询失败，无法判断: {e}")),
     }
 
     unsafe {
@@ -310,6 +330,8 @@ pub fn run() -> i32 {
         let monitors = GetSystemMetrics(SM_CMONITORS);
         if monitors >= 1 {
             rep.info("显示器数量", monitors.to_string());
+        } else {
+            rep.warn("显示器数量", "查询失败（GetSystemMetrics 返回 0）");
         }
     }
 
@@ -331,12 +353,20 @@ pub fn run() -> i32 {
         "\n=== 汇总: {} / {} 通过，{} 失败，{} 警告 ===",
         rep.passed, total, rep.failed, rep.warned
     );
-    let code = if rep.failed > 0 { 1 } else { 0 };
+    let code = if rep.failed > 0 {
+        1
+    } else if strict && rep.warned > 0 {
+        2
+    } else {
+        0
+    };
     let _ = writeln!(rep.out, "退出码: {code}");
 
-    // 输出：控制台（若父进程有）+ 程序目录日志文件
+    // 输出：控制台（若父进程有）+ 日志文件（程序目录优先，失败则退到 %LOCALAPPDATA%）
     unsafe {
         if AttachConsole(ATTACH_PARENT_PROCESS).is_ok() {
+            // 父控制台通常是 936 代码页，直接写 UTF-8 会乱码
+            let _ = SetConsoleOutputCP(CP_UTF8);
             if let Ok(mut con) = fs::OpenOptions::new().write(true).open("CONOUT$") {
                 use std::io::Write as _;
                 let _ = con.write_all(rep.out.as_bytes());
@@ -344,14 +374,40 @@ pub fn run() -> i32 {
             }
         }
     }
-    let log_path = cfg_path.with_file_name("transglass_selftest.log");
+
     // 带 BOM 写出，避免老版记事本把中文判成 ANSI
-    let mut log_body = String::from("\u{FEFF}");
-    log_body.push_str(&rep.out);
-    if let Err(e) = fs::write(&log_path, log_body.as_bytes()) {
-        // 连日志都写不进去时至少让控制台看到
-        eprintln!("无法写入 {}: {e}", log_path.display());
-        print!("{}", rep.out);
+    let mut body = String::from("\u{FEFF}");
+    body.push_str(&rep.out);
+    let mut written = None;
+    for target in log_targets(&cfg_path) {
+        if let Some(dir) = target.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        match fs::write(&target, body.as_bytes()) {
+            Ok(()) => {
+                written = Some(target);
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    match written {
+        Some(p) => {
+            unsafe {
+                if AttachConsole(ATTACH_PARENT_PROCESS).is_ok() {
+                    let _ = SetConsoleOutputCP(CP_UTF8);
+                    if let Ok(mut con) = fs::OpenOptions::new().write(true).open("CONOUT$") {
+                        use std::io::Write as _;
+                        let _ = writeln!(con, "\r\n[报告已写入] {}", p.display());
+                    }
+                }
+            }
+        }
+        None => {
+            // GUI 子系统下 stderr 可能无处可去，这里尽力而为
+            eprintln!("无法写入自检日志（程序目录与 %LOCALAPPDATA% 均不可写）");
+            print!("{}", rep.out);
+        }
     }
 
     code
