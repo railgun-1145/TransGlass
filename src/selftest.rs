@@ -226,18 +226,18 @@ pub fn run(strict: bool) -> i32 {
     let mut probe_items: Vec<(i32, String, u32, u32)> = Vec::new();
 
     for (id, label, spec) in &slots {
-        let (mods, vk) = unsafe { (parse_modifiers(&spec.modifiers), parse_vk(&spec.key)) };
+        let mods = unsafe { parse_modifiers(&spec.modifiers) };
         let combo = format!(
             "{}+{}",
             spec.modifiers.trim().to_uppercase(),
             spec.key.trim().to_uppercase()
         );
-        if vk == 0 {
+        let Some(vk) = (unsafe { parse_vk(&spec.key) }) else {
             // 键名不合法时主程序直接跳过注册，这里也不该拿去真实注册：
             // Win32 对 vk=0 的 RegisterHotKey 会返回成功，测了也是假的
             bad_keys.push(format!("{label}({combo})"));
             continue;
-        }
+        };
         if let Some((_, other)) = seen.iter().find(|(k, _)| *k == (mods.0, vk)) {
             duplicates.push(format!("{label} 与 {other} 都是 {combo}"));
         } else {
