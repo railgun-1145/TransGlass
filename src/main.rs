@@ -213,8 +213,25 @@ fn cycle_input_mode() {
     request_ui_repaint();
 }
 
+/// 退出路径诊断（设 `TRANSGLASS_DEBUG_EXIT=1` 才写，默认关闭）。
+fn debug_exit_note(kind: &str) {
+    if std::env::var_os("TRANSGLASS_DEBUG_EXIT").is_none() {
+        return;
+    }
+    let path = std::env::temp_dir().join("transglass_exit.txt");
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write as _;
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "{ms} {kind}");
+    }
+}
+
 fn request_app_exit() {
     APP_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+    debug_exit_note("exit-requested");
 
     // 兜底：窗口隐藏时 egui 不再重绘，只靠 WM_CLOSE 可能永远走不到退出流程，
     // 进程会一直挂在后台，用户再从托盘启动时就容易看到"图标越来越多"。
@@ -222,6 +239,7 @@ fn request_app_exit() {
     // 这里只兜底进程残留。
     thread::spawn(|| {
         thread::sleep(std::time::Duration::from_millis(1500));
+        debug_exit_note("fallback-exit");
         unsafe {
             restore_all_windows();
             uninstall_mouse_hook();
@@ -1871,7 +1889,7 @@ fn main() -> Result<(), eframe::Error> {
         }
     });
 
-    let _tray_icon = create_tray_icon();
+    let tray_icon = create_tray_icon();
 
     thread::spawn(|| unsafe {
         HOTKEY_THREAD_ID.store(GetCurrentThreadId(), Ordering::Relaxed);
@@ -1935,15 +1953,22 @@ fn main() -> Result<(), eframe::Error> {
             .with_inner_size([320.0, 450.0])
             .with_title("TransGlass 控制面板")
             .with_visible(true),
-        run_and_return: false,
+        // 必须是 true：false 时 eframe 会在关闭后直接 std::process::exit，
+        // main 里的局部变量（尤其是 TrayIcon）不会 drop，托盘图标就会变成 ghost
+        run_and_return: true,
         ..Default::default()
     };
 
-    eframe::run_native(
+    debug_exit_note("run-native-enter");
+    let result = eframe::run_native(
         "TransGlass 控制面板",
         options,
         Box::new(|cc| Ok(Box::new(TransGlassApp::new(cc)))),
-    )
+    );
+    debug_exit_note("run-native-return");
+    // 显式删除托盘图标：drop 会触发 Shell_NotifyIconW(NIM_DELETE)
+    drop(tray_icon);
+    result
 }
 
 fn run_self_update() -> Result<(), Box<dyn std::error::Error>> {
