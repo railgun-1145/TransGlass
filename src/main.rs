@@ -4082,7 +4082,7 @@ unsafe fn ball_render() {
     draw_block(bx, by, 27.0, true);
     if t > 0.02 {
         for (sx, sy) in ball_satellites(t) {
-            let sr = 17.0 * (0.6 + 0.4 * t);
+            let sr = 21.0 * (0.6 + 0.4 * t);
             draw_block(sx, sy, sr, false);
         }
     }
@@ -4090,7 +4090,7 @@ unsafe fn ball_render() {
     let _ = SetBkMode(mem, TRANSPARENT);
     let _ = SetTextColor(mem, COLORREF(0x00FF_FFFF));
     let font_ball = CreateFontW(
-        20, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0,
+        24, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0,
         windows::core::w!("Microsoft YaHei"),
     );
     let old_font = SelectObject(mem, HGDIOBJ(font_ball.0));
@@ -4101,13 +4101,13 @@ unsafe fn ball_render() {
     if t > 0.02 {
         let _ = SetTextColor(mem, COLORREF(0x00F0_F6FA));
         let font_sat = CreateFontW(
-            12, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 0, 0,
+            15, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0,
             windows::core::w!("Microsoft YaHei"),
         );
         let old_sat = SelectObject(mem, HGDIOBJ(font_sat.0));
         let labels = ["透-", "透+", "置顶", "穿透", "模式", "还原"];
         for (i, (sx, sy)) in ball_satellites(t).iter().enumerate() {
-            let sr = (17.0 * (0.6 + 0.4 * t)) as i32;
+            let sr = (21.0 * (0.6 + 0.4 * t)) as i32;
             let mut txt: Vec<u16> = labels[i].encode_utf16().collect();
             let mut tr = RECT {
                 left: sx - sr,
@@ -4169,12 +4169,12 @@ unsafe fn ball_render() {
 unsafe fn ball_hit(x: i32, y: i32) -> u8 {
     let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
     let (bx, by) = ball_center();
-    if ((x - bx).pow(2) + (y - by).pow(2)) <= 30 * 30 {
+    if ((x - bx).pow(2) + (y - by).pow(2)) <= 34 * 34 {
         return 9; // 球本身
     }
     if t > 0.5 {
         for (i, (sx, sy)) in ball_satellites(t).iter().enumerate() {
-            if ((x - sx).pow(2) + (y - sy).pow(2)) <= 18 * 18 {
+            if ((x - sx).pow(2) + (y - sy).pow(2)) <= 23 * 23 {
                 return (i + 1) as u8;
             }
         }
