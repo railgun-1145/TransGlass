@@ -25,6 +25,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 mod selftest;
+mod doll;
 
 // --- 核心状态注册表 ---
 #[derive(Clone)]
@@ -2327,10 +2328,46 @@ impl eframe::App for TransGlassApp {
                                     }
                                 }
                             });
-                        if choose_skin != self.ui_state.skin {
+                        // 纸娃娃模型：宽 Steve / 细 Alex / 自动按皮肤判定
+                        let forced = ui_doll_model(&self.ui_state);
+                        let mut pick: Option<doll::ModelKind> = forced;
+                        let auto_label = match BALL_SKIN
+                            .read()
+                            .ok()
+                            .and_then(|g| g.as_ref().map(|s| s.model))
+                        {
+                            Some(m) => format!("自动（{}）", m.label()),
+                            None => "自动（按皮肤）".to_string(),
+                        };
+                        egui::ComboBox::from_label("纸娃娃模型")
+                            .selected_text(match pick {
+                                Some(m) => m.label(),
+                                None => auto_label.as_str(),
+                            })
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(pick.is_none(), "自动（按皮肤判定）")
+                                    .clicked()
+                                {
+                                    pick = None;
+                                }
+                                for m in [doll::ModelKind::Classic, doll::ModelKind::Slim] {
+                                    if ui.selectable_label(pick == Some(m), m.label()).clicked() {
+                                        pick = Some(m);
+                                    }
+                                }
+                            });
+                        let model_changed = pick != forced;
+                        if model_changed {
+                            self.ui_state.doll_model = pick.map(|m| m.as_str().to_string());
+                        }
+                        if choose_skin != self.ui_state.skin || model_changed {
                             self.ui_state.skin = choose_skin.clone();
                             save_ui_state(&self.ui_state);
-                            load_ball_skin(choose_skin.as_deref());
+                            load_ball_skin(
+                                choose_skin.as_deref(),
+                                ui_doll_model(&self.ui_state),
+                            );
                             unsafe { ball_render() };
                         }
                         ui.add_space(6.0);
@@ -2722,13 +2759,15 @@ fn main() -> Result<(), eframe::Error> {
     PERF_ON.store(std::env::var_os("TRANSGLASS_DEBUG_PERF").is_some(), Ordering::Relaxed);
     spawn_quit_listener();
     load_ball_tex();
-    load_ball_skin(load_ui_state().skin.as_deref());
+    let boot_state = load_ui_state();
+    load_ball_skin(boot_state.skin.as_deref(), ui_doll_model(&boot_state));
     if let Some(sc) = load_ui_state().ball_scale {
         BALL_SCALE.store(sc.to_bits(), Ordering::Relaxed);
     }
     unsafe { ball_spawn() };
     unsafe { purge_shell_managed() };
     spawn_device_tracking_ticker();
+    spawn_doll_ticker();
 
     thread::spawn(|| {
         while let Ok(event) = MenuEvent::receiver().recv() {
@@ -3084,9 +3123,15 @@ struct UiState {
     preview_fps: Option<u32>,
     ball_scale: Option<f32>,
     skin: Option<String>,
+    /// 纸娃娃模型：None = 按皮肤自动判定，Some("classic"/"slim") = 强制
+    doll_model: Option<String>,
     view_mode: Option<u8>,
     /// 兼容旧配置
     preview_rate: Option<u8>,
+}
+
+fn ui_doll_model(st: &UiState) -> Option<doll::ModelKind> {
+    st.doll_model.as_deref().and_then(doll::ModelKind::parse)
 }
 
 fn ui_state_path() -> PathBuf {
@@ -4013,7 +4058,15 @@ static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static BALL_EXPANDED: AtomicBool = AtomicBool::new(false);
 static BALL_ANIM: AtomicU32 = AtomicU32::new(0);
 static BALL_CURSOR: AtomicU64 = AtomicU64::new(0);
-static BALL_SCALE: AtomicU32 = AtomicU32::new(0); // f32 bits，纸娃娃缩放 // f32 bits，0..1 弹出动画
+static BALL_SCALE: AtomicU32 = AtomicU32::new(0); // f32 bits，0..1 弹出动画
+/// 纸娃娃：平滑后的身体朝向 / 头部额外偏转 / 头部俯仰（f32 bits）
+static BALL_YAW: AtomicU32 = AtomicU32::new(0);
+static BALL_HEAD_YAW: AtomicU32 = AtomicU32::new(0);
+static BALL_HEAD_PITCH: AtomicU32 = AtomicU32::new(0);
+/// 上一次"光标在动"的时间（anim_secs 的 f32 bits）
+static BALL_LAST_ACTIVE: AtomicU32 = AtomicU32::new(0);
+/// 纸娃娃当前占用的窗口内矩形（用于点击命中，0 = 无）
+static BALL_DOLL_RECT: AtomicU64 = AtomicU64::new(0);
 static BALL_REQ_PANEL: AtomicBool = AtomicBool::new(false);
 static BALL_REQ_MINI: AtomicBool = AtomicBool::new(false);
 static BALL_REQ_RESTORE: AtomicBool = AtomicBool::new(false);
@@ -4047,6 +4100,127 @@ unsafe fn ball_satellites(t: f32) -> [(i32, i32); 6] {
         );
     }
     out
+}
+
+/// 单调动画时钟（秒）。不能用 SystemTime 毫秒直接转 f32：数值太大精度只剩分钟级。
+fn anim_secs() -> f32 {
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f32()
+}
+
+#[inline]
+fn wrap_pi(mut a: f32) -> f32 {
+    let tau = std::f32::consts::TAU;
+    while a > std::f32::consts::PI {
+        a -= tau;
+    }
+    while a < -std::f32::consts::PI {
+        a += tau;
+    }
+    a
+}
+
+#[inline]
+fn pack_rect(x0: i32, y0: i32, x1: i32, y1: i32) -> u64 {
+    let c = |v: i32| (v.clamp(0, 4095) as u64) & 0xFFF;
+    c(x0) | (c(y0) << 12) | (c(x1) << 24) | (c(y1) << 36) | (1u64 << 63)
+}
+
+fn unpack_rect(v: u64) -> Option<(i32, i32, i32, i32)> {
+    if v & (1u64 << 63) == 0 {
+        return None;
+    }
+    Some((
+        (v & 0xFFF) as i32,
+        ((v >> 12) & 0xFFF) as i32,
+        ((v >> 24) & 0xFFF) as i32,
+        ((v >> 36) & 0xFFF) as i32,
+    ))
+}
+
+/// 按光标方向推进纸娃娃朝向（指数平滑）。返回 (身体剩余差, 头剩余差)，
+/// 都接近 0 说明姿态已经收敛，可以降低重绘帧率。
+fn update_doll_pose() -> (f32, f32) {
+    const DT: f32 = 0.033;
+    let (bx, by) = unsafe { ball_center() };
+    let cx = BALL_POS_X.load(Ordering::Relaxed) as f32 + bx as f32;
+    let cy = BALL_POS_Y.load(Ordering::Relaxed) as f32 + by as f32;
+    let mut cp = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut cp);
+    }
+    let dx = cp.x as f32 - cx;
+    let dy = cp.y as f32 - cy;
+
+    let t = anim_secs();
+    // 光标在球正上方 = 正面朝观察者，右侧 = 向右转，正下方 = 背面
+    let sway = (t * 0.63).sin() * 0.035;
+    let target = dx.atan2(-dy) + sway;
+
+    let body = f32::from_bits(BALL_YAW.load(Ordering::Relaxed));
+    let head = f32::from_bits(BALL_HEAD_YAW.load(Ordering::Relaxed));
+    let pitch = f32::from_bits(BALL_HEAD_PITCH.load(Ordering::Relaxed));
+
+    let body_k = 1.0 - (-12.0f32 * DT).exp();
+    let head_k = 1.0 - (-18.0f32 * DT).exp();
+    let nb = body + wrap_pi(target - body) * body_k;
+    // 头在身体基础上再追角度，限制 ±38°，看起来像"回头看着光标"
+    let head_target = wrap_pi(target - nb).clamp(-0.66, 0.66) + (t * 0.9).sin() * 0.03;
+    let nh = head + (head_target - head) * head_k;
+    // 光标越低越低头（幅度收着点，8x8 的头转太多会显得扭曲）
+    let pitch_target = (dy / 300.0).clamp(-0.22, 0.28);
+    let np = pitch + (pitch_target - pitch) * head_k;
+
+    BALL_YAW.store(nb.to_bits(), Ordering::Relaxed);
+    BALL_HEAD_YAW.store(nh.to_bits(), Ordering::Relaxed);
+    BALL_HEAD_PITCH.store(np.to_bits(), Ordering::Relaxed);
+    (
+        wrap_pi(target - nb).abs(),
+        (head_target - nh).abs() + (pitch_target - np).abs(),
+    )
+}
+
+/// 纸娃娃动画循环：光标在动或姿态未收敛时 ~30fps，静置时降到 ~7fps 保住 CPU。
+fn spawn_doll_ticker() {
+    thread::spawn(|| {
+        let mut last_render = f32::NEG_INFINITY;
+        loop {
+            thread::sleep(std::time::Duration::from_millis(33));
+            if APP_EXIT_REQUESTED.load(Ordering::Relaxed) {
+                break;
+            }
+            let hwnd = BALL_HWND.load(Ordering::Relaxed);
+            if hwnd == 0 {
+                continue;
+            }
+            unsafe {
+                if !IsWindowVisible(HWND(hwnd as *mut _)).as_bool() {
+                    continue;
+                }
+            }
+            if BALL_SKIN.read().map(|g| g.is_none()).unwrap_or(true) {
+                continue;
+            }
+            let mut cp = POINT::default();
+            unsafe {
+                let _ = GetCursorPos(&mut cp);
+            }
+            let packed = ((cp.x as u32 as u64) << 32) | (cp.y as u32 as u64);
+            let prev = BALL_CURSOR.swap(packed, Ordering::Relaxed);
+            if prev != packed {
+                BALL_LAST_ACTIVE.store(anim_secs().to_bits(), Ordering::Relaxed);
+            }
+            let (rest_body, rest_head) = update_doll_pose();
+            let t = anim_secs();
+            let last_active = f32::from_bits(BALL_LAST_ACTIVE.load(Ordering::Relaxed));
+            let moving = rest_body > 0.004 || rest_head > 0.004;
+            let active = last_active > 0.0 && (t - last_active) < 0.5;
+            if moving || active || (t - last_render) >= 0.14 {
+                last_render = t;
+                unsafe { ball_render() };
+            }
+        }
+    });
 }
 
 unsafe fn ball_render() {
@@ -4085,9 +4259,8 @@ unsafe fn ball_render() {
 
     let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
     let (bx, by) = ball_center();
-    let r = 27i32;
 
-    // 主球 + 卫星：统一的圆角玻璃块（抗锯齿）
+    // 卫星：统一的圆角玻璃块（抗锯齿）
     {
     let mut draw_block = |cx: i32, cy: i32, half: f32, is_main: bool| {
         let span = (half + 2.0).ceil() as i32;
@@ -4137,82 +4310,42 @@ unsafe fn ball_render() {
     }
     }
 
-    // 中间：MC 纸娃娃（随光标转向：正面 / 背面 / 左 / 右）
+    // 中间：MC 3D 纸娃娃（基岩版左上角纸娃娃观感，随光标连续转向）
     let skin_guard = BALL_SKIN.read().ok();
     if let Some(skin) = skin_guard.as_ref().and_then(|g| g.as_ref()) {
         let stored = f32::from_bits(BALL_SCALE.load(Ordering::Relaxed));
         let unit = if stored > 0.1 { stored } else { 2.1 };
-        let bob = {
-            let ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as f32)
-                .unwrap_or(0.0);
-            ((ms / 900.0) * std::f32::consts::TAU).sin() * 1.4
+        let t = anim_secs();
+        // 待机上下浮动
+        let bob = ((t / 2.6) * std::f32::consts::TAU).sin() * 1.4;
+        let pose = doll::Pose {
+            yaw: f32::from_bits(BALL_YAW.load(Ordering::Relaxed)),
+            cam_pitch: 18.0f32.to_radians(),
+            head_yaw: f32::from_bits(BALL_HEAD_YAW.load(Ordering::Relaxed)),
+            head_pitch: f32::from_bits(BALL_HEAD_PITCH.load(Ordering::Relaxed)),
+            // 待机手臂轻摆（左右反向）
+            arm_swing: ((t / 5.0) * std::f32::consts::TAU).sin() * 2.2f32.to_radians(),
+            leg_swing: 0.0,
+            scale: unit,
+            dist: 95.0,
+            ss: 3,
         };
-        let top = by as f32 - 32.0 * unit * 0.5 + 3.0 + bob;
-        let left = bx as f32 - 8.0 * unit;
-
-        // 光标方向 → 朝向
-        let mut cp = POINT::default();
-        let _ = GetCursorPos(&mut cp);
-        let cx = (BALL_POS_X.load(Ordering::Relaxed) + bx) as f32;
-        let cy = (BALL_POS_Y.load(Ordering::Relaxed) + by) as f32;
-        let ddx = cp.x as f32 - cx;
-        let ddy = cp.y as f32 - cy;
-        // 0 正面 / 1 背面 / 2 左 / 3 右
-        let facing = if ddy.abs() > ddx.abs() * 1.4 {
-            if ddy > 0.0 { 1 } else { 0 }
-        } else if ddx < 0.0 {
-            2
-        } else {
-            3
-        };
-
-        // 各面 UV（正面/背面），左右面用正面镜像 + 侧面头
-        let (uv_head, uv_body, uv_ra, uv_la, uv_rl, uv_ll) = match facing {
-            1 => ((24, 8), (32, 20), (52, 20), (44, 52), (12, 20), (28, 52)),
-            2 => ((16, 8), (20, 20), (44, 20), (36, 52), (4, 20), (20, 52)),
-            3 => ((0, 8), (20, 20), (44, 20), (36, 52), (4, 20), (20, 52)),
-            _ => ((8, 8), (20, 20), (44, 20), (36, 52), (4, 20), (20, 52)),
-        };
-        let mirror = facing == 2;
-
-        let mut part = |u0: u32, v0: u32, pw: u32, ph: u32, ox: f32, oy: f32| -> () {
-            let x0 = (left + ox * unit) as i32;
-            let y0 = (top + oy * unit) as i32;
-            let wpx = (pw as f32 * unit) as i32;
-            let hpx = (ph as f32 * unit) as i32;
-            for yy in 0..hpx {
-                for xx in 0..wpx {
-                    let sx = if mirror { wpx - 1 - xx } else { xx };
-                    let tx = u0 + (sx as f32 / unit) as u32;
-                    let ty = v0 + (yy as f32 / unit) as u32;
-                    if tx >= skin.width() || ty >= skin.height() {
-                        continue;
-                    }
-                    let px = skin.get_pixel(tx, ty);
-                    if px[3] == 0 {
-                        continue;
-                    }
-                    let gx = x0 + xx;
-                    let gy = y0 + yy;
-                    if gx < 0 || gy < 0 || gx >= w || gy >= h {
-                        continue;
-                    }
-                    let o = ((gy * w + gx) * 4) as usize;
-                    buf[o] = px[2];
-                    buf[o + 1] = px[1];
-                    buf[o + 2] = px[0];
-                    buf[o + 3] = 255;
-                }
-            }
-        };
-        part(uv_head.0, uv_head.1, 8, 8, 4.0, 0.0);       // 头
-        part(uv_body.0, uv_body.1, 8, 12, 4.0, 8.0);      // 身体
-        part(uv_ra.0, uv_ra.1, 4, 12, 0.0, 8.0);          // 右臂
-        part(uv_la.0, uv_la.1, 4, 12, 12.0, 8.0);         // 左臂
-        part(uv_rl.0, uv_rl.1, 4, 12, 4.0, 20.0);         // 右腿
-        part(uv_ll.0, uv_ll.1, 4, 12, 8.0, 20.0);         // 左腿
+        let rect = doll::render(
+            buf,
+            w as usize,
+            h as usize,
+            bx as f32,
+            by as f32 + 3.0 + bob,
+            skin,
+            &pose,
+        );
+        BALL_DOLL_RECT.store(
+            match rect {
+                Some((x0, y0, x1, y1)) => pack_rect(x0, y0, x1, y1),
+                None => 0,
+            },
+            Ordering::Relaxed,
+        );
     }
 
     // 给纸娃娃加 1px 深色描边（无方块时靠它从桌面里跳出来）
@@ -4292,6 +4425,25 @@ unsafe fn ball_render() {
         }
     }
 
+    // UpdateLayeredWindow 的 AC_SRC_ALPHA 要求预乘 alpha：
+    // 不预乘的话抗锯齿边缘会往亮处偏，深色桌面上能看到一圈白边。
+    for px in buf.chunks_exact_mut(4) {
+        match px[3] {
+            255 => {}
+            0 => {
+                px[0] = 0;
+                px[1] = 0;
+                px[2] = 0;
+            }
+            a => {
+                let a = a as u32;
+                px[0] = (px[0] as u32 * a / 255) as u8;
+                px[1] = (px[1] as u32 * a / 255) as u8;
+                px[2] = (px[2] as u32 * a / 255) as u8;
+            }
+        }
+    }
+
     let pos = POINT {
         x: BALL_POS_X.load(Ordering::Relaxed),
         y: BALL_POS_Y.load(Ordering::Relaxed),
@@ -4328,6 +4480,11 @@ unsafe fn ball_hit(x: i32, y: i32) -> u8 {
     let (bx, by) = ball_center();
     if ((x - bx).pow(2) + (y - by).pow(2)) <= 34 * 34 {
         return 9; // 球本身
+    }
+    if let Some((rx0, ry0, rx1, ry1)) = unpack_rect(BALL_DOLL_RECT.load(Ordering::Relaxed)) {
+        if x >= rx0 && y >= ry0 && x < rx1 && y < ry1 {
+            return 9; // 纸娃娃（头/腿伸出球的区域也能拖）
+        }
     }
     if t > 0.5 {
         for (i, (sx, sy)) in ball_satellites(t).iter().enumerate() {
@@ -4626,7 +4783,7 @@ fn sq_coverage(dx: i32, dy: i32, half: f32, rad: f32) -> (f32, f32) {
 }
 
 
-static BALL_SKIN: std::sync::RwLock<Option<image::RgbaImage>> = std::sync::RwLock::new(None);
+static BALL_SKIN: std::sync::RwLock<Option<doll::Skin>> = std::sync::RwLock::new(None);
 
 fn skin_dir() -> Option<std::path::PathBuf> {
     std::env::current_exe()
@@ -4661,7 +4818,7 @@ fn list_skins() -> Vec<String> {
     out
 }
 
-fn load_ball_skin(name: Option<&str>) {
+fn load_ball_skin(name: Option<&str>, model: Option<doll::ModelKind>) {
     let exe_dir = match std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|d| d.to_path_buf()))
@@ -4672,8 +4829,10 @@ fn load_ball_skin(name: Option<&str>) {
     let rel = name.unwrap_or("skin.png");
     let path = exe_dir.join(rel);
     if let Ok(img) = image::open(&path) {
+        let rgba = img.to_rgba8();
+        let skin = doll::Skin::from_rgba(&rgba, model);
         if let Ok(mut g) = BALL_SKIN.write() {
-            *g = Some(img.to_rgba8());
+            *g = Some(skin);
         }
     }
 }
