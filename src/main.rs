@@ -1228,6 +1228,22 @@ unsafe fn apply_transparency_to_hwnd(
         let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, next_style as i32);
     }
     SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA).map_err(|e| e.to_string())?;
+    // GPU 合成的重型应用（PS / AE / LR / 画世界等）改完 alpha 会留旧帧，
+    // 强制它重画一次并让 DWM 立刻提交，不然要等用户动一下鼠标才更新
+    if let Some(app) = compat_app_name(hwnd) {
+        use windows::Win32::Graphics::Dwm::DwmFlush;
+        use windows::Win32::Graphics::Gdi::{
+            RedrawWindow, RDW_ALLCHILDREN, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW,
+        };
+        let _ = DwmFlush();
+        let _ = RedrawWindow(
+            hwnd,
+            None,
+            None,
+            RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW | RDW_ALLCHILDREN,
+        );
+        log_hilite(&format!("compat redraw: {app}"));
+    }
 
     let pos = if topmost {
         HWND_TOPMOST
@@ -2390,6 +2406,143 @@ impl TransGlassApp {
                 self.hotkey_message = Some(format!("保存失败：{}", e));
             }
         }
+    }
+}
+
+/// 开机自启动：写 HKCU\...\Run，值名 TransGlass，内容是带引号的 exe 路径
+fn autostart_enabled() -> bool {
+    use windows::Win32::System::Registry::{RegOpenKeyExW, RegQueryValueExW, HKEY, KEY_READ};
+    unsafe {
+        let sub = wide_reg("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+        let mut hkey = HKEY::default();
+        if RegOpenKeyExW(
+            windows::Win32::System::Registry::HKEY_CURRENT_USER,
+            windows::core::PCWSTR(sub.as_ptr()),
+            0,
+            KEY_READ,
+            &mut hkey,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let name = wide_reg("TransGlass");
+        let mut size: u32 = 0;
+        let ok = RegQueryValueExW(
+            hkey,
+            windows::core::PCWSTR(name.as_ptr()),
+            None,
+            None,
+            None,
+            Some(&mut size),
+        )
+        .is_ok();
+        let _ = windows::Win32::System::Registry::RegCloseKey(hkey);
+        ok && size > 0
+    }
+}
+
+/// 写/删开机自启动项
+fn set_autostart(on: bool) -> Result<(), String> {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY, KEY_SET_VALUE,
+        REG_OPTION_NON_VOLATILE, REG_SZ,
+    };
+    unsafe {
+        let sub = wide_reg("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+        let mut hkey = HKEY::default();
+        let rc = RegCreateKeyExW(
+            windows::Win32::System::Registry::HKEY_CURRENT_USER,
+            windows::core::PCWSTR(sub.as_ptr()),
+            0,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut hkey,
+            None,
+        );
+        if rc.is_err() {
+            return Err(format!("打开 Run 键失败（Win32 {}）", rc.0));
+        }
+        let name = wide_reg("TransGlass");
+        let res = if on {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let val = format!("\"{}\"", exe.display());
+            let data: Vec<u16> = val.encode_utf16().chain(std::iter::once(0)).collect();
+            let bytes = std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2);
+            let rc = RegSetValueExW(
+                hkey,
+                windows::core::PCWSTR(name.as_ptr()),
+                0,
+                REG_SZ,
+                Some(bytes),
+            );
+            if rc.is_err() {
+                Err(format!("写入失败（Win32 {}）", rc.0))
+            } else {
+                Ok(())
+            }
+        } else {
+            let rc = RegDeleteValueW(hkey, windows::core::PCWSTR(name.as_ptr()));
+            if rc.is_err() {
+                Err(format!("删除失败（Win32 {}）", rc.0))
+            } else {
+                Ok(())
+            }
+        };
+        let _ = RegCloseKey(hkey);
+        res
+    }
+}
+
+fn wide_reg(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 需要兼容处理的重型应用（PS 家族、画世界等）
+unsafe fn compat_app_name(hwnd: HWND) -> Option<String> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == 0 {
+        return None;
+    }
+    let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    let ok = QueryFullProcessImageNameW(
+        h,
+        PROCESS_NAME_WIN32,
+        windows::core::PWSTR(buf.as_mut_ptr()),
+        &mut len,
+    )
+    .is_ok();
+    let _ = windows::Win32::Foundation::CloseHandle(h);
+    if !ok || len == 0 {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    let exe = path.rsplit('\\').next().unwrap_or("").to_lowercase();
+    const LIST: [&str; 10] = [
+        "photoshop",
+        "illustrator",
+        "aftereffects",
+        "lightroom",
+        "indesign",
+        "premiere",
+        "huashijie",
+        "artworld",
+        "画世界",
+        "painter",
+    ];
+    if LIST.iter().any(|n| exe.contains(n)) {
+        Some(exe)
+    } else {
+        None
     }
 }
 
@@ -4685,6 +4838,8 @@ struct BallPanel {
     slider: (i32, i32, i32, i32),
     /// 标题栏右上角的 MC 风格关闭键
     close_btn: (i32, i32, i32, i32),
+    /// 左下方显示「当前目标窗口」的一行
+    target_row: (i32, i32, i32, i32),
 }
 
 /// 展开布局：MC 背包/设置界面风格——标题栏 + 左侧 4 个按钮 + 右侧深色槽底站纸娃娃 + 底部透明度条。
@@ -4704,6 +4859,7 @@ fn ball_panel(t: f32) -> BallPanel {
     let stage = (px0 + 136, 52, px0 + 212, 192);
     let slider = (px0 + 10, 198, px0 + 208, 224);
     let close_btn = (px0 + 188, 26, px0 + 210, 42);
+    let target_row = (px0 + 10, 176, px0 + 130, 194);
     BallPanel {
         panel,
         title,
@@ -4712,6 +4868,7 @@ fn ball_panel(t: f32) -> BallPanel {
         buttons,
         slider,
         close_btn,
+        target_row,
     }
 }
 
@@ -4856,6 +5013,15 @@ fn slider_travel(r: (i32, i32, i32, i32)) -> f32 {
 }
 
 /// t=0 → 最不透明（滑块在最左），t=1 → 最透明（滑块在最右）
+/// 「当前目标窗口」那一行的底：MC 那种凹进去的小槽
+fn draw_mc_target_row(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32), a: f32) {
+    let (x0, y0, x1, y1) = r;
+    mc_fill(buf, w, h, x0, y0, x1, y1, (58, 58, 58), a);
+    mc_frame(buf, w, h, r, MC_BLACK, 2, a);
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x1 - 2, y0 + 3, (34, 34, 34), a);
+    mc_fill(buf, w, h, x0 + 2, y1 - 3, x1 - 2, y1 - 2, (96, 96, 96), a);
+}
+
 fn draw_mc_slider(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32), t: f32, a: f32) {
     let (x0, y0, x1, y1) = r;
     mc_fill(buf, w, h, x0, y0, x1, y1, MC_GROOVE, a);
@@ -5114,6 +5280,8 @@ unsafe fn ball_render() {
         // 标题栏右上角的关闭键（MC 风格小按钮 + ×）
         draw_mc_button(buf, w, h, p.close_btn, hover == 6, false, panel_alpha);
         draw_mc_cross(buf, w, h, p.close_btn, (255, 255, 255), panel_alpha);
+        // 目标窗口那一行：MC 凹槽底 + 窗口标题
+        draw_mc_target_row(buf, w, h, p.target_row, panel_alpha);
     }
 
     // 中间：MC 3D 纸娃娃（基岩版左上角纸娃娃观感，随光标连续转向）
@@ -5265,6 +5433,27 @@ unsafe fn ball_render() {
             )
         };
         draw_mc_label(mem, "TransGlass", p.title, fade((80, 80, 80)));
+        // 目标窗口那一行：没目标就显示「未选中窗口」
+        let target_text = {
+            let h = ball_target();
+            if h.0.is_null() {
+                "未选中窗口".to_string()
+            } else {
+                let mut t: Vec<u16> = vec![0; 260];
+                let n = GetWindowTextW(h, &mut t);
+                let s = String::from_utf16_lossy(&t[..n as usize]);
+                let s = s.trim();
+                if s.is_empty() {
+                    "未选中窗口".to_string()
+                } else if s.chars().count() > 11 {
+                    let cut: String = s.chars().take(11).collect();
+                    format!("{cut}…")
+                } else {
+                    s.to_string()
+                }
+            }
+        };
+        draw_mc_label(mem, &target_text, p.target_row, fade((255, 255, 255)));
         let labels = ["置顶", "穿透", "模式", "还原"];
         for (i, r) in p.buttons.iter().enumerate() {
             draw_mc_label(mem, labels[i], *r, fade((255, 255, 255)));
@@ -5488,13 +5677,11 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         let last = f32::from_bits(DOLL_LAST_CLICK.load(Ordering::Relaxed));
                         let pos = DOLL_LAST_POS.load(Ordering::Relaxed);
                         let this_pos = ((x as u32) << 16) | (y as u32 & 0xFFFF);
-                        let near = (pos >> 16) as i32 - x;
+                        let ddx = ((pos >> 16) as i32 - x).abs();
+                        let ddy = ((pos & 0xFFFF) as i32 - y).abs();
                         DOLL_LAST_POS.store(this_pos, Ordering::Relaxed);
                         DOLL_LAST_CLICK.store(now.to_bits(), Ordering::Relaxed);
-                        if last > 0.0
-                            && now - last < 0.35
-                            && (near.abs() <= 12 || (pos & 0xFFFF) as i32 == -1)
-                        {
+                        if last > 0.0 && now - last < 0.35 && ddx <= 14 && ddy <= 40 {
                             DOLL_LAST_CLICK.store(0.0f32.to_bits(), Ordering::Relaxed);
                             show_root_window();
                             return LRESULT(0);
@@ -6408,6 +6595,16 @@ impl TransGlassApp {
             thread::spawn(|| {
                 let _ = run_self_update();
             });
+        }
+        ui.add_space(8.0);
+        let mut auto = autostart_enabled();
+        if ui
+            .checkbox(&mut auto, "开机自启动（登录 Windows 后自动启动 TransGlass）")
+            .changed()
+        {
+            if let Err(e) = set_autostart(auto) {
+                push_issue(format!("设置开机自启动失败：{e}"));
+            }
         }
         ui.add_space(8.0);
         if ui.button("打开配置目录").clicked() {

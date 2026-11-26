@@ -13,7 +13,7 @@
 #endif
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.4.0"
+  #define MyAppVersion "2.5.0"
 #endif
 
 [Setup]
@@ -38,6 +38,8 @@ OutputDir={#MyAppSourceRoot}\dist\installer
 Compression=lzma2
 SolidCompression=yes
 DefaultDirName={localappdata}\Programs\{#MyAppName}
+SetupIconFile={#MyAppSourceRoot}\icon.ico
+UninstallDisplayName={#MyAppName}
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\{#MyAppExeName}
@@ -54,11 +56,16 @@ Source: "{#MyAppSourceRoot}\target\release\{#MyAppExeName}"; DestDir: "{app}"; F
 Source: "{#MyAppSourceRoot}\transglass.manifest"; DestDir: "{app}"; Flags: ignoreversion
 ; 包含默认配置文件（如果存在）
 Source: "{#MyAppSourceRoot}\transglass_hotkeys.json"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist skipifsourcedoesntexist
+Source: "{#MyAppSourceRoot}\icon.png"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceRoot}\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceRoot}\ball_glass.png"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#MyAppSourceRoot}\skin.png"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#MyAppSourceRoot}\skins\*.png"; DestDir: "{app}\skins"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: """{app}\{#MyAppExeName}"""; Tasks: startup; Flags: uninsdeletevalue

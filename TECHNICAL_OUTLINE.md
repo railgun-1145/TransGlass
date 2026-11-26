@@ -58,7 +58,13 @@
 
 **悬浮球开关**：`BALL_SHOWN` 记当前是否显示，`set_ball_visible(on)`（关 = 收起面板 + `ShowWindow(SW_HIDE)`，开 = `ball_render` + `SHOWNA`）。设置里「显示悬浮球」写 `UiState.ball_visible` 并在启动时应用；托盘右键 / 菜单项「唤出悬浮球」也会调它。**右键点悬浮球不再关球**（关球改成面板标题栏右上角的 MC 风格 `×`，命中码 6）。
 
-**纸娃娃居中 + 双击**：纸娃娃先 `doll::render` 到一张透明图层，再按返回的包围盒把整块合成到主缓冲——中心按 `t` 从「球的位置」插值到「舞台中心」，所以展开/收起时人物是滑进去的，展开后视觉上水平垂直都居中。`BALL_DOLL_RECT` 存的是合成后的矩形（命中测试用）。`WM_LBUTTONUP` 命中 9（纸娃娃）时判断双击：`DOLL_LAST_CLICK`/`DOLL_LAST_POS` 记上次时间与位置，350ms 内且位置接近就算双击 → `show_root_window()`，开关是 `DOLL_DBLCLICK`（设置里的「双击纸娃娃打开主界面」）。
+**纸娃娃居中 + 双击**：纸娃娃先 `doll::render` 到一张透明图层，再按返回的包围盒把整块合成到主缓冲——中心按 `t` 从「球的位置」插值到「舞台中心」，所以展开/收起时人物是滑进去的，展开后视觉上水平垂直都居中。`BALL_DOLL_RECT` 存的是合成后的矩形（命中测试用）。`WM_LBUTTONUP` 命中 9（纸娃娃）时判断双击：`DOLL_LAST_CLICK`/`DOLL_LAST_POS` 记上次时间与位置，350ms 内且位置接近（横 ≤14px、纵 ≤40px）就算双击 → `show_root_window()`，开关是 `DOLL_DBLCLICK`（设置里的「双击纸娃娃打开主界面」）。
+
+**目标窗口显示**：面板左下 `target_row`（176..194）是一个 MC 凹槽，里面用 `draw_mc_label` 画 `ball_target()` 的标题，超过 11 个字截断加 `…`，没有目标显示「未选中窗口」。
+
+**开机自启动**：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `TransGlass` 值（带引号的 exe 路径）。`autostart_enabled()` 查存在性、`set_autostart()` 写/删；设置 → 维护里的复选框直接反映真实注册表状态。注意 windows-rs 的 `Reg*` 返回 `WIN32_ERROR` 而不是 `Result`，只能 `.is_err()` + 读 `.0`，没有 `map_err`。
+
+**重型应用兼容（PS 家族 / 画世界）**：`compat_app_name(hwnd)` 按进程 exe 名匹配（photoshop / illustrator / aftereffects / lightroom / indesign / premiere / painter / huashijie / artworld / 画世界），命中后在 `apply_transparency_to_hwnd` 里改完 alpha 额外做一次 `DwmFlush()` + `RedrawWindow(RDW_INVALIDATE|RDW_FRAME|RDW_UPDATENOW|RDW_ALLCHILDREN)`——这些 GPU 合成的应用不强制重画会留旧帧，要等用户动鼠标才更新。`RedrawWindow` 和 `RDW_*` 在 `Win32::Graphics::Gdi` 下，不在 WindowsAndMessaging。
 
 **快捷键编辑**：不再单开二级窗口（`hotkey_editor_open` 已删），直接内嵌在设置页「快捷键」分类里，一行一个功能：勾选 / 名称 / 修饰键 / 按键 / 录入。
 
