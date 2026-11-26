@@ -1462,7 +1462,8 @@ impl TransGlassApp {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(repaint_ms));
         }
 
-        if self.view_mode == 0 {
+        // 紧凑列表只用于小窗；大界面保持缩略图网格不变
+        if self.mini_mode && self.view_mode == 0 {
             self.list_view(ui, &wins);
             return;
         }
@@ -2204,7 +2205,7 @@ impl eframe::App for TransGlassApp {
                                 .weak(),
                         );
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new("视图").small().color(TEXT_SECONDARY));
+                        ui.label(egui::RichText::new("小窗视图").small().color(TEXT_SECONDARY));
                         let mut view = self.view_mode;
                         ui.horizontal(|ui| {
                             if ui.radio_value(&mut view, 0u8, "紧凑列表").changed() {
