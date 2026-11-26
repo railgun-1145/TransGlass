@@ -1077,6 +1077,7 @@ struct TransGlassApp {
     selftest_open: bool,
     selftest_text: String,
     wins: Vec<WinInfo>,
+    thumbs: std::collections::HashMap<isize, (egui::TextureHandle, std::time::Instant)>,
     wins_at: Option<std::time::Instant>,
     selected: Option<isize>,
     issues_ver: u32,
@@ -1149,6 +1150,7 @@ impl TransGlassApp {
             selftest_open: false,
             selftest_text: String::new(),
             wins: Vec::new(),
+            thumbs: std::collections::HashMap::new(),
             wins_at: None,
             selected: None,
             issues_ver: u32::MAX,
@@ -1295,72 +1297,167 @@ impl TransGlassApp {
     }
 
     fn detail_pane(&mut self, ui: &mut egui::Ui) {
-        let Some(sel) = self.selected else {
+        self.refresh_window_list(false);
+        let wins: Vec<(isize, String, String)> = self
+            .wins
+            .iter()
+            .map(|w| (w.hwnd, w.title.clone(), w.desktop.clone()))
+            .collect();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("窗口总览").strong().size(16.0));
+            ui.label(
+                egui::RichText::new(format!(
+                    "共 {} 个 ｜ 已管理 {}",
+                    wins.len(),
+                    GLOBAL_REGISTRY.len()
+                ))
+                .small()
+                .weak(),
+            );
+        });
+        ui.add_space(10.0);
+        if wins.is_empty() {
             ui.vertical_centered(|ui| {
-                ui.add_space(140.0);
-                ui.label(egui::RichText::new("从左侧选择一个窗口").size(14.0).weak());
+                ui.add_space(120.0);
+                ui.label(egui::RichText::new("没有可见窗口").weak());
             });
             return;
-        };
-        let info = self.wins.iter().find(|w| w.hwnd == sel).cloned();
-        let title = info
-            .as_ref()
-            .map(|w| w.title.clone())
-            .unwrap_or_else(|| format!("HWND {sel:#x}"));
-        let desktop = info.as_ref().map(|w| w.desktop.clone()).unwrap_or_default();
-        let st = GLOBAL_REGISTRY
-            .get(&sel)
-            .map(|s| (s.current_alpha, s.user_pref_topmost, s.mouse_passthrough, s.pen_passthrough));
-        let (alpha, top, mouse, pen) = st.unwrap_or((255, false, false, false));
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new(&title).strong().size(17.0));
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new(format!(
-                "{desktop} ｜ {} ｜ HWND {sel:#x}",
-                if st.is_some() { "已管理" } else { "未管理" }
-            ))
-            .small()
-            .weak(),
-        );
-        ui.add_space(12.0);
-        card(ui, |ui| {
-            ui.label(egui::RichText::new("透明度").small().color(TEXT_SECONDARY));
-            let mut a = alpha as f32;
-            let resp = ui.add(egui::Slider::new(&mut a, 30.0..=255.0).show_value(false));
-            ui.label(egui::RichText::new(format!("{}%", (a / 255.0 * 100.0).round() as i32)).small());
-            if resp.changed() {
-                unsafe {
-                    ensure_managed(HWND(sel as *mut _));
-                    set_window_alpha(HWND(sel as *mut _), a as u8);
+        }
+        let mut toggle: Option<isize> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (hwnd, title, desktop) in &wins {
+                        self.window_card(ui, *hwnd, title, desktop, &mut toggle);
+                    }
+                });
+            });
+        if let Some(h) = toggle {
+            let managed = GLOBAL_REGISTRY.get(&h).is_some();
+            unsafe {
+                if managed {
+                    restore_window(HWND(h as *mut _));
+                } else {
+                    control_window(HWND(h as *mut _));
                 }
             }
-            ui.add_space(10.0);
-            ui.label(egui::RichText::new("状态").small().color(TEXT_SECONDARY));
-            ui.horizontal(|ui| {
-                if ui.selectable_label(top, "置顶").clicked() {
-                    unsafe { toggle_topmost(HWND(sel as *mut _)) };
-                }
-                ui.add_space(6.0);
-                if ui.selectable_label(mouse, "鼠标点透").clicked() {
-                    unsafe { toggle_mouse_passthrough(HWND(sel as *mut _)) };
-                }
-                ui.add_space(6.0);
-                if ui.selectable_label(pen, "笔点透").clicked() {
-                    unsafe { toggle_pen_passthrough(HWND(sel as *mut _)) };
-                }
-            });
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button("♻ 还原这个窗口").clicked() {
-                    unsafe { restore_window(HWND(sel as *mut _)) };
-                    self.refresh_window_list(true);
-                }
-                if ui.button("⟳ 刷新列表").clicked() {
-                    self.refresh_window_list(true);
-                }
-            });
-        });
+            self.refresh_window_list(true);
+        }
+    }
+
+    fn window_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        hwnd: isize,
+        title: &str,
+        desktop: &str,
+        toggle: &mut Option<isize>,
+    ) {
+        let managed = GLOBAL_REGISTRY
+            .get(&hwnd)
+            .map(|s| (s.current_alpha, s.user_pref_topmost, s.mouse_passthrough, s.pen_passthrough));
+        let card_w = 232.0;
+        ui.allocate_ui_with_layout(
+            egui::vec2(card_w, 208.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::Frame::none()
+                    .fill(SURFACE)
+                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .rounding(egui::Rounding::same(12.0))
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(ui, |ui| {
+                        let img_size = egui::vec2(card_w - 18.0, 118.0);
+                        match self.thumbnail(ui.ctx(), hwnd) {
+                            Some(tex) => {
+                                let resp = ui.add(
+                                    egui::Image::new(egui::load::SizedTexture::new(tex.id(), img_size))
+                                        .rounding(8.0)
+                                        .sense(egui::Sense::click()),
+                                );
+                                if resp.clicked() {
+                                    *toggle = Some(hwnd);
+                                }
+                                resp.context_menu(|ui| window_menu(ui, hwnd, title));
+                            }
+                            None => {
+                                let (rect, resp) = ui.allocate_exact_size(img_size, egui::Sense::click());
+                                ui.painter().rect_filled(
+                                    rect,
+                                    8.0,
+                                    egui::Color32::from_rgb(0xF1, 0xF3, 0xF6),
+                                );
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "无预览",
+                                    egui::FontId::proportional(12.0),
+                                    TEXT_SECONDARY,
+                                );
+                                if resp.clicked() {
+                                    *toggle = Some(hwnd);
+                                }
+                                resp.context_menu(|ui| window_menu(ui, hwnd, title));
+                            }
+                        }
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(title).small().strong()).truncate(),
+                        );
+                        let mut badges = String::new();
+                        match managed {
+                            Some((a, top, m, p)) => {
+                                badges.push_str(&format!(
+                                    "{}%",
+                                    (a as f32 / 255.0 * 100.0).round() as i32
+                                ));
+                                if top {
+                                    badges.push_str(" · 置顶");
+                                }
+                                if m {
+                                    badges.push_str(" · 鼠标透");
+                                }
+                                if p {
+                                    badges.push_str(" · 笔透");
+                                }
+                            }
+                            None => badges.push_str("未管理"),
+                        }
+                        ui.label(egui::RichText::new(format!("{badges} ｜ {desktop}")).small().weak());
+                        ui.add_space(2.0);
+                        let label = if managed.is_some() { "复原" } else { "控制" };
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new(label).small()))
+                            .clicked()
+                        {
+                            *toggle = Some(hwnd);
+                        }
+                    });
+            },
+        );
+        ui.add_space(8.0);
+    }
+
+    fn thumbnail(&mut self, ctx: &egui::Context, hwnd: isize) -> Option<egui::TextureHandle> {
+        let now = std::time::Instant::now();
+        if let Some((tex, at)) = self.thumbs.get(&hwnd) {
+            if now.duration_since(*at).as_secs() < 3 {
+                return Some(tex.clone());
+            }
+        }
+        unsafe {
+            if let Some(img) = capture_window(HWND(hwnd as *mut _)) {
+                let tex = ctx.load_texture(
+                    format!("thumb_{hwnd}"),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.thumbs.insert(hwnd, (tex.clone(), now));
+                return Some(tex);
+            }
+        }
+        None
     }
     fn open_hotkey_editor(&mut self) {
         self.hotkey_draft = load_or_create_hotkey_config();
@@ -3034,4 +3131,104 @@ unsafe fn set_window_alpha(hwnd: HWND, alpha: u8) {
 unsafe fn control_window(hwnd: HWND) {
     ensure_managed(hwnd);
     set_window_alpha(hwnd, 230);
+}
+
+fn window_menu(ui: &mut egui::Ui, hwnd: isize, title: &str) {
+    ui.label(egui::RichText::new(title).strong().small());
+    ui.separator();
+    match GLOBAL_REGISTRY.get(&hwnd) {
+        Some(st) => {
+            ui.label(
+                egui::RichText::new(format!(
+                    "透明度 {}%",
+                    (st.current_alpha as f32 / 255.0 * 100.0).round() as i32
+                ))
+                .small(),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "置顶：{}",
+                    if st.user_pref_topmost { "是" } else { "否" }
+                ))
+                .small(),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "鼠标点透：{}",
+                    if st.mouse_passthrough { "开" } else { "关" }
+                ))
+                .small(),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "笔点透：{}",
+                    if st.pen_passthrough { "开" } else { "关" }
+                ))
+                .small(),
+            );
+            ui.separator();
+            if ui.button("复原这个窗口").clicked() {
+                unsafe { restore_window(HWND(hwnd as *mut _)) };
+            }
+        }
+        None => {
+            ui.label(egui::RichText::new("未管理").small().weak());
+        }
+    }
+}
+
+/// 用 PrintWindow 抓一帧窗口缩略图（失败返回 None，卡片会显示"无预览"）
+unsafe fn capture_window(hwnd: HWND) -> Option<egui::ColorImage> {
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+        ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+    };
+    let mut rect = RECT::default();
+    if GetWindowRect(hwnd, &mut rect).is_err() {
+        return None;
+    }
+    let w = rect.right - rect.left;
+    let h = rect.bottom - rect.top;
+    if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
+        return None;
+    }
+    let screen = GetDC(None);
+    let mem = CreateCompatibleDC(screen);
+    let bmp = CreateCompatibleBitmap(screen, w, h);
+    let old = SelectObject(mem, HGDIOBJ(bmp.0));
+    let mut img = None;
+    if windows::Win32::Storage::Xps::PrintWindow(hwnd, mem, windows::Win32::Storage::Xps::PRINT_WINDOW_FLAGS(2)).as_bool() {
+        let mut bi: BITMAPINFO = std::mem::zeroed();
+        bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB.0;
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let lines = GetDIBits(
+            mem,
+            bmp,
+            0,
+            h as u32,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            &mut bi,
+            DIB_RGB_COLORS,
+        );
+        if lines > 0 {
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2);
+                px[3] = 255;
+            }
+            img = Some(egui::ColorImage::from_rgba_unmultiplied(
+                [w as usize, h as usize],
+                &buf,
+            ));
+        }
+    }
+    let _ = SelectObject(mem, old);
+    let _ = DeleteObject(HGDIOBJ(bmp.0));
+    let _ = DeleteDC(mem);
+    ReleaseDC(None, screen);
+    img
 }
