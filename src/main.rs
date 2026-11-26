@@ -3944,7 +3944,7 @@ static BALL_REQ_MINI: AtomicBool = AtomicBool::new(false);
 static BALL_REQ_RESTORE: AtomicBool = AtomicBool::new(false);
 
 const BALL_W: i32 = 250;
-const BALL_H: i32 = 170;
+const BALL_H: i32 = 250;
 static BALL_POS_X: AtomicI32 = AtomicI32::new(1500);
 static BALL_POS_Y: AtomicI32 = AtomicI32::new(380);
 static BALL_DRAGGING: AtomicBool = AtomicBool::new(false);
