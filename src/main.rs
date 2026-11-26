@@ -1388,7 +1388,7 @@ impl TransGlassApp {
             }
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("桌面（点即切换）").small().weak());
+            ui.label(egui::RichText::new("桌面").small().weak());
             if ui
                 .selectable_label(self.desk_filter.is_none(), egui::RichText::new("全部").small())
                 .clicked()
@@ -1404,7 +1404,6 @@ impl TransGlassApp {
                     .clicked()
                 {
                     self.desk_filter = Some(d.clone());
-                    self.switch_desktop_to(d);
                 }
             }
         });
@@ -3290,11 +3289,15 @@ unsafe extern "system" fn enum_win_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
             .is_ok()
                 && cloaked != 0;
             if !cloaked_h {
-                out.push(WinInfo {
-                    hwnd: hwnd.0 as isize,
-                    title: String::from_utf16_lossy(&buf[..len as usize]),
-                    desktop: window_desktop(hwnd),
-                });
+                let desktop = window_desktop(hwnd);
+                // 判断不出桌面的窗口直接不显示（否则筛选无效）
+                if desktop != "未分组" {
+                    out.push(WinInfo {
+                        hwnd: hwnd.0 as isize,
+                        title: String::from_utf16_lossy(&buf[..len as usize]),
+                        desktop,
+                    });
+                }
             }
         }
     }
