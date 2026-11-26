@@ -1116,6 +1116,9 @@ struct TransGlassApp {
     view_mode: u8,
     card_rects: std::collections::HashMap<isize, egui::Rect>,
     ball_open: bool,
+    ball_expanded: bool,
+    ball_size: f32,
+    ball_pos: egui::Pos2,
     hover: Option<(isize, std::time::Instant)>,
     hover_seen: bool,
     last_mini: bool,
@@ -1198,6 +1201,9 @@ impl TransGlassApp {
             view_mode: load_ui_state().view_mode.unwrap_or(0),
             card_rects: std::collections::HashMap::new(),
             ball_open: true,
+            ball_expanded: false,
+            ball_size: 68.0,
+            ball_pos: egui::pos2(1540.0, 420.0),
             hover: None,
             hover_seen: false,
             preview_fps: { let s = load_ui_state(); s.preview_fps.unwrap_or(match s.preview_rate { Some(3) => 0, Some(2) => 2, Some(1) => 8, _ => 15 }) },
@@ -2072,55 +2078,136 @@ impl eframe::App for TransGlassApp {
         }
 
         // 3. UI 绘制 (更简洁现代的布局)
-        // 悬浮球：独立的小窗口，点一下显示/隐藏主面板
+        // 悬浮球：单击展开卫星小工具，再单击收起；双击打开主面板；可拖动
         if self.ball_open {
             let ball_id = egui::ViewportId::from_hash_of("tg_ball");
+            let want = if self.ball_expanded { 248.0 } else { 68.0 };
+            if (self.ball_size - want).abs() > 0.5 {
+                let d = (want - self.ball_size) * 0.5;
+                self.ball_pos.x -= d;
+                self.ball_pos.y -= d;
+                self.ball_size = want;
+                ctx.send_viewport_cmd_to(ball_id, egui::ViewportCommand::InnerSize(egui::vec2(want, want)));
+                ctx.send_viewport_cmd_to(ball_id, egui::ViewportCommand::OuterPosition(self.ball_pos));
+            }
             let builder = egui::ViewportBuilder::default()
-                .with_inner_size([68.0, 68.0])
+                .with_inner_size([self.ball_size, self.ball_size])
+                .with_position([self.ball_pos.x, self.ball_pos.y])
                 .with_decorations(false)
                 .with_always_on_top()
                 .with_resizable(false)
-                .with_transparent(true)
-                .with_position([1820.0, 520.0]);
-            let mut clicked = false;
+                .with_transparent(true);
+            let mut click_ball = false;
+            let mut dbl_ball = false;
+            let mut drag_ball = false;
             let mut hide_ball = false;
+            let mut action: u8 = 0;
+            let expanded = self.ball_expanded;
             ctx.show_viewport_immediate(ball_id, builder, |ctx, _class| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none())
                     .show(ctx, |ui| {
+                        let side = ctx.screen_rect().size().x;
+                        let center = egui::pos2(side * 0.5, side * 0.5);
                         let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(68.0, 68.0),
+                            egui::vec2(side, side),
                             egui::Sense::click_and_drag(),
                         );
                         let hover = resp.hovered();
                         let base = if hover { 30.0 } else { 27.0 };
-                        ui.painter().circle_filled(rect.center(), base, ACCENT);
+                        ui.painter().circle_filled(center, base, ACCENT);
                         ui.painter().text(
-                            rect.center(),
+                            center,
                             egui::Align2::CENTER_CENTER,
-                            "T",
-                            egui::FontId::proportional(20.0),
+                            if expanded { "×" } else { "T" },
+                            egui::FontId::proportional(if expanded { 24.0 } else { 20.0 }),
                             egui::Color32::WHITE,
                         );
-                        if resp.dragged() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        if expanded {
+                            let r = side * 0.5 - 34.0;
+                            let items: [(f32, &str, u8); 4] = [
+                                (-2.356, "面板", 1),
+                                (-0.785, "小窗", 2),
+                                (0.785, "设置", 3),
+                                (2.356, "还原", 4),
+                            ];
+                            for (ang, label, code) in items {
+                                let p = center + egui::vec2(ang.cos() * r, ang.sin() * r);
+                                let rc = egui::Rect::from_center_size(p, egui::vec2(44.0, 44.0));
+                                let r2 = ui.allocate_rect(rc, egui::Sense::click());
+                                let col = if r2.hovered() {
+                                    egui::Color32::from_rgb(0x2E, 0x5B, 0xC8)
+                                } else {
+                                    egui::Color32::from_rgb(0x41, 0x76, 0xE6)
+                                };
+                                ui.painter().circle_filled(p, 20.0, col);
+                                ui.painter().text(
+                                    p,
+                                    egui::Align2::CENTER_CENTER,
+                                    label,
+                                    egui::FontId::proportional(12.0),
+                                    egui::Color32::WHITE,
+                                );
+                                if r2.clicked() {
+                                    action = code;
+                                }
+                            }
                         }
-                        if resp.clicked() {
-                            clicked = true;
+                        if resp.dragged() {
+                            drag_ball = true;
+                        }
+                        if resp.double_clicked() {
+                            dbl_ball = true;
+                        } else if resp.clicked() {
+                            click_ball = true;
                         }
                         if resp.secondary_clicked() {
                             hide_ball = true;
                         }
+                        let _ = rect;
                     });
             });
-            if clicked {
+            if drag_ball {
+                if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
+                    self.ball_pos = outer.min;
+                }
+            }
+            if click_ball {
+                self.ball_expanded = !self.ball_expanded;
+            }
+            if dbl_ball {
+                self.ball_expanded = false;
                 unsafe { toggle_main_window() };
             }
             if hide_ball {
                 self.ball_open = false;
             }
+            match action {
+                1 => unsafe { toggle_main_window() },
+                2 => {
+                    self.mini_mode = true;
+                    hide_root_window();
+                }
+                3 => {
+                    self.settings_open = true;
+                    unsafe {
+                        let h = ROOT_HWND.load(Ordering::Relaxed);
+                        if h != 0 {
+                            let _ = ShowWindow(HWND(h as *mut _), SW_SHOW);
+                            let _ = SetForegroundWindow(HWND(h as *mut _));
+                            WINDOW_VISIBLE.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+                4 => unsafe {
+                    restore_all_windows();
+                },
+                _ => {}
+            }
+            if action != 0 {
+                self.ball_expanded = false;
+            }
         }
-
         // 3. 大界面：左侧导航（桌面分组 + 窗口），右侧详情
         self.refresh_window_list(false);
 
