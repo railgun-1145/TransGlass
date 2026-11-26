@@ -383,6 +383,15 @@ fn spawn_device_tracking_ticker() {
         }
         refresh_device_tracking();
         unsafe {
+            let mut cp = POINT::default();
+            let _ = GetCursorPos(&mut cp);
+            let packed = ((cp.x as u32 as u64) << 32) | (cp.y as u32 as u64);
+            let prev = BALL_CURSOR.swap(packed, Ordering::Relaxed);
+            if prev != packed && BALL_HWND.load(Ordering::Relaxed) != 0 {
+                ball_render();
+            }
+        }
+        unsafe {
             let fg = GetForegroundWindow();
             if !fg.0.is_null() && !is_own_hwnd(fg) && !is_shell_hwnd(fg) {
                 TARGET_HWND.store(fg.0 as isize, Ordering::Relaxed);
@@ -2306,6 +2315,19 @@ impl eframe::App for TransGlassApp {
                         );
                         ui.add_space(12.0);
                         ui.label(egui::RichText::new("窗口").strong().color(TEXT_SECONDARY));
+                        let mut bsc = f32::from_bits(BALL_SCALE.load(Ordering::Relaxed));
+                        if bsc <= 0.1 {
+                            bsc = 2.1;
+                        }
+                        if ui
+                            .add(egui::Slider::new(&mut bsc, 1.0..=4.0).text("悬浮球大小"))
+                            .changed()
+                        {
+                            BALL_SCALE.store(bsc.to_bits(), Ordering::Relaxed);
+                            self.ui_state.ball_scale = Some(bsc);
+                            save_ui_state(&self.ui_state);
+                            unsafe { ball_render() };
+                        }
                         ui.label(egui::RichText::new("预览帧率").small().color(TEXT_SECONDARY));
                         let mut fps = self.preview_fps as f32;
                         let resp = ui.add(
@@ -2682,6 +2704,9 @@ fn main() -> Result<(), eframe::Error> {
     spawn_quit_listener();
     load_ball_tex();
     load_ball_skin();
+    if let Some(sc) = load_ui_state().ball_scale {
+        BALL_SCALE.store(sc.to_bits(), Ordering::Relaxed);
+    }
     unsafe { ball_spawn() };
     unsafe { purge_shell_managed() };
     spawn_device_tracking_ticker();
@@ -3038,6 +3063,7 @@ struct UiState {
     always_on_top: Option<bool>,
     /// 预览帧率（0 = 关闭）
     preview_fps: Option<u32>,
+    ball_scale: Option<f32>,
     view_mode: Option<u8>,
     /// 兼容旧配置
     preview_rate: Option<u8>,
@@ -3965,7 +3991,9 @@ static BALL_HWND: AtomicIsize = AtomicIsize::new(0);
 /// 最后一次点击命中的（非自身的）窗口，悬浮球遥控的目标
 static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static BALL_EXPANDED: AtomicBool = AtomicBool::new(false);
-static BALL_ANIM: AtomicU32 = AtomicU32::new(0); // f32 bits，0..1 弹出动画
+static BALL_ANIM: AtomicU32 = AtomicU32::new(0);
+static BALL_CURSOR: AtomicU64 = AtomicU64::new(0);
+static BALL_SCALE: AtomicU32 = AtomicU32::new(0); // f32 bits，纸娃娃缩放 // f32 bits，0..1 弹出动画
 static BALL_REQ_PANEL: AtomicBool = AtomicBool::new(false);
 static BALL_REQ_MINI: AtomicBool = AtomicBool::new(false);
 static BALL_REQ_RESTORE: AtomicBool = AtomicBool::new(false);
@@ -4091,7 +4119,19 @@ unsafe fn ball_render() {
 
     // 中间方块：MC 纸娃娃（基岩版风格，正面 UV 拼装）
     if let Some(skin) = BALL_SKIN.get() {
-        let unit = 2.1f32;
+        let stored = f32::from_bits(BALL_SCALE.load(Ordering::Relaxed));
+        let unit = if stored > 0.1 { stored } else { 2.1 };
+        // 鼠标追踪：头/身体朝光标方向轻微偏移
+        let mut gx = 0.0f32;
+        let mut gy = 0.0f32;
+        {
+            let mut cp = POINT::default();
+            let _ = GetCursorPos(&mut cp);
+            let cx = (BALL_POS_X.load(Ordering::Relaxed) + bx) as f32;
+            let cy = (BALL_POS_Y.load(Ordering::Relaxed) + by) as f32;
+            gx = ((cp.x as f32 - cx) / 45.0).clamp(-2.0, 2.0);
+            gy = ((cp.y as f32 - cy) / 45.0).clamp(-2.0, 2.0);
+        }
         let top = by as f32 - 32.0 * unit * 0.5 + 3.0;
         let left = bx as f32 - 8.0 * unit;
         let mut part = |u0: u32, v0: u32, pw: u32, ph: u32, ox: f32, oy: f32| -> () {
@@ -4123,7 +4163,7 @@ unsafe fn ball_render() {
                 }
             }
         };
-        part(8, 8, 8, 8, 4.0, 0.0);      // 头
+        part(8, 8, 8, 8, 4.0 + gx / unit, 0.0 + gy / unit); // 头（跟随光标）
         part(20, 20, 8, 12, 4.0, 8.0);   // 身体
         part(44, 20, 4, 12, 0.0, 8.0);   // 右臂
         part(36, 52, 4, 12, 12.0, 8.0);  // 左臂
