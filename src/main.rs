@@ -4160,7 +4160,63 @@ unsafe fn ball_hit(x: i32, y: i32) -> u8 {
 
 unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
+        WM_LBUTTONDOWN => {
+            let x = (l.0 & 0xFFFF) as i32;
+            let y = ((l.0 >> 16) & 0xFFFF) as i32;
+            if ball_hit(x, y) == 9 {
+                BALL_DRAGGING.store(true, Ordering::Relaxed);
+                BALL_MOVED.store(false, Ordering::Relaxed);
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                BALL_DOWN_POS.store(
+                    ((p.x as u32 as u64) << 32) | (p.y as u32 as u64),
+                    Ordering::Relaxed,
+                );
+                let _ = SetCapture(hwnd);
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, w, l)
+        }
+        WM_MOUSEMOVE => {
+            if BALL_DRAGGING.load(Ordering::Relaxed) {
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                let packed = BALL_DOWN_POS.load(Ordering::Relaxed);
+                let ox = (packed >> 32) as i32;
+                let oy = (packed & 0xFFFF_FFFF) as i32;
+                if (p.x - ox).abs() + (p.y - oy).abs() > 4 {
+                    BALL_MOVED.store(true, Ordering::Relaxed);
+                }
+                if BALL_MOVED.load(Ordering::Relaxed) {
+                    let nx = BALL_POS_X.load(Ordering::Relaxed) + (p.x - ox);
+                    let ny = BALL_POS_Y.load(Ordering::Relaxed) + (p.y - oy);
+                    BALL_POS_X.store(nx, Ordering::Relaxed);
+                    BALL_POS_Y.store(ny, Ordering::Relaxed);
+                    let _ = SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        nx,
+                        ny,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                    BALL_DOWN_POS.store(
+                        ((p.x as u32 as u64) << 32) | (p.y as u32 as u64),
+                        Ordering::Relaxed,
+                    );
+                }
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, w, l)
+        }
         WM_LBUTTONUP => {
+            let dragged = BALL_DRAGGING.swap(false, Ordering::Relaxed)
+                && BALL_MOVED.swap(false, Ordering::Relaxed);
+            let _ = ReleaseCapture();
+            if dragged {
+                return LRESULT(0);
+            }
             let x = (l.0 & 0xFFFF) as i32;
             let y = ((l.0 >> 16) & 0xFFFF) as i32;
             match ball_hit(x, y) {
@@ -4194,8 +4250,6 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         6 => ball_apply(target, BallAction::Restore),
                         _ => {}
                     }
-                    BALL_EXPANDED.store(false, Ordering::Relaxed);
-                    BALL_ANIM.store(0f32.to_bits(), Ordering::Relaxed);
                     ball_render();
                 }
                 _ => {}
