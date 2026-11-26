@@ -382,6 +382,12 @@ fn spawn_device_tracking_ticker() {
             break;
         }
         refresh_device_tracking();
+        unsafe {
+            let fg = GetForegroundWindow();
+            if !fg.0.is_null() && !is_own_hwnd(fg) && !is_shell_hwnd(fg) {
+                TARGET_HWND.store(fg.0 as isize, Ordering::Relaxed);
+            }
+        }
         perf_dump();
         perf_dump();
     });
@@ -575,6 +581,15 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     if code == HC_ACTION as i32 {
         let msg = wparam.0 as u32;
         let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
+        // 记录"最后点过的非自身窗口"，供悬浮球当遥控目标
+        if msg == WM_LBUTTONDOWN {
+            if let Some(root) = hit_root_at(info.pt.x, info.pt.y) {
+                if !is_own_hwnd(root) && !is_shell_hwnd(root) {
+                    TARGET_HWND.store(root.0 as isize, Ordering::Relaxed);
+                    log_hilite(&format!("target={:?}", root.0));
+                }
+            }
+        }
         if info.dwExtraInfo == TRANSG_GLASS_INJECT_EXTRA_INFO {
             return CallNextHookEx(
                 HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
@@ -4346,6 +4361,7 @@ enum BallAction {
 }
 
 unsafe fn ball_apply(target: HWND, action: BallAction) {
+    log_hilite(&format!("apply target={:?}", target.0));
     if target.0.is_null() || is_own_hwnd(target) || is_shell_hwnd(target) {
         return;
     }
