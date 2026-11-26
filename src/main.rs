@@ -5466,6 +5466,37 @@ impl TransGlassApp {
                             .small()
                             .weak(),
                     );
+                    // 快捷键页才需要保存/恢复默认：放在右下角，永远看得见
+                    if self.settings_tab == 0 {
+                        if ui.button("保存并应用").clicked() {
+                            self.save_and_reload_hotkeys();
+                        }
+                        if ui.button("恢复默认").clicked() {
+                            self.hotkey_draft = default_config();
+                            self.hotkey_message = Some("已恢复默认（尚未保存）".into());
+                        }
+                        ui.add_space(8.0);
+                        match Self::validate_config(&self.hotkey_draft) {
+                            Ok(()) => {
+                                let (text, color) = match self.hotkey_message.as_ref() {
+                                    Some(msg) => (msg.clone(), TEXT_SECONDARY),
+                                    None => (
+                                        "组合键均合法且无冲突".to_string(),
+                                        egui::Color32::from_rgb(0x2E, 0x7D, 0x32),
+                                    ),
+                                };
+                                ui.label(egui::RichText::new(text).small().color(color));
+                            }
+                            Err(err) => {
+                                ui.label(
+                                    egui::RichText::new(format!("配置有问题：{err}"))
+                                        .small()
+                                        .color(ERROR),
+                                );
+                            }
+                        }
+                        ui.separator();
+                    }
                 });
             });
             ui.add_space(4.0);
@@ -5607,39 +5638,7 @@ impl TransGlassApp {
             ui.add_space(2.0);
         }
 
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            if ui.button("保存并应用").clicked() {
-                self.save_and_reload_hotkeys();
-            }
-            if ui.button("恢复默认").clicked() {
-                self.hotkey_draft = default_config();
-                self.hotkey_message = Some("已恢复默认（尚未保存）".into());
-            }
-        });
         ui.add_space(6.0);
-        match Self::validate_config(&self.hotkey_draft) {
-            Ok(()) => {
-                ui.label(
-                    egui::RichText::new("组合键均合法且无冲突")
-                        .small()
-                        .color(egui::Color32::from_rgb(0x2E, 0x7D, 0x32)),
-                );
-            }
-            Err(err) => {
-                ui.label(
-                    egui::RichText::new(format!("配置有问题：{err}"))
-                        .small()
-                        .color(ERROR),
-                );
-            }
-        }
-        if let Some(msg) = self.hotkey_message.as_ref() {
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(msg).small().weak());
-        }
     }
 
     fn settings_page_input(&mut self, ui: &mut egui::Ui) {
