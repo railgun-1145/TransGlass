@@ -4137,22 +4137,11 @@ unsafe fn ball_render() {
     }
     }
 
-    // 中间方块：MC 纸娃娃（基岩版风格，正面 UV 拼装）
+    // 中间：MC 纸娃娃（随光标转向：正面 / 背面 / 左 / 右）
     let skin_guard = BALL_SKIN.read().ok();
     if let Some(skin) = skin_guard.as_ref().and_then(|g| g.as_ref()) {
         let stored = f32::from_bits(BALL_SCALE.load(Ordering::Relaxed));
         let unit = if stored > 0.1 { stored } else { 2.1 };
-        // 鼠标追踪：头/身体朝光标方向轻微偏移
-        let mut gx = 0.0f32;
-        let mut gy = 0.0f32;
-        {
-            let mut cp = POINT::default();
-            let _ = GetCursorPos(&mut cp);
-            let cx = (BALL_POS_X.load(Ordering::Relaxed) + bx) as f32;
-            let cy = (BALL_POS_Y.load(Ordering::Relaxed) + by) as f32;
-            gx = ((cp.x as f32 - cx) / 45.0).clamp(-2.0, 2.0);
-            gy = ((cp.y as f32 - cy) / 45.0).clamp(-2.0, 2.0);
-        }
         let bob = {
             let ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4162,6 +4151,32 @@ unsafe fn ball_render() {
         };
         let top = by as f32 - 32.0 * unit * 0.5 + 3.0 + bob;
         let left = bx as f32 - 8.0 * unit;
+
+        // 光标方向 → 朝向
+        let mut cp = POINT::default();
+        let _ = GetCursorPos(&mut cp);
+        let cx = (BALL_POS_X.load(Ordering::Relaxed) + bx) as f32;
+        let cy = (BALL_POS_Y.load(Ordering::Relaxed) + by) as f32;
+        let ddx = cp.x as f32 - cx;
+        let ddy = cp.y as f32 - cy;
+        // 0 正面 / 1 背面 / 2 左 / 3 右
+        let facing = if ddy.abs() > ddx.abs() * 1.4 {
+            if ddy > 0.0 { 1 } else { 0 }
+        } else if ddx < 0.0 {
+            2
+        } else {
+            3
+        };
+
+        // 各面 UV（正面/背面），左右面用正面镜像 + 侧面头
+        let (uv_head, uv_body, uv_ra, uv_la, uv_rl, uv_ll) = match facing {
+            1 => ((24, 8), (32, 20), (52, 20), (44, 52), (12, 20), (28, 52)),
+            2 => ((16, 8), (20, 20), (44, 20), (36, 52), (4, 20), (20, 52)),
+            3 => ((0, 8), (20, 20), (44, 20), (36, 52), (4, 20), (20, 52)),
+            _ => ((8, 8), (20, 20), (44, 20), (36, 52), (4, 20), (20, 52)),
+        };
+        let mirror = facing == 2;
+
         let mut part = |u0: u32, v0: u32, pw: u32, ph: u32, ox: f32, oy: f32| -> () {
             let x0 = (left + ox * unit) as i32;
             let y0 = (top + oy * unit) as i32;
@@ -4169,7 +4184,8 @@ unsafe fn ball_render() {
             let hpx = (ph as f32 * unit) as i32;
             for yy in 0..hpx {
                 for xx in 0..wpx {
-                    let tx = u0 + (xx as f32 / unit) as u32;
+                    let sx = if mirror { wpx - 1 - xx } else { xx };
+                    let tx = u0 + (sx as f32 / unit) as u32;
                     let ty = v0 + (yy as f32 / unit) as u32;
                     if tx >= skin.width() || ty >= skin.height() {
                         continue;
@@ -4191,12 +4207,12 @@ unsafe fn ball_render() {
                 }
             }
         };
-        part(8, 8, 8, 8, 4.0 + gx / unit, 0.0 + gy / unit); // 头（跟随光标）
-        part(20, 20, 8, 12, 4.0, 8.0);   // 身体
-        part(44, 20, 4, 12, 0.0, 8.0);   // 右臂
-        part(36, 52, 4, 12, 12.0, 8.0);  // 左臂
-        part(4, 20, 4, 12, 4.0, 20.0);   // 右腿
-        part(20, 52, 4, 12, 8.0, 20.0);  // 左腿
+        part(uv_head.0, uv_head.1, 8, 8, 4.0, 0.0);       // 头
+        part(uv_body.0, uv_body.1, 8, 12, 4.0, 8.0);      // 身体
+        part(uv_ra.0, uv_ra.1, 4, 12, 0.0, 8.0);          // 右臂
+        part(uv_la.0, uv_la.1, 4, 12, 12.0, 8.0);         // 左臂
+        part(uv_rl.0, uv_rl.1, 4, 12, 4.0, 20.0);         // 右腿
+        part(uv_ll.0, uv_ll.1, 4, 12, 8.0, 20.0);         // 左腿
     }
 
     // 给纸娃娃加 1px 深色描边（无方块时靠它从桌面里跳出来）
