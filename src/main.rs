@@ -1120,15 +1120,8 @@ impl TransGlassApp {
         cc.egui_ctx.set_fonts(fonts);
 
         // 2. 仿 Trae 风格的深色 UI
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(18, 18, 18);
-        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(24, 24, 24);
-        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(32, 32, 32);
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(45, 45, 45);
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(55, 55, 55);
-        visuals.selection.bg_fill = egui::Color32::from_rgb(0, 150, 255);
-        visuals.window_rounding = egui::Rounding::same(8.0);
-        cc.egui_ctx.set_visuals(visuals);
+        // 浅色主题：色值取自 DSH 界面取样（底 #FAFAFA / 卡 #FFFFFF / 边 #E5E7EB / 主色 #4176E6）
+        apply_panel_theme(&cc.egui_ctx);
         let _ = EGUI_CTX.set(cc.egui_ctx.clone());
 
         if let Ok(handle) = cc.window_handle() {
@@ -1415,7 +1408,7 @@ impl eframe::App for TransGlassApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("TransGlass").color(egui::Color32::from_rgb(0, 150, 255)).strong().size(22.0));
+                ui.heading(egui::RichText::new("TransGlass").color(ACCENT).strong().size(19.0));
                 // 输入模式做成可点的：以前只能靠热键盲切
                 let mode_btn = ui
                     .add(
@@ -1484,20 +1477,20 @@ impl eframe::App for TransGlassApp {
             let issues = &self.issues_cache;
             if !issues.is_empty() {
                 egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(60, 40, 10))
+                    .fill(egui::Color32::from_rgb(255, 247, 237))
                     .inner_margin(egui::Margin::same(6.0))
                     .rounding(4.0)
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(format!("⚠ 有 {} 条配置/热键问题", issues.len()))
-                                .color(egui::Color32::from_rgb(255, 190, 80))
+                                .color(egui::Color32::from_rgb(180, 83, 9))
                                 .strong()
                                 .small(),
                         );
                         for msg in issues.iter().take(4) {
                             ui.label(
                                 egui::RichText::new(format!("• {msg}"))
-                                    .color(egui::Color32::from_rgb(255, 200, 120))
+                                    .color(egui::Color32::from_rgb(146, 64, 14))
                                     .small(),
                             );
                         }
@@ -1555,7 +1548,7 @@ impl eframe::App for TransGlassApp {
             ui.add_space(6.0);
 
             // 正在管理的窗口
-            ui.label(egui::RichText::new("已调节的窗口").strong().color(egui::Color32::LIGHT_GRAY));
+            ui.label(egui::RichText::new("已调节的窗口").strong().size(12.0).color(TEXT_SECONDARY));
             ui.add_space(5.0);
 
             egui::ScrollArea::vertical()
@@ -1767,7 +1760,7 @@ impl eframe::App for TransGlassApp {
                         );
                     }
                     // 键位多时内部滚动；高度按剩余空间算，避免把底部按钮顶出可视区
-                    let room = (ui.available_height() - 36.0).max(60.0);
+                    let room = (ui.available_height() - 56.0).max(48.0);
                     egui::ScrollArea::vertical()
                         .max_height(room)
                         .auto_shrink([false, false])
@@ -1906,7 +1899,7 @@ impl eframe::App for TransGlassApp {
                             ui.label(
                                 egui::RichText::new(format!("配置有问题：{err}"))
                                     .small()
-                                    .color(egui::Color32::from_rgb(255, 120, 120)),
+                                    .color(ERROR),
                             );
                         }
                     }
@@ -2883,10 +2876,64 @@ fn hotkey_key_ui(ui: &mut egui::Ui, key: &mut String, salt: &str) -> bool {
 /// 统一卡片外观：圆角 10、细描边、内边距，和 DSH 面板的卡片风格保持一致。
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::none()
-        .fill(egui::Color32::from_rgb(30, 30, 34))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 58, 66)))
-        .rounding(egui::Rounding::same(10.0))
+        .fill(SURFACE)
+        .stroke(egui::Stroke::new(1.0, BORDER))
+        .rounding(egui::Rounding::same(12.0))
+        .shadow(egui::epaint::Shadow { offset: egui::vec2(0.0, 1.0), blur: 6.0, spread: 0.0, color: egui::Color32::from_black_alpha(10) })
         .inner_margin(egui::Margin::symmetric(10.0, 8.0))
         .show(ui, |ui| add(ui))
         .inner
+}
+
+// ---- 面板配色（取值来自 DSH 界面取样）----
+pub(crate) const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x41, 0x76, 0xE6);
+pub(crate) const SURFACE: egui::Color32 = egui::Color32::WHITE;
+pub(crate) const BG_BASE: egui::Color32 = egui::Color32::from_rgb(0xFA, 0xFA, 0xFA);
+pub(crate) const BG_SIDEBAR: egui::Color32 = egui::Color32::from_rgb(0xF9, 0xFA, 0xFB);
+pub(crate) const BORDER: egui::Color32 = egui::Color32::from_rgb(0xE5, 0xE7, 0xEB);
+pub(crate) const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(0x1F, 0x23, 0x28);
+pub(crate) const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(0x6B, 0x72, 0x80);
+pub(crate) const ERROR: egui::Color32 = egui::Color32::from_rgb(0xDC, 0x26, 0x26);
+
+fn apply_panel_theme(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    let mut v = egui::Visuals::light();
+    v.override_text_color = Some(TEXT_PRIMARY);
+    v.panel_fill = BG_BASE;
+    v.window_fill = SURFACE;
+    v.extreme_bg_color = SURFACE;
+    v.faint_bg_color = BG_SIDEBAR;
+    v.window_stroke = egui::Stroke::new(1.0, BORDER);
+    v.window_rounding = egui::Rounding::same(12.0);
+    v.menu_rounding = egui::Rounding::same(10.0);
+    v.selection.bg_fill = ACCENT;
+    v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    v.hyperlink_color = ACCENT;
+    v.widgets.noninteractive.bg_fill = SURFACE;
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT_PRIMARY);
+    v.widgets.inactive.bg_fill = SURFACE;
+    v.widgets.inactive.weak_bg_fill = SURFACE;
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT_PRIMARY);
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(0xF3, 0xF4, 0xF6);
+    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(0xF3, 0xF4, 0xF6);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0xD1, 0xD5, 0xDB));
+    v.widgets.active.bg_fill = egui::Color32::from_rgb(0xEC, 0xEE, 0xF0);
+    v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(0xEC, 0xEE, 0xF0);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0xD1, 0xD5, 0xDB));
+    for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
+        w.rounding = egui::Rounding::same(8.0);
+    }
+    style.visuals = v;
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.window_margin = egui::Margin::same(12.0);
+    style.spacing.menu_margin = egui::Margin::same(8.0);
+    style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(19.0));
+    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
+    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
+    style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(11.0));
+    ctx.set_style(style);
 }
