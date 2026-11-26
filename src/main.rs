@@ -1218,15 +1218,16 @@ impl TransGlassApp {
         // 2. 仿 Trae 风格的深色 UI
         // 浅色主题：色值取自 DSH 界面取样（底 #FAFAFA / 卡 #FFFFFF / 边 #E5E7EB / 主色 #4176E6）
         apply_panel_theme(&cc.egui_ctx);
+        BOLD_FONT_OK.store(bold_loaded, Ordering::Relaxed);
         if bold_loaded {
             let mut style = (*cc.egui_ctx.style()).clone();
             style.text_styles.insert(
                 egui::TextStyle::Heading,
-                egui::FontId::new(19.0, egui::FontFamily::Name("bold".into())),
+                egui::FontId::new(20.0, egui::FontFamily::Name("bold".into())),
             );
             style.text_styles.insert(
                 egui::TextStyle::Button,
-                egui::FontId::new(13.0, egui::FontFamily::Name("bold".into())),
+                egui::FontId::new(14.0, egui::FontFamily::Name("bold".into())),
             );
             cc.egui_ctx.set_style(style);
         }
@@ -1536,7 +1537,11 @@ impl TransGlassApp {
             .map(|w| (w.hwnd, w.title.clone(), w.desktop.clone()))
             .collect();
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("窗口总览").strong().size(16.0));
+            ui.label(
+                egui::RichText::new("窗口总览")
+                    .font(font_title(19.0))
+                    .color(TEXT_PRIMARY),
+            );
             ui.label(
                 egui::RichText::new(format!(
                     "共 {} 个 ｜ 已管理 {}",
@@ -1755,7 +1760,7 @@ impl TransGlassApp {
                     .fill(SURFACE)
                     .stroke(egui::Stroke::new(
                         1.0,
-                        lerp_color(BORDER, egui::Color32::from_rgb(0x9F, 0xC8, 0xD6), anim),
+                        lerp_color(BORDER, egui::Color32::from_rgb(0xA8, 0xE6, 0xC8), anim),
                     ))
                     .rounding(egui::Rounding::same(12.0))
                     .shadow(egui::epaint::Shadow {
@@ -1815,7 +1820,12 @@ impl TransGlassApp {
                         }
                         ui.add_space(6.0);
                         ui.add(
-                            egui::Label::new(egui::RichText::new(title).small().strong()).truncate(),
+                            egui::Label::new(
+                                egui::RichText::new(title)
+                                    .font(font_title(14.0))
+                                    .color(TEXT_PRIMARY),
+                            )
+                            .truncate(),
                         );
                         let mut badges = String::new();
                         match managed {
@@ -2180,7 +2190,7 @@ impl eframe::App for TransGlassApp {
             .show(ctx, |ui| {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("TransGlass").color(ACCENT).strong().size(18.0));
+                    ui.label(egui::RichText::new("TransGlass").color(ACCENT).strong().size(20.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let weak_btn = |ui: &mut egui::Ui, text: &str| -> egui::Response {
                             ui.add(
@@ -3382,6 +3392,18 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 /// 两个颜色按 t 插值（含 alpha），做悬停/选中的过渡
+/// 系统里有没有雅黑 Bold（没有就用常规字重兜底，避免 egui 找不到字体家族）
+static BOLD_FONT_OK: AtomicBool = AtomicBool::new(false);
+
+/// 标题字体：有粗体家族就用，没有退回常规
+pub(crate) fn font_title(size: f32) -> egui::FontId {
+    if BOLD_FONT_OK.load(Ordering::Relaxed) {
+        egui::FontId::new(size, egui::FontFamily::Name("bold".into()))
+    } else {
+        egui::FontId::proportional(size)
+    }
+}
+
 fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let t = t.clamp(0.0, 1.0);
     let f = |x: u8, y: u8| -> u8 { (x as f32 + (y as f32 - x as f32) * t).round() as u8 };
@@ -3474,19 +3496,19 @@ fn chip(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
     resp
 }
 
-// ---- 面板配色（取值来自 DSH 界面取样）----
-pub(crate) const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4E, 0x8F, 0xA8);
+// ---- 面板配色（参考 QQ 音乐：白底 + 浅灰分隔 + 一个绿色主色）----
+pub(crate) const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2F, 0xC2, 0x7C);
 /// 强调色的淡底（导航选中、胶囊选中）
-pub(crate) const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(0xE9, 0xF2, 0xF6);
+pub(crate) const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(0xE9, 0xF9, 0xF1);
 /// 悬停底色
-pub(crate) const HOVER_FILL: egui::Color32 = egui::Color32::from_rgb(0xEF, 0xF1, 0xF4);
+pub(crate) const HOVER_FILL: egui::Color32 = egui::Color32::from_rgb(0xF5, 0xF5, 0xF5);
 pub(crate) const SURFACE: egui::Color32 = egui::Color32::WHITE;
-pub(crate) const BG_BASE: egui::Color32 = egui::Color32::from_rgb(0xFA, 0xFA, 0xFA);
-pub(crate) const BG_SIDEBAR: egui::Color32 = egui::Color32::from_rgb(0xF9, 0xFA, 0xFB);
-pub(crate) const BORDER: egui::Color32 = egui::Color32::from_rgb(0xE5, 0xE7, 0xEB);
-pub(crate) const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(0x1F, 0x23, 0x28);
-pub(crate) const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(0x6B, 0x72, 0x80);
-pub(crate) const ERROR: egui::Color32 = egui::Color32::from_rgb(0xDC, 0x26, 0x26);
+pub(crate) const BG_BASE: egui::Color32 = egui::Color32::WHITE;
+pub(crate) const BG_SIDEBAR: egui::Color32 = egui::Color32::from_rgb(0xF7, 0xF7, 0xF7);
+pub(crate) const BORDER: egui::Color32 = egui::Color32::from_rgb(0xEE, 0xEE, 0xEE);
+pub(crate) const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(0x1A, 0x1A, 0x1A);
+pub(crate) const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(0x8A, 0x8A, 0x8A);
+pub(crate) const ERROR: egui::Color32 = egui::Color32::from_rgb(0xE6, 0x4B, 0x4B);
 
 fn apply_panel_theme(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
@@ -3530,11 +3552,12 @@ fn apply_panel_theme(ctx: &egui::Context) {
     style.spacing.button_padding = egui::vec2(11.0, 6.0);
     style.spacing.window_margin = egui::Margin::same(12.0);
     style.spacing.menu_margin = egui::Margin::same(8.0);
-    style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(19.0));
-    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
-    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
-    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
-    style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(11.0));
+    // 字号对齐 QQ 音乐那种排版：标题 20、正文 14、辅助 12
+    style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(20.0));
+    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+    style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(11.5));
     ctx.set_style(style);
 }
 
@@ -5008,7 +5031,7 @@ pub(crate) const SETTINGS_TABS: [&str; 5] = [
 
 impl TransGlassApp {
     fn settings_page_hotkeys(&mut self, ui: &mut egui::Ui) {
-        ui.heading("快捷键");
+        ui.label(egui::RichText::new("快捷键").font(font_title(20.0)).color(TEXT_PRIMARY));
         ui.add_space(2.0);
         let mut priority = self.hotkey_priority_ui;
         if ui

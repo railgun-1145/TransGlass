@@ -41,7 +41,7 @@
 ### 4.3 GUI 渲染
 `egui` 每 100ms 轮询一次注册表状态，确保界面上的滑动条与热键调节同步。
 
-**视觉样式（对齐驱动 App 那种克制风）**：颜色都是灰/白——`BG_BASE #FAFAFA`、`BG_SIDEBAR #F9FAFB`、`SURFACE #FFF`、`BORDER #E5E7EB`、`TEXT_PRIMARY #1F2328`、`TEXT_SECONDARY #6B7280`，强调色只有 `ACCENT #4E8FA8` 和它的淡底 `ACCENT_SOFT #E9F2F6`。控件圆角 8、卡片 12、窗口 12；卡片带 1px 描边 + 很轻的投影；弹窗统一 `popup_shadow`（blur 16、alpha 28）。
+**视觉样式（对齐 QQ 音乐那种"白底 + 浅灰 + 一个绿"的克制风）**：`SURFACE/BG_BASE` 纯白、`BG_SIDEBAR #F7F7F7`、`BORDER #EEEEEE`、`TEXT_PRIMARY #1A1A1A`、`TEXT_SECONDARY #8A8A8A`、强调色 `ACCENT #2FC27C` 和淡底 `ACCENT_SOFT #E9F9F1`、悬停 `HOVER_FILL #F5F5F5`、错误 `#E64B4B`。控件圆角 8、卡片 12、窗口 12；卡片 1px 描边 + 很轻的投影；弹窗统一 `popup_shadow`。字号 20/14/12（标题/正文/辅助），标题走粗体家族 `font_title()`。
 
 **两个自绘组件**（`nav_row` / `chip`）：驱动 App 的导航行和桌面胶囊。都用 `animate_bool_with_time` 做 120~160ms 的过渡——悬停淡入 `HOVER_FILL`，选中淡入 `ACCENT_SOFT`，导航行左侧还有一条 3px 强调条；文字用 `lerp_color` 从 `TEXT_PRIMARY` 渐变到 `ACCENT`。卡片悬停则是描边/投影随 `anim` 渐变（`lerp_color(BORDER, #9FC8D6, anim)`）。设置页打开/切分类时 `ui.set_opacity()` 做 150ms 淡入（`settings_fade` 记时间戳）。
 
