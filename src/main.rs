@@ -3270,43 +3270,38 @@ fn window_menu(ui: &mut egui::Ui, hwnd: isize, title: &str) {
     let st = GLOBAL_REGISTRY
         .get(&hwnd)
         .map(|s| (s.current_alpha, s.user_pref_topmost, s.mouse_passthrough, s.pen_passthrough));
-    match st {
-        Some((alpha, top, mouse, pen)) => {
-            ui.label(
-                egui::RichText::new(format!(
-                    "透明度 {}%",
-                    (alpha as f32 / 255.0 * 100.0).round() as i32
-                ))
-                .small()
-                .weak(),
-            );
-            if ui.button(if top { "取消置顶" } else { "置顶" }).clicked() {
-                unsafe { toggle_topmost(HWND(hwnd as *mut _)) };
-            }
-            if ui
-                .button(if mouse { "关闭鼠标点透" } else { "鼠标点透" })
-                .clicked()
-            {
-                unsafe { toggle_mouse_passthrough(HWND(hwnd as *mut _)) };
-            }
-            if ui
-                .button(if pen { "关闭笔点透" } else { "笔点透" })
-                .clicked()
-            {
-                unsafe { toggle_pen_passthrough(HWND(hwnd as *mut _)) };
-            }
-            ui.separator();
-            if ui.button("复原这个窗口").clicked() {
-                unsafe { restore_window(HWND(hwnd as *mut _)) };
+    let (alpha, top, mouse, pen) = st.unwrap_or((255, false, false, false));
+    // 全部功能并列：置顶 / 鼠标点透 / 笔点透 / 透明度 / 控制或复原
+    let mut top_flag = top;
+    if ui.checkbox(&mut top_flag, "置顶").changed() {
+        unsafe { toggle_topmost(HWND(hwnd as *mut _)) };
+    }
+    let mut mouse_flag = mouse;
+    if ui.checkbox(&mut mouse_flag, "鼠标点透").changed() {
+        unsafe { toggle_mouse_passthrough(HWND(hwnd as *mut _)) };
+    }
+    let mut pen_flag = pen;
+    if ui.checkbox(&mut pen_flag, "笔点透").changed() {
+        unsafe { toggle_pen_passthrough(HWND(hwnd as *mut _)) };
+    }
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("透明度").small().weak());
+        let pct = (alpha as f32 / 255.0 * 100.0).round() as i32;
+        for p in [100, 90, 80, 70, 50] {
+            if ui.selectable_label(pct == p, egui::RichText::new(format!("{p}%")).small()).clicked() {
+                unsafe {
+                    ensure_managed(HWND(hwnd as *mut _));
+                    set_window_alpha(HWND(hwnd as *mut _), (p as f32 * 2.55).round() as u8);
+                }
             }
         }
-        None => {
-            ui.label(egui::RichText::new("未管理").small().weak());
-            ui.separator();
-            if ui.button("控制（90% 透明）").clicked() {
-                unsafe { control_window(HWND(hwnd as *mut _)) };
-            }
+    });
+    if st.is_some() {
+        if ui.button("复原这个窗口").clicked() {
+            unsafe { restore_window(HWND(hwnd as *mut _)) };
         }
+    } else if ui.button("控制（90% 透明）").clicked() {
+        unsafe { control_window(HWND(hwnd as *mut _)) };
     }
 }
 
