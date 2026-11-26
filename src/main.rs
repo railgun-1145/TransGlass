@@ -4109,18 +4109,6 @@ fn anim_secs() -> f32 {
 }
 
 #[inline]
-fn wrap_pi(mut a: f32) -> f32 {
-    let tau = std::f32::consts::TAU;
-    while a > std::f32::consts::PI {
-        a -= tau;
-    }
-    while a < -std::f32::consts::PI {
-        a += tau;
-    }
-    a
-}
-
-#[inline]
 fn pack_rect(x0: i32, y0: i32, x1: i32, y1: i32) -> u64 {
     let c = |v: i32| (v.clamp(0, 4095) as u64) & 0xFFF;
     c(x0) | (c(y0) << 12) | (c(x1) << 24) | (c(y1) << 36) | (1u64 << 63)
@@ -4153,9 +4141,15 @@ fn update_doll_pose() -> (f32, f32) {
     let dy = cp.y as f32 - cy;
 
     let t = anim_secs();
-    // 光标在球正上方 = 正面朝观察者，右侧 = 向右转，正下方 = 背面
+    // 基岩版纸娃娃基本看不到后脑勺：身体朝向按"光标方向的水平分量"给，
+    // 正上方 / 正下方都是正面（0），左右最多偏 MAX_YAW，永远不会转到背面。
+    // 用 dx / r 而不是 atan2，是因为它在中垂线上连续，不会左右来回弹。
+    const MAX_YAW: f32 = 62.0f32.to_radians();
+    let r = (dx * dx + dy * dy).sqrt().max(1.0);
     let sway = (t * 0.63).sin() * 0.035;
-    let target = dx.atan2(-dy) + sway;
+    let look = MAX_YAW * (dx / r) + sway;
+    // 身体只吃 78%，剩下的给头去"追"，看起来是头先看过去、身子跟上
+    let target = look * 0.78;
 
     let body = f32::from_bits(BALL_YAW.load(Ordering::Relaxed));
     let head = f32::from_bits(BALL_HEAD_YAW.load(Ordering::Relaxed));
@@ -4163,9 +4157,9 @@ fn update_doll_pose() -> (f32, f32) {
 
     let body_k = 1.0 - (-12.0f32 * DT).exp();
     let head_k = 1.0 - (-18.0f32 * DT).exp();
-    let nb = body + wrap_pi(target - body) * body_k;
-    // 头在身体基础上再追角度，限制 ±38°，看起来像"回头看着光标"
-    let head_target = wrap_pi(target - nb).clamp(-0.66, 0.66) + (t * 0.9).sin() * 0.03;
+    let nb = body + (target - body) * body_k;
+    // 头相对身体再转一点（最多 ±0.3 rad），总朝向不会超过 MAX_YAW 太多
+    let head_target = (look - nb).clamp(-0.3, 0.3) + (t * 0.9).sin() * 0.03;
     let nh = head + (head_target - head) * head_k;
     // 光标越低越低头（幅度收着点，8x8 的头转太多会显得扭曲）
     let pitch_target = (dy / 300.0).clamp(-0.22, 0.28);
@@ -4174,10 +4168,7 @@ fn update_doll_pose() -> (f32, f32) {
     BALL_YAW.store(nb.to_bits(), Ordering::Relaxed);
     BALL_HEAD_YAW.store(nh.to_bits(), Ordering::Relaxed);
     BALL_HEAD_PITCH.store(np.to_bits(), Ordering::Relaxed);
-    (
-        wrap_pi(target - nb).abs(),
-        (head_target - nh).abs() + (pitch_target - np).abs(),
-    )
+    ((target - nb).abs(), (head_target - nh).abs() + (pitch_target - np).abs())
 }
 
 /// 纸娃娃动画循环：光标在动或姿态未收敛时 ~30fps，静置时降到 ~7fps 保住 CPU。
