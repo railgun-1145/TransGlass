@@ -1102,7 +1102,7 @@ struct TransGlassApp {
     settings_open: bool,
     mini_mode: bool,
     desk_filter: Option<String>,
-    preview_rate: u8,
+    preview_fps: u32,
     last_mini: bool,
     issues_ver: u32,
     issues_cache: Vec<String>,
@@ -1180,7 +1180,7 @@ impl TransGlassApp {
             settings_open: std::env::var_os("TRANSGLASS_OPEN_SETTINGS").is_some(),
             mini_mode: false,
             desk_filter: None,
-            preview_rate: load_ui_state().preview_rate.unwrap_or(0),
+            preview_fps: { let s = load_ui_state(); s.preview_fps.unwrap_or(match s.preview_rate { Some(3) => 0, Some(2) => 2, Some(1) => 8, _ => 15 }) },
             last_mini: false,
             issues_ver: u32::MAX,
             issues_cache: Vec::new(),
@@ -1451,11 +1451,10 @@ impl TransGlassApp {
             return;
         }
         // 预览要动起来，按帧率档位请求下一帧重绘（关闭档不再空转）
-        let repaint_ms: u64 = match self.preview_rate {
-            3 => 0,
-            2 => 500,
-            1 => 125,
-            _ => 60,
+        let repaint_ms: u64 = if self.preview_fps == 0 {
+            0
+        } else {
+            (1000 / self.preview_fps.max(1) as u64).max(16)
         };
         if repaint_ms > 0 {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(repaint_ms));
@@ -1507,11 +1506,25 @@ impl TransGlassApp {
                     .rounding(egui::Rounding::same(12.0))
                     .inner_margin(egui::Margin::same(8.0))
                     .show(ui, |ui| {
-                        let img_size = egui::vec2(card_w - 18.0, if self.mini_mode { 96.0 } else { 118.0 });
+                        let box_w = card_w - 18.0;
+                        let box_h = if self.mini_mode { 96.0 } else { 118.0 };
+                        let img_size = egui::vec2(box_w, box_h);
                         match self.thumbnail(ui.ctx(), hwnd) {
                             Some(tex) => {
                                 let resp = ui.add(
-                                    egui::Image::new(egui::load::SizedTexture::new(tex.id(), img_size))
+                                    {
+                                        let ts = tex.size();
+                                        let aspect = ts[1] as f32 / ts[0].max(1) as f32;
+                                        let (dw, dh) = if box_w * aspect <= box_h {
+                                            (box_w, box_w * aspect)
+                                        } else {
+                                            (box_h / aspect, box_h)
+                                        };
+                                        egui::Image::new(egui::load::SizedTexture::new(
+                                            tex.id(),
+                                            egui::vec2(dw, dh),
+                                        ))
+                                    }
                                         .rounding(8.0)
                                         .sense(egui::Sense::click()),
                                 );
@@ -1530,7 +1543,7 @@ impl TransGlassApp {
                                 ui.painter().text(
                                     rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    if self.preview_rate >= 3 { "预览已关闭" } else { "无预览" },
+                                    if self.preview_fps == 0 { "预览已关闭" } else { "无预览" },
                                     egui::FontId::proportional(12.0),
                                     TEXT_SECONDARY,
                                 );
@@ -1597,17 +1610,12 @@ impl TransGlassApp {
 
     fn thumbnail(&mut self, ctx: &egui::Context, hwnd: isize) -> Option<egui::TextureHandle> {
         let now = std::time::Instant::now();
-        if self.preview_rate >= 3 {
+        if self.preview_fps == 0 {
             return None;
         }
         let is_fg = unsafe { GetForegroundWindow() == HWND(hwnd as *mut _) };
-        // 0 流畅 15/2.5fps，1 均衡 8/1.2fps，2 省电 2/0.8fps
-        let (fg_ms, bg_ms): (u64, u64) = match self.preview_rate {
-            1 => (125, 800),
-            2 => (500, 1200),
-            _ => (66, 400),
-        };
-        let interval_ms = if is_fg { fg_ms } else { bg_ms };
+        let fg_ms = (1000 / self.preview_fps.max(1) as u64).max(16);
+        let interval_ms = if is_fg { fg_ms } else { fg_ms * 4 };
         if let Some((tex, at)) = self.thumbs.get(&hwnd) {
             if (now.duration_since(*at).as_millis() as u64) < interval_ms {
                 return Some(tex.clone());
@@ -2055,18 +2063,23 @@ impl eframe::App for TransGlassApp {
                         ui.add_space(12.0);
                         ui.label(egui::RichText::new("窗口").strong().color(TEXT_SECONDARY));
                         ui.label(egui::RichText::new("预览帧率").small().color(TEXT_SECONDARY));
-                        let mut rate = self.preview_rate;
-                        ui.horizontal(|ui| {
-                            for (v, name) in
-                                [(0u8, "流畅"), (1u8, "均衡"), (2u8, "省电"), (3u8, "关闭（只显示图标）")]
-                            {
-                                if ui.radio_value(&mut rate, v, name).changed() {
-                                    self.preview_rate = rate;
-                                    self.ui_state.preview_rate = Some(rate);
-                                    save_ui_state(&self.ui_state);
-                                }
-                            }
-                        });
+                        let mut fps = self.preview_fps as f32;
+                        let resp = ui.add(
+                            egui::Slider::new(&mut fps, 0.0..=60.0)
+                                .step_by(1.0)
+                                .suffix(" fps")
+                                .show_value(true),
+                        );
+                        if resp.changed() {
+                            self.preview_fps = fps as u32;
+                            self.ui_state.preview_fps = Some(self.preview_fps);
+                            save_ui_state(&self.ui_state);
+                        }
+                        ui.label(
+                            egui::RichText::new("0 = 关闭预览（只显示占位）；前台窗口按此帧率，其它窗口为 1/4")
+                                .small()
+                                .weak(),
+                        );
                         ui.add_space(8.0);
                         let mut mini = self.mini_mode;
                         if ui
@@ -2750,7 +2763,9 @@ struct UiState {
     w: Option<f32>,
     h: Option<f32>,
     always_on_top: Option<bool>,
-    /// 预览帧率：0 流畅 / 1 均衡 / 2 省电 / 3 关闭
+    /// 预览帧率（0 = 关闭）
+    preview_fps: Option<u32>,
+    /// 兼容旧配置
     preview_rate: Option<u8>,
 }
 
@@ -3453,7 +3468,12 @@ unsafe fn control_window(hwnd: HWND) {
 }
 
 fn window_menu(ui: &mut egui::Ui, hwnd: isize, title: &str) {
-    ui.label(egui::RichText::new(title).strong().small());
+    ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
+    ui.spacing_mut().button_padding = egui::vec2(12.0, 6.0);
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+    ui.label(egui::RichText::new(title).strong().size(14.0));
     ui.separator();
     let st = GLOBAL_REGISTRY
         .get(&hwnd)
