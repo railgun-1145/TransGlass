@@ -54,6 +54,12 @@
 
 **窗口按钮尺寸**：小窗模式下头部是「设置 / 还原」两个按钮，`还原` 只是把 `mini_mode = false`；`设置` 会同时把 `mini_mode = false` 再打开设置页，所以永远是「大界面 + 设置页」。
 
+**无边框的窗口描边**：`rect_stroke` 在 0.5 偏移下会被抗锯齿糊掉（只有右边和下边能看到），改成在 Foreground 层用 `rect_filled` 画四条 1px 实心线，颜色 `#B0B0B0`，四边都实心可见。
+
+**悬浮球开关**：`BALL_SHOWN` 记当前是否显示，`set_ball_visible(on)`（关 = 收起面板 + `ShowWindow(SW_HIDE)`，开 = `ball_render` + `SHOWNA`）。设置里「显示悬浮球」写 `UiState.ball_visible` 并在启动时应用；托盘右键 / 菜单项「唤出悬浮球」也会调它。**右键点悬浮球不再关球**（关球改成面板标题栏右上角的 MC 风格 `×`，命中码 6）。
+
+**纸娃娃居中 + 双击**：纸娃娃先 `doll::render` 到一张透明图层，再按返回的包围盒把整块合成到主缓冲——中心按 `t` 从「球的位置」插值到「舞台中心」，所以展开/收起时人物是滑进去的，展开后视觉上水平垂直都居中。`BALL_DOLL_RECT` 存的是合成后的矩形（命中测试用）。`WM_LBUTTONUP` 命中 9（纸娃娃）时判断双击：`DOLL_LAST_CLICK`/`DOLL_LAST_POS` 记上次时间与位置，350ms 内且位置接近就算双击 → `show_root_window()`，开关是 `DOLL_DBLCLICK`（设置里的「双击纸娃娃打开主界面」）。
+
 **快捷键编辑**：不再单开二级窗口（`hotkey_editor_open` 已删），直接内嵌在设置页「快捷键」分类里，一行一个功能：勾选 / 名称 / 修饰键 / 按键 / 录入。
 
 **鼠标键热键（战争雷霆式）**：键位词表里除了键盘键，还有 `鼠标左键/右键/中键/侧键1/侧键2/滚轮上/滚轮下`，`parse_vk` 分别映射到 VK 0x01/02/04/05/06 和自定义码 0x20A/0x20B。`try_register_hotkey` 遇到鼠标键直接返回成功（`RegisterHotKey` 注册不了），改由 `mouse_hook_proc` 派发：按 `WM_*BUTTONDOWN`/`WM_MOUSEWHEEL` 算出 vk，和 `current_hotkey_mods()` 一起在 `HOTKEY_MATCH` 里查，命中就 `PostThreadMessageW(WM_HOTKEY)` 走同一条处理链；侧键/中键吞掉，左/右键和滚轮放行。校验规则：鼠标键可以不带修饰键，但左/右键必须配修饰键。旧的 `mouse.xbutton1/2` 字段保留兼容，保存时若槽位已占用对应侧键会自动清空，避免一次按键触发两次。

@@ -2898,6 +2898,38 @@ impl eframe::App for TransGlassApp {
             unsafe { hide_hilite() };
         }
 
+        // 无边框窗口：自己描一圈细边，不然跟桌面糊在一起分不清边界
+        {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("win_border"),
+            ));
+            // 四条 1px 的实心线，比 rect_stroke 稳（半像素会被抗锯齿糊掉）
+            let r = ctx.screen_rect();
+            let c = egui::Color32::from_rgb(0xB0, 0xB0, 0xB0);
+            let one = 1.0;
+            painter.rect_filled(
+                egui::Rect::from_min_max(r.min, egui::pos2(r.max.x, r.min.y + one)),
+                0.0,
+                c,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(r.min.x, r.max.y - one), r.max),
+                0.0,
+                c,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + one, r.max.y)),
+                0.0,
+                c,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(r.max.x - one, r.min.y), r.max),
+                0.0,
+                c,
+            );
+        }
+
         if self.selftest_open {
             let mut open = self.selftest_open;
             egui::Window::new("自检报告")
@@ -2938,11 +2970,13 @@ impl eframe::App for TransGlassApp {
 fn create_tray_icon() -> TrayIcon {
     let tray_menu = Menu::new();
     let show_item = MenuItem::with_id("show", "打开 TransGlass", true, None);
+    let ball_item = MenuItem::with_id("ball", "唤出悬浮球", true, None);
     let reset_all_item = MenuItem::with_id("reset_all", "全部窗口还原", true, None);
     let exit_item = MenuItem::with_id("exit", "退出程序", true, None);
 
     let _ = tray_menu.append_items(&[
         &show_item,
+        &ball_item,
         &PredefinedMenuItem::separator(),
         &reset_all_item,
         &PredefinedMenuItem::separator(),
@@ -3070,6 +3104,10 @@ fn main() -> Result<(), eframe::Error> {
         BALL_SCALE.store(sc.to_bits(), Ordering::Relaxed);
     }
     unsafe { ball_spawn() };
+    DOLL_DBLCLICK.store(boot_state.doll_dblclick.unwrap_or(true), Ordering::Relaxed);
+    if boot_state.ball_visible == Some(false) {
+        unsafe { set_ball_visible(false) };
+    }
     unsafe { purge_shell_managed() };
     spawn_device_tracking_ticker();
     spawn_doll_ticker();
@@ -3080,6 +3118,7 @@ fn main() -> Result<(), eframe::Error> {
                 "show" => {
                     show_root_window();
                 }
+                "ball" => unsafe { set_ball_visible(true) },
                 "reset_all" => unsafe { restore_all_windows() },
                 "exit" => {
                     if EXITING.swap(true, Ordering::SeqCst) {
@@ -3096,17 +3135,25 @@ fn main() -> Result<(), eframe::Error> {
 
     thread::spawn(|| {
         while let Ok(event) = TrayIconEvent::receiver().recv() {
-            if matches!(
-                event,
+            match event {
                 TrayIconEvent::Click {
                     button: MouseButton::Left,
                     ..
-                } | TrayIconEvent::DoubleClick {
+                }
+                | TrayIconEvent::DoubleClick {
                     button: MouseButton::Left,
                     ..
-                }
-            ) {
-                show_root_window();
+                } => show_root_window(),
+                // 托盘图标右键：唤出悬浮球（没显示的时候才需要）
+                TrayIconEvent::Click {
+                    button: MouseButton::Right,
+                    ..
+                } => unsafe {
+                    if !BALL_SHOWN.load(Ordering::Relaxed) {
+                        set_ball_visible(true);
+                    }
+                },
+                _ => {}
             }
         }
     });
@@ -3442,6 +3489,10 @@ struct UiState {
     idle_sway: Option<bool>,
     /// 设置里选定的输入设备路径（None = 自动）
     input_mouse: Option<String>,
+    /// 是否显示悬浮球（默认显示）
+    ball_visible: Option<bool>,
+    /// 双击纸娃娃打开主界面（默认开）
+    doll_dblclick: Option<bool>,
     input_pen: Option<String>,
     input_tablet: Option<String>,
     view_mode: Option<u8>,
@@ -4594,6 +4645,13 @@ static BALL_MOVED: AtomicBool = AtomicBool::new(false);
 static BALL_HOVER: AtomicU8 = AtomicU8::new(0);
 /// 正在拖透明度滑条
 static BALL_SLIDER_DRAG: AtomicBool = AtomicBool::new(false);
+/// 悬浮球当前是否显示（设置里可开关）
+static BALL_SHOWN: AtomicBool = AtomicBool::new(true);
+/// 双击纸娃娃打开主界面（设置里可关）
+static DOLL_DBLCLICK: AtomicBool = AtomicBool::new(true);
+/// 上次点纸娃娃的时间/位置（判断双击）
+static DOLL_LAST_CLICK: AtomicU32 = AtomicU32::new(0);
+static DOLL_LAST_POS: AtomicU32 = AtomicU32::new(0);
 
 fn ball_expand_target() -> bool {
     BALL_EXPANDED.load(Ordering::Relaxed)
@@ -4625,6 +4683,8 @@ struct BallPanel {
     stage: (i32, i32, i32, i32),
     buttons: [(i32, i32, i32, i32); 4],
     slider: (i32, i32, i32, i32),
+    /// 标题栏右上角的 MC 风格关闭键
+    close_btn: (i32, i32, i32, i32),
 }
 
 /// 展开布局：MC 背包/设置界面风格——标题栏 + 左侧 4 个按钮 + 右侧深色槽底站纸娃娃 + 底部透明度条。
@@ -4643,6 +4703,7 @@ fn ball_panel(t: f32) -> BallPanel {
     }
     let stage = (px0 + 136, 52, px0 + 212, 192);
     let slider = (px0 + 10, 198, px0 + 208, 224);
+    let close_btn = (px0 + 188, 26, px0 + 210, 42);
     BallPanel {
         panel,
         title,
@@ -4650,6 +4711,7 @@ fn ball_panel(t: f32) -> BallPanel {
         stage,
         buttons,
         slider,
+        close_btn,
     }
 }
 
@@ -4739,6 +4801,26 @@ fn draw_mc_stage(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32), a: f32
     mc_fill(buf, w, h, x0 + 2, y0 + 2, x0 + 4, y1 - 2, (34, 34, 34), a);
     mc_fill(buf, w, h, x0 + 2, y1 - 4, x1 - 2, y1 - 2, (96, 96, 96), a);
     mc_fill(buf, w, h, x1 - 4, y0 + 2, x1 - 2, y1 - 2, (96, 96, 96), a);
+}
+
+/// MC 风格的 ×：两根 2px 斜线，带深色投影
+fn draw_mc_cross(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32), c: (u8, u8, u8), a: f32) {
+    let (x0, y0, x1, y1) = r;
+    let n = ((x1 - x0).min(y1 - y0) - 8).max(3);
+    let cx = (x0 + x1) / 2;
+    let cy = (y0 + y1) / 2;
+    let half = n / 2;
+    for i in -half..=half {
+        // 投影（右下偏移 1px）
+        for (ax, ay) in [(1, 1), (-1, 1)] {
+            let bx0 = if ax > 0 { cx + i } else { cx - i - 2 };
+            let bx1 = if ax > 0 { cx + i + 2 } else { cx - i };
+            mc_fill(buf, w, h, bx0, cy + ay + i.min(0), bx1, cy + ay + i + 2, (60, 60, 60), a);
+        }
+        // 主笔画：一条 \ 一条 /
+        mc_fill(buf, w, h, cx + i, cy + i, cx + i + 2, cy + i + 2, c, a);
+        mc_fill(buf, w, h, cx - i - 2, cy + i, cx - i, cy + i + 2, c, a);
+    }
 }
 
 fn draw_mc_button(
@@ -5029,6 +5111,9 @@ unsafe fn ball_render() {
         let cur = target_alpha_now();
         let sv = ((255.0 - cur as f32) / 215.0).clamp(0.0, 1.0);
         draw_mc_slider(buf, w, h, p.slider, sv, panel_alpha);
+        // 标题栏右上角的关闭键（MC 风格小按钮 + ×）
+        draw_mc_button(buf, w, h, p.close_btn, hover == 6, false, panel_alpha);
+        draw_mc_cross(buf, w, h, p.close_btn, (255, 255, 255), panel_alpha);
     }
 
     // 中间：MC 3D 纸娃娃（基岩版左上角纸娃娃观感，随光标连续转向）
@@ -5059,8 +5144,10 @@ unsafe fn ball_render() {
             dist: 95.0,
             ss: 3,
         };
+        // 先画到一张透明图层，再按包围盒把人物摆到舞台正中
+        let mut layer = vec![0u8; (w * h * 4) as usize];
         let rect = doll::render(
-            buf,
+            &mut layer,
             w as usize,
             h as usize,
             bx as f32,
@@ -5068,13 +5155,57 @@ unsafe fn ball_render() {
             skin,
             &pose,
         );
-        BALL_DOLL_RECT.store(
-            match rect {
-                Some((x0, y0, x1, y1)) => pack_rect(x0, y0, x1, y1),
-                None => 0,
-            },
-            Ordering::Relaxed,
-        );
+        let mut doll_rect: u64 = 0;
+        if let Some((x0, y0, x1, y1)) = rect {
+            if x1 > x0 && y1 > y0 {
+                // 折叠时留在球的位置；展开时按进度插值到舞台中心
+                let (mut cx, mut cy) = (bx, by);
+                if panel_alpha > 0.02 {
+                    let p = ball_panel(t);
+                    let scx = (p.stage.0 + p.stage.2) / 2;
+                    let scy = (p.stage.1 + p.stage.3) / 2;
+                    cx = (bx as f32 + (scx - bx) as f32 * panel_alpha).round() as i32;
+                    cy = (by as f32 + (scy - by) as f32 * panel_alpha).round() as i32;
+                }
+                let bw = x1 - x0;
+                let bh = y1 - y0;
+                let dx = cx - bw / 2 - x0;
+                let dy = cy - bh / 2 - y0;
+                for yy in 0..bh {
+                    for xx in 0..bw {
+                        let sx = x0 + xx;
+                        let sy = y0 + yy;
+                        let nx = sx + dx;
+                        let ny = sy + dy;
+                        if sx < 0
+                            || sy < 0
+                            || sx >= w
+                            || sy >= h
+                            || nx < 0
+                            || ny < 0
+                            || nx >= w
+                            || ny >= h
+                        {
+                            continue;
+                        }
+                        let so = ((sy * w + sx) * 4) as usize;
+                        let a = layer[so + 3] as f32 / 255.0;
+                        if a <= 0.004 {
+                            continue;
+                        }
+                        let dobj = ((ny * w + nx) * 4) as usize;
+                        mc_blend_px(
+                            buf,
+                            dobj,
+                            (layer[so + 2], layer[so + 1], layer[so]),
+                            a,
+                        );
+                    }
+                }
+                doll_rect = pack_rect(x0 + dx, y0 + dy, x1 + dx, y1 + dy);
+            }
+        }
+        BALL_DOLL_RECT.store(doll_rect, Ordering::Relaxed);
     }
 
     // 给纸娃娃加 1px 深色描边（无方块时靠它从桌面里跳出来）
@@ -5208,6 +5339,17 @@ unsafe fn ball_render() {
     ReleaseDC(HWND::default(), screen);
 }
 unsafe fn ball_hit(x: i32, y: i32) -> u8 {
+    // 展开时先判面板上的控件（关闭键在最上层）
+    {
+        let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
+        if t > 0.5 {
+            let p = ball_panel(t);
+            let inside = |r: (i32, i32, i32, i32)| x >= r.0 && x < r.2 && y >= r.1 && y < r.3;
+            if inside(p.close_btn) {
+                return 6;
+            }
+        }
+    }
     let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
     let (bx, by) = ball_center();
     if ((x - bx).pow(2) + (y - by).pow(2)) <= 34 * 34 {
@@ -5331,7 +5473,33 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             let x = (l.0 & 0xFFFF) as i32;
             let y = ((l.0 >> 16) & 0xFFFF) as i32;
             match ball_hit(x, y) {
+                6 => {
+                    // 面板上的 × ：关掉悬浮球
+                    BALL_EXPANDED.store(false, Ordering::Relaxed);
+                    BALL_ANIM.store(0.0f32.to_bits(), Ordering::Relaxed);
+                    BALL_SHOWN.store(false, Ordering::Relaxed);
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    request_ui_repaint();
+                }
                 9 => {
+                    // 双击纸娃娃 → 打开主界面（设置里可关）
+                    if DOLL_DBLCLICK.load(Ordering::Relaxed) {
+                        let now = anim_secs();
+                        let last = f32::from_bits(DOLL_LAST_CLICK.load(Ordering::Relaxed));
+                        let pos = DOLL_LAST_POS.load(Ordering::Relaxed);
+                        let this_pos = ((x as u32) << 16) | (y as u32 & 0xFFFF);
+                        let near = (pos >> 16) as i32 - x;
+                        DOLL_LAST_POS.store(this_pos, Ordering::Relaxed);
+                        DOLL_LAST_CLICK.store(now.to_bits(), Ordering::Relaxed);
+                        if last > 0.0
+                            && now - last < 0.35
+                            && (near.abs() <= 12 || (pos & 0xFFFF) as i32 == -1)
+                        {
+                            DOLL_LAST_CLICK.store(0.0f32.to_bits(), Ordering::Relaxed);
+                            show_root_window();
+                            return LRESULT(0);
+                        }
+                    }
                     let target = !ball_expand_target();
                     BALL_EXPANDED.store(target, Ordering::Relaxed);
                     // 12 步 × 16ms ≈ 200ms，三次方 ease-out：起手快、收尾慢
@@ -5363,11 +5531,29 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             }
             LRESULT(0)
         }
-        WM_RBUTTONUP => {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-            LRESULT(0)
-        }
+        // 右键不再关闭悬浮球（关球改用面板标题栏的 ×）
+        WM_RBUTTONUP => DefWindowProcW(hwnd, msg, w, l),
         _ => DefWindowProcW(hwnd, msg, w, l),
+    }
+}
+
+unsafe fn set_ball_visible(on: bool) {
+    BALL_SHOWN.store(on, Ordering::Relaxed);
+    let raw = BALL_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        if on {
+            ball_spawn();
+        }
+        return;
+    }
+    let h = HWND(raw as *mut _);
+    if on {
+        ball_render();
+        let _ = ShowWindow(h, SW_SHOWNA);
+    } else {
+        BALL_EXPANDED.store(false, Ordering::Relaxed);
+        BALL_ANIM.store(0.0f32.to_bits(), Ordering::Relaxed);
+        let _ = ShowWindow(h, SW_HIDE);
     }
 }
 
@@ -6179,6 +6365,27 @@ impl TransGlassApp {
                 .small()
                 .weak(),
         );
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("显示与交互").size(15.0).color(TEXT_PRIMARY));
+        let mut shown = BALL_SHOWN.load(Ordering::Relaxed);
+        if ui
+            .checkbox(&mut shown, "显示悬浮球")
+            .on_hover_text("关掉后托盘图标右键可以重新唤出")
+            .changed()
+        {
+            self.ui_state.ball_visible = Some(shown);
+            save_ui_state(&self.ui_state);
+            unsafe { set_ball_visible(shown) };
+        }
+        let mut dbl = DOLL_DBLCLICK.load(Ordering::Relaxed);
+        if ui
+            .checkbox(&mut dbl, "双击纸娃娃打开主界面")
+            .changed()
+        {
+            DOLL_DBLCLICK.store(dbl, Ordering::Relaxed);
+            self.ui_state.doll_dblclick = Some(dbl);
+            save_ui_state(&self.ui_state);
+        }
     }
 
     fn settings_page_maint(&mut self, ui: &mut egui::Ui) {
