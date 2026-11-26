@@ -4102,73 +4102,128 @@ const MC_GROOVE: (u8, u8, u8) = (55, 55, 55);
 
 struct BallPanel {
     panel: (i32, i32, i32, i32),
-    /// 纸娃娃站立的深色底（MC 背包里放角色/物品的那块凹槽底）
+    /// 标题栏（MC 设置界面顶部那种标题）
+    title: (i32, i32, i32, i32),
+    /// 标题栏下面的分隔线：(x0, x1, y)
+    divider: (i32, i32, i32),
+    /// 纸娃娃站立的深色底（MC 背包里放角色/物品的那块凹槽）
     stage: (i32, i32, i32, i32),
     buttons: [(i32, i32, i32, i32); 4],
     slider: (i32, i32, i32, i32),
 }
 
-/// 展开布局：左边竖着 4 个 MC 按钮（置顶 / 穿透 / 模式 / 还原），右边一块深色底站着纸娃娃，
-/// 底部一条透明度滑条。t = 0..1 弹出动画，面板从右侧滑进来。
+/// 展开布局：MC 背包/设置界面风格——标题栏 + 左侧 4 个按钮 + 右侧深色槽底站纸娃娃 + 底部透明度条。
+/// t = 0..1 弹出动画，面板从右侧滑进来并淡入。
 fn ball_panel(t: f32) -> BallPanel {
     let off = ((1.0 - t.clamp(0.0, 1.0)) * 22.0).round() as i32;
     let px0 = 24 + off;
-    let panel = (px0, 28, px0 + 218, 244);
-    let bx = px0 + 12;
-    let bw = 124;
+    let panel = (px0, 22, px0 + 218, 246);
+    let title = (px0 + 8, 22, px0 + 210, 46);
+    let divider = (px0 + 8, px0 + 210, 46);
+    let bx = px0 + 10;
+    let bw = 120;
     let mut buttons = [(0, 0, 0, 0); 4];
-    for (i, y) in [40i32, 72, 104, 136].iter().enumerate() {
+    for (i, y) in [54i32, 84, 114, 144].iter().enumerate() {
         buttons[i] = (bx, *y, bx + bw, *y + 26);
     }
-    let stage = (px0 + 134, 30, px0 + 214, 192);
-    let slider = (bx, 196, px0 + 206, 222);
+    let stage = (px0 + 136, 52, px0 + 212, 192);
+    let slider = (px0 + 10, 198, px0 + 208, 224);
     BallPanel {
         panel,
+        title,
+        divider,
         stage,
         buttons,
         slider,
     }
 }
 
-fn mc_fill(buf: &mut [u8], w: i32, h: i32, x0: i32, y0: i32, x1: i32, y1: i32, c: (u8, u8, u8)) {
+/// 直通 alpha 合成一个像素（BGRA 目标），用于面板淡入
+#[inline]
+fn mc_blend_px(buf: &mut [u8], o: usize, c: (u8, u8, u8), a: f32) {
+    if a <= 0.004 {
+        return;
+    }
+    let da = buf[o + 3] as f32 / 255.0;
+    let oa = a + da * (1.0 - a);
+    if oa <= 0.004 {
+        return;
+    }
+    let k = 1.0 / oa;
+    let mix = |s: u8, d: u8| -> u8 {
+        (((s as f32 * a + d as f32 * da * (1.0 - a)) * k).clamp(0.0, 255.0)) as u8
+    };
+    buf[o] = mix(c.2, buf[o]);
+    buf[o + 1] = mix(c.1, buf[o + 1]);
+    buf[o + 2] = mix(c.0, buf[o + 2]);
+    buf[o + 3] = (oa * 255.0) as u8;
+}
+
+fn mc_fill(
+    buf: &mut [u8],
+    w: i32,
+    h: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    c: (u8, u8, u8),
+    a: f32,
+) {
+    if a <= 0.004 {
+        return;
+    }
     for y in y0.max(0)..y1.min(h) {
         for x in x0.max(0)..x1.min(w) {
             let o = ((y * w + x) * 4) as usize;
-            buf[o] = c.2;
-            buf[o + 1] = c.1;
-            buf[o + 2] = c.0;
-            buf[o + 3] = 255;
+            mc_blend_px(buf, o, c, a);
         }
     }
 }
 
-fn mc_frame(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32), c: (u8, u8, u8), t: i32) {
+fn mc_frame(
+    buf: &mut [u8],
+    w: i32,
+    h: i32,
+    r: (i32, i32, i32, i32),
+    c: (u8, u8, u8),
+    t: i32,
+    a: f32,
+) {
     let (x0, y0, x1, y1) = r;
-    mc_fill(buf, w, h, x0, y0, x1, y0 + t, c);
-    mc_fill(buf, w, h, x0, y1 - t, x1, y1, c);
-    mc_fill(buf, w, h, x0, y0, x0 + t, y1, c);
-    mc_fill(buf, w, h, x1 - t, y0, x1, y1, c);
+    mc_fill(buf, w, h, x0, y0, x1, y0 + t, c, a);
+    mc_fill(buf, w, h, x0, y1 - t, x1, y1, c, a);
+    mc_fill(buf, w, h, x0, y0, x0 + t, y1, c, a);
+    mc_fill(buf, w, h, x1 - t, y0, x1, y1, c, a);
 }
 
-fn draw_mc_panel(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32)) {
+fn draw_mc_panel(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32), a: f32) {
     let (x0, y0, x1, y1) = r;
-    mc_fill(buf, w, h, x0, y0, x1, y1, MC_BG);
-    mc_frame(buf, w, h, r, MC_BLACK, 2);
+    mc_fill(buf, w, h, x0, y0, x1, y1, MC_BG, a);
+    mc_frame(buf, w, h, r, MC_BLACK, 2, a);
     // 内侧斜面：上/左白，下/右深灰
-    mc_fill(buf, w, h, x0 + 2, y0 + 2, x1 - 2, y0 + 3, MC_WHITE);
-    mc_fill(buf, w, h, x0 + 2, y0 + 2, x0 + 3, y1 - 2, MC_WHITE);
-    mc_fill(buf, w, h, x0 + 2, y1 - 3, x1 - 2, y1 - 2, MC_SHADOW);
-    mc_fill(buf, w, h, x1 - 3, y0 + 2, x1 - 2, y1 - 2, MC_SHADOW);
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x1 - 2, y0 + 3, MC_WHITE, a);
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x0 + 3, y1 - 2, MC_WHITE, a);
+    mc_fill(buf, w, h, x0 + 2, y1 - 3, x1 - 2, y1 - 2, MC_SHADOW, a);
+    mc_fill(buf, w, h, x1 - 3, y0 + 2, x1 - 2, y1 - 2, MC_SHADOW, a);
 }
 
-/// 纸娃娃的深色底：MC 背包里那种凹进去的槽底（上/左更暗，下/右稍亮）
-fn draw_mc_stage(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32)) {
+/// 标题栏和内容之间那道分隔线（MC 设置界面里标题下面那一横）
+fn draw_mc_divider(buf: &mut [u8], w: i32, h: i32, d: (i32, i32, i32), a: f32) {
+    let (x0, x1, y) = d;
+    mc_fill(buf, w, h, x0, y, x1, y + 1, MC_SHADOW, a);
+    mc_fill(buf, w, h, x0, y + 1, x1, y + 2, MC_WHITE, a);
+}
+
+/// 纸娃娃的深色底：MC 背包里那种凹进去的槽底，外面套一圈黑框
+fn draw_mc_stage(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32), a: f32) {
     let (x0, y0, x1, y1) = r;
-    mc_fill(buf, w, h, x0, y0, x1, y1, (58, 58, 58));
-    mc_fill(buf, w, h, x0, y0, x1, y0 + 2, (34, 34, 34));
-    mc_fill(buf, w, h, x0, y0, x0 + 2, y1, (34, 34, 34));
-    mc_fill(buf, w, h, x0, y1 - 2, x1, y1, (96, 96, 96));
-    mc_fill(buf, w, h, x1 - 2, y0, x1, y1, (96, 96, 96));
+    mc_fill(buf, w, h, x0, y0, x1, y1, (58, 58, 58), a);
+    mc_frame(buf, w, h, r, MC_BLACK, 2, a);
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x1 - 2, y0 + 4, (34, 34, 34), a);
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x0 + 4, y1 - 2, (34, 34, 34), a);
+    mc_fill(buf, w, h, x0 + 2, y1 - 4, x1 - 2, y1 - 2, (96, 96, 96), a);
+    mc_fill(buf, w, h, x1 - 4, y0 + 2, x1 - 2, y1 - 2, (96, 96, 96), a);
 }
 
 fn draw_mc_button(
@@ -4178,6 +4233,7 @@ fn draw_mc_button(
     r: (i32, i32, i32, i32),
     hover: bool,
     pressed: bool,
+    a: f32,
 ) {
     let (x0, y0, x1, y1) = r;
     let body = if pressed {
@@ -4187,14 +4243,14 @@ fn draw_mc_button(
     } else {
         MC_BTN
     };
-    mc_fill(buf, w, h, x0, y0, x1, y1, body);
-    mc_frame(buf, w, h, r, MC_BLACK, 2);
+    mc_fill(buf, w, h, x0, y0, x1, y1, body, a);
+    mc_frame(buf, w, h, r, MC_BLACK, 2, a);
     let hl = if pressed { (128, 128, 128) } else { MC_BTN_HL };
     let sh = if pressed { (150, 150, 150) } else { MC_BTN_SH };
-    mc_fill(buf, w, h, x0 + 2, y0 + 2, x1 - 2, y0 + 4, hl);
-    mc_fill(buf, w, h, x0 + 2, y0 + 2, x0 + 4, y1 - 2, hl);
-    mc_fill(buf, w, h, x0 + 2, y1 - 4, x1 - 2, y1 - 2, sh);
-    mc_fill(buf, w, h, x1 - 4, y0 + 2, x1 - 2, y1 - 2, sh);
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x1 - 2, y0 + 4, hl, a);
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x0 + 4, y1 - 2, hl, a);
+    mc_fill(buf, w, h, x0 + 2, y1 - 4, x1 - 2, y1 - 2, sh, a);
+    mc_fill(buf, w, h, x1 - 4, y0 + 2, x1 - 2, y1 - 2, sh, a);
 }
 
 /// 滑条可走行程（滑块宽 20，两端各留 6）
@@ -4203,20 +4259,19 @@ fn slider_travel(r: (i32, i32, i32, i32)) -> f32 {
 }
 
 /// t=0 → 最不透明（滑块在最左），t=1 → 最透明（滑块在最右）
-fn draw_mc_slider(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32), t: f32) {
+fn draw_mc_slider(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32), t: f32, a: f32) {
     let (x0, y0, x1, y1) = r;
-    mc_fill(buf, w, h, x0, y0, x1, y1, MC_GROOVE);
-    mc_frame(buf, w, h, r, MC_BLACK, 2);
+    mc_fill(buf, w, h, x0, y0, x1, y1, MC_GROOVE, a);
+    mc_frame(buf, w, h, r, MC_BLACK, 2, a);
     // 凹槽的内斜面：上/左更暗，下/右稍亮
-    mc_fill(buf, w, h, x0 + 2, y0 + 2, x1 - 2, y0 + 4, (28, 28, 28));
-    mc_fill(buf, w, h, x0 + 2, y0 + 2, x0 + 4, y1 - 2, (28, 28, 28));
-    mc_fill(buf, w, h, x0 + 2, y1 - 4, x1 - 2, y1 - 2, (110, 110, 110));
-    mc_fill(buf, w, h, x1 - 4, y0 + 2, x1 - 2, y1 - 2, (110, 110, 110));
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x1 - 2, y0 + 4, (28, 28, 28), a);
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x0 + 4, y1 - 2, (28, 28, 28), a);
+    mc_fill(buf, w, h, x0 + 2, y1 - 4, x1 - 2, y1 - 2, (110, 110, 110), a);
+    mc_fill(buf, w, h, x1 - 4, y0 + 2, x1 - 2, y1 - 2, (110, 110, 110), a);
     let hx = x0 + 6 + (slider_travel(r) * t.clamp(0.0, 1.0)) as i32;
-    draw_mc_button(buf, w, h, (hx, y0 - 2, hx + 20, y1 + 2), false, false);
+    draw_mc_button(buf, w, h, (hx, y0 - 2, hx + 20, y1 + 2), false, false, a);
 }
 
-/// 当前的遥控目标：跳过自身/系统窗口（记录值失效时退回前台窗口）
 unsafe fn ball_target() -> HWND {
     let stored = TARGET_HWND.load(Ordering::Relaxed);
     if stored != 0 {
@@ -4396,7 +4451,7 @@ fn spawn_doll_ticker() {
             if hover_changed {
                 last_hover = hover;
             }
-            if moving || active || hover_changed || (t - last_render) >= 0.14 {
+            if moving || active || hover_changed || (t - last_render) >= 0.18 {
                 last_render = t;
                 unsafe { ball_render() };
             }
@@ -4441,18 +4496,21 @@ unsafe fn ball_render() {
     let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
     let (bx, by) = ball_center();
 
-    // 展开面板：MC 背包风格（深色底座 + 4 个按钮 + 底部透明度条）
-    if t > 0.02 {
+    // 展开面板：MC 背包风格（标题栏 + 深色槽底 + 4 个按钮 + 底部透明度条）
+    // t 同时当透明度用：弹出时整块面板淡入，不至于"啪"一下糊在桌面上
+    let panel_alpha = t.clamp(0.0, 1.0);
+    if panel_alpha > 0.02 {
         let p = ball_panel(t);
         let hover = BALL_HOVER.load(Ordering::Relaxed);
-        draw_mc_panel(buf, w, h, p.panel);
-        draw_mc_stage(buf, w, h, p.stage);
+        draw_mc_panel(buf, w, h, p.panel, panel_alpha);
+        draw_mc_divider(buf, w, h, p.divider, panel_alpha);
+        draw_mc_stage(buf, w, h, p.stage, panel_alpha);
         for (i, r) in p.buttons.iter().enumerate() {
-            draw_mc_button(buf, w, h, *r, hover == (i as u8 + 1), false);
+            draw_mc_button(buf, w, h, *r, hover == (i as u8 + 1), false, panel_alpha);
         }
         let cur = target_alpha_now();
         let sv = ((255.0 - cur as f32) / 215.0).clamp(0.0, 1.0);
-        draw_mc_slider(buf, w, h, p.slider, sv);
+        draw_mc_slider(buf, w, h, p.slider, sv, panel_alpha);
     }
 
     // 中间：MC 3D 纸娃娃（基岩版左上角纸娃娃观感，随光标连续转向）
@@ -4540,9 +4598,19 @@ unsafe fn ball_render() {
             windows::core::w!("Microsoft YaHei"),
         );
         let old_sat = SelectObject(mem, HGDIOBJ(font.0));
+        // 文字不能真的半透明（GDI 不写 alpha），用"往底色靠"的方式跟着面板淡入
+        let k = ((t - 0.45) / 0.55).clamp(0.0, 1.0);
+        let fade = |c: (u8, u8, u8)| -> (u8, u8, u8) {
+            (
+                (198.0 + (c.0 as f32 - 198.0) * k) as u8,
+                (198.0 + (c.1 as f32 - 198.0) * k) as u8,
+                (198.0 + (c.2 as f32 - 198.0) * k) as u8,
+            )
+        };
+        draw_mc_label(mem, "TransGlass", p.title, fade((80, 80, 80)));
         let labels = ["置顶", "穿透", "模式", "还原"];
         for (i, r) in p.buttons.iter().enumerate() {
-            draw_mc_label(mem, labels[i], *r, (255, 255, 255));
+            draw_mc_label(mem, labels[i], *r, fade((255, 255, 255)));
         }
         let cur = target_alpha_now();
         let sv = ((255.0 - cur as f32) / 215.0).clamp(0.0, 1.0);
@@ -4550,7 +4618,7 @@ unsafe fn ball_render() {
             mem,
             &format!("透明度 {}%", (sv * 100.0).round() as i32),
             p.slider,
-            (255, 255, 255),
+            fade((255, 255, 255)),
         );
         SelectObject(mem, old_sat);
         let _ = DeleteObject(HGDIOBJ(font.0));
@@ -4740,13 +4808,15 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 9 => {
                     let target = !ball_expand_target();
                     BALL_EXPANDED.store(target, Ordering::Relaxed);
-                    let steps = 6;
+                    // 12 步 × 16ms ≈ 200ms，三次方 ease-out：起手快、收尾慢
+                    let steps = 12;
                     for i in 0..=steps {
                         let v = i as f32 / steps as f32;
-                        let t = if target { v } else { 1.0 - v };
+                        let e = 1.0 - (1.0 - v).powi(3);
+                        let t = if target { e } else { 1.0 - e };
                         BALL_ANIM.store(t.to_bits(), Ordering::Relaxed);
                         ball_render();
-                        std::thread::sleep(std::time::Duration::from_millis(14));
+                        std::thread::sleep(std::time::Duration::from_millis(16));
                     }
                 }
                 1..=4 => {
