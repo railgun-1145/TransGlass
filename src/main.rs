@@ -1101,6 +1101,7 @@ struct TransGlassApp {
     selected: Option<isize>,
     settings_open: bool,
     mini_mode: bool,
+    desk_filter: Option<String>,
     last_mini: bool,
     issues_ver: u32,
     issues_cache: Vec<String>,
@@ -1177,6 +1178,7 @@ impl TransGlassApp {
             selected: None,
             settings_open: std::env::var_os("TRANSGLASS_OPEN_SETTINGS").is_some(),
             mini_mode: false,
+            desk_filter: None,
             last_mini: false,
             issues_ver: u32::MAX,
             issues_cache: Vec::new(),
@@ -1323,9 +1325,41 @@ impl TransGlassApp {
 
     fn detail_pane(&mut self, ui: &mut egui::Ui) {
         self.refresh_window_list(false);
+        // 顶部桌面选择：控制当前显示的桌面
+        let mut desks: Vec<String> = Vec::new();
+        for w in &self.wins {
+            if !desks.contains(&w.desktop) {
+                desks.push(w.desktop.clone());
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("桌面").small().weak());
+            if ui
+                .selectable_label(self.desk_filter.is_none(), egui::RichText::new("全部").small())
+                .clicked()
+            {
+                self.desk_filter = None;
+            }
+            for d in &desks {
+                if ui
+                    .selectable_label(
+                        self.desk_filter.as_deref() == Some(d.as_str()),
+                        egui::RichText::new(d).small(),
+                    )
+                    .clicked()
+                {
+                    self.desk_filter = Some(d.clone());
+                }
+            }
+        });
+        ui.add_space(6.0);
         let wins: Vec<(isize, String, String)> = self
             .wins
             .iter()
+            .filter(|w| match &self.desk_filter {
+                Some(d) => &w.desktop == d,
+                None => true,
+            })
             .map(|w| (w.hwnd, w.title.clone(), w.desktop.clone()))
             .collect();
         ui.horizontal(|ui| {
