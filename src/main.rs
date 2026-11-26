@@ -3029,13 +3029,23 @@ fn window_desktop(hwnd: HWND) -> String {
     };
     unsafe {
         if let Ok(guid) = manager.GetWindowDesktopId(hwnd) {
-            let on_current = manager.IsWindowOnCurrentVirtualDesktop(hwnd).map(|b| b.as_bool()).unwrap_or(false);
-            let short = format!("{:08x}", guid.data1);
-            return if on_current {
-                format!("桌面 {short}（当前）")
-            } else {
-                format!("桌面 {short}")
-            };
+            // 全零 GUID 表示查询失败（不是真实桌面），归到「未分组」
+            let empty = guid.data1 == 0
+                && guid.data2 == 0
+                && guid.data3 == 0
+                && guid.data4.iter().all(|b| *b == 0);
+            if !empty {
+                let on_current = manager
+                    .IsWindowOnCurrentVirtualDesktop(hwnd)
+                    .map(|b| b.as_bool())
+                    .unwrap_or(false);
+                let short = format!("{:08x}", guid.data1);
+                return if on_current {
+                    format!("桌面 {short}（当前）")
+                } else {
+                    format!("桌面 {short}")
+                };
+            }
         }
     }
     "未分组".to_string()
@@ -3220,10 +3230,41 @@ unsafe fn capture_window(hwnd: HWND) -> Option<egui::ColorImage> {
                 px.swap(0, 2);
                 px[3] = 255;
             }
-            img = Some(egui::ColorImage::from_rgba_unmultiplied(
-                [w as usize, h as usize],
-                &buf,
-            ));
+            // 花屏检测：GPU/DirectComposition 窗口常抓到扫描线噪声，
+            // 用相邻像素亮度差均值判断，超过阈值就当作抓取失败（显示"无预览"而不是花屏）
+            let stride = (w * 4) as usize;
+            let mut diff_sum = 0u64;
+            let mut diff_n = 0u64;
+            let mut points = 0i32;
+            let mut y = 0i32;
+            while y < h {
+                let mut x = 0i32;
+                while x + 1 < w {
+                    let i = (y as usize) * stride + (x as usize) * 4;
+                    let a = (buf[i] as i32 + buf[i + 1] as i32 + buf[i + 2] as i32) / 3;
+                    let b = (buf[i + 4] as i32 + buf[i + 5] as i32 + buf[i + 6] as i32) / 3;
+                    diff_sum += (a - b).unsigned_abs() as u64;
+                    diff_n += 1;
+                    x += 7;
+                }
+                y += 5;
+                points += 1;
+            }
+            // 纯黑帧（GPU 窗口抓不到内容）也算失败
+            let mut luma = 0u64;
+            let mut luma_n = 0u64;
+            for px in buf.chunks_exact(4) {
+                luma += (px[0] as u64 + px[1] as u64 + px[2] as u64) / 3;
+                luma_n += 1;
+            }
+            let black = luma_n > 0 && (luma / luma_n) < 10;
+            let noisy = diff_n > 0 && (diff_sum / diff_n) > 42;
+            if !noisy && !black {
+                img = Some(egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    &buf,
+                ));
+            }
         }
     }
     let _ = SelectObject(mem, old);
