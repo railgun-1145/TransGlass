@@ -1363,9 +1363,10 @@ impl TransGlassApp {
         let managed = GLOBAL_REGISTRY
             .get(&hwnd)
             .map(|s| (s.current_alpha, s.user_pref_topmost, s.mouse_passthrough, s.pen_passthrough));
+        let (alpha, top, _mouse, _pen) = managed.unwrap_or((255, false, false, false));
         let card_w = if self.mini_mode { 172.0 } else { 232.0 };
         ui.allocate_ui_with_layout(
-            egui::vec2(card_w, 208.0),
+            egui::vec2(card_w, if self.mini_mode { 190.0 } else { 224.0 }),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 egui::Frame::none()
@@ -1431,14 +1432,31 @@ impl TransGlassApp {
                             None => badges.push_str("未管理"),
                         }
                         ui.label(egui::RichText::new(format!("{badges} ｜ {desktop}")).small().weak());
-                        ui.add_space(2.0);
-                        let label = if managed.is_some() { "复原" } else { "控制" };
-                        if ui
-                            .add(egui::Button::new(egui::RichText::new(label).small()))
-                            .clicked()
-                        {
-                            *toggle = Some(hwnd);
-                        }
+                        ui.add_space(4.0);
+                        let mut a = alpha as f32;
+                        ui.horizontal(|ui| {
+                            let slider_w = if self.mini_mode { 84.0 } else { 128.0 };
+                            ui.label(egui::RichText::new("透明").small().weak());
+                            ui.spacing_mut().slider_width = slider_w;
+                            // 滑轨在白色卡片上默认几乎看不见，给个浅灰底
+                            ui.visuals_mut().widgets.inactive.bg_fill =
+                                egui::Color32::from_rgb(0xE1, 0xE4, 0xE9);
+                            ui.visuals_mut().widgets.hovered.bg_fill =
+                                egui::Color32::from_rgb(0xCF, 0xD4, 0xDB);
+                            let resp = ui.add(egui::Slider::new(&mut a, 30.0..=255.0).show_value(false));
+                            if resp.changed() {
+                                unsafe {
+                                    ensure_managed(HWND(hwnd as *mut _));
+                                    set_window_alpha(HWND(hwnd as *mut _), a as u8);
+                                }
+                            }
+                            if ui
+                                .selectable_label(top, egui::RichText::new("置顶").small())
+                                .clicked()
+                            {
+                                unsafe { toggle_topmost(HWND(hwnd as *mut _)) };
+                            }
+                        });
                     });
             },
         );
@@ -3230,36 +3248,34 @@ unsafe fn control_window(hwnd: HWND) {
 fn window_menu(ui: &mut egui::Ui, hwnd: isize, title: &str) {
     ui.label(egui::RichText::new(title).strong().small());
     ui.separator();
-    match GLOBAL_REGISTRY.get(&hwnd) {
-        Some(st) => {
+    let st = GLOBAL_REGISTRY
+        .get(&hwnd)
+        .map(|s| (s.current_alpha, s.user_pref_topmost, s.mouse_passthrough, s.pen_passthrough));
+    match st {
+        Some((alpha, top, mouse, pen)) => {
             ui.label(
                 egui::RichText::new(format!(
                     "透明度 {}%",
-                    (st.current_alpha as f32 / 255.0 * 100.0).round() as i32
+                    (alpha as f32 / 255.0 * 100.0).round() as i32
                 ))
-                .small(),
+                .small()
+                .weak(),
             );
-            ui.label(
-                egui::RichText::new(format!(
-                    "置顶：{}",
-                    if st.user_pref_topmost { "是" } else { "否" }
-                ))
-                .small(),
-            );
-            ui.label(
-                egui::RichText::new(format!(
-                    "鼠标点透：{}",
-                    if st.mouse_passthrough { "开" } else { "关" }
-                ))
-                .small(),
-            );
-            ui.label(
-                egui::RichText::new(format!(
-                    "笔点透：{}",
-                    if st.pen_passthrough { "开" } else { "关" }
-                ))
-                .small(),
-            );
+            if ui.button(if top { "取消置顶" } else { "置顶" }).clicked() {
+                unsafe { toggle_topmost(HWND(hwnd as *mut _)) };
+            }
+            if ui
+                .button(if mouse { "关闭鼠标点透" } else { "鼠标点透" })
+                .clicked()
+            {
+                unsafe { toggle_mouse_passthrough(HWND(hwnd as *mut _)) };
+            }
+            if ui
+                .button(if pen { "关闭笔点透" } else { "笔点透" })
+                .clicked()
+            {
+                unsafe { toggle_pen_passthrough(HWND(hwnd as *mut _)) };
+            }
             ui.separator();
             if ui.button("复原这个窗口").clicked() {
                 unsafe { restore_window(HWND(hwnd as *mut _)) };
@@ -3267,6 +3283,10 @@ fn window_menu(ui: &mut egui::Ui, hwnd: isize, title: &str) {
         }
         None => {
             ui.label(egui::RichText::new("未管理").small().weak());
+            ui.separator();
+            if ui.button("控制（90% 透明）").clicked() {
+                unsafe { control_window(HWND(hwnd as *mut _)) };
+            }
         }
     }
 }
