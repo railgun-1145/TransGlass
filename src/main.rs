@@ -1381,10 +1381,21 @@ impl TransGlassApp {
     fn detail_pane(&mut self, ui: &mut egui::Ui) {
         self.refresh_window_list(false);
         // 顶部桌面选择：控制当前显示的桌面
+        let (ids, current_id) = virtual_desktops();
         let mut desks: Vec<String> = Vec::new();
-        for w in &self.wins {
-            if !desks.contains(&w.desktop) {
-                desks.push(w.desktop.clone());
+        for (i, id) in ids.iter().enumerate() {
+            let mark = if Some(id) == current_id.as_ref() {
+                "（当前）"
+            } else {
+                ""
+            };
+            desks.push(format!("桌面 {}{mark}", i + 1));
+        }
+        if desks.is_empty() {
+            for w in &self.wins {
+                if !desks.contains(&w.desktop) {
+                    desks.push(w.desktop.clone());
+                }
             }
         }
         ui.horizontal_wrapped(|ui| {
@@ -3233,28 +3244,80 @@ fn virtual_desktop_manager() -> Option<&'static windows::Win32::UI::Shell::IVirt
     .as_ref()
 }
 
+/// 从注册表读取全部虚拟桌面 GUID（顺序即桌面顺序），解决"没有窗口的桌面看不到"的问题。
+fn virtual_desktops() -> (Vec<String>, Option<String>) {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+    };
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let mut out = Vec::new();
+    let mut current: Option<String> = None;
+    unsafe {
+        let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops");
+        let mut hkey = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, windows::core::PCWSTR(sub.as_ptr()), 0, KEY_READ, &mut hkey).is_err() {
+            return (out, current);
+        }
+        for name in ["VirtualDesktopIDs", "CurrentVirtualDesktop"] {
+            let name_w = wide(name);
+            let mut ty = windows::Win32::System::Registry::REG_VALUE_TYPE::default();
+            let mut size: u32 = 0;
+            if RegQueryValueExW(
+                hkey,
+                windows::core::PCWSTR(name_w.as_ptr()),
+                None,
+                Some(&mut ty),
+                None,
+                Some(&mut size),
+            )
+            .is_ok()
+                && size >= 16
+            {
+                let mut buf = vec![0u8; size as usize];
+                if RegQueryValueExW(
+                    hkey,
+                    windows::core::PCWSTR(name_w.as_ptr()),
+                    None,
+                    Some(&mut ty),
+                    Some(buf.as_mut_ptr()),
+                    Some(&mut size),
+                )
+                .is_ok()
+                {
+                    for chunk in buf.chunks_exact(16) {
+                        let d1 = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                        let id = format!("{d1:08x}");
+                        if name == "CurrentVirtualDesktop" {
+                            current = Some(id);
+                        } else {
+                            out.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        let _ = RegCloseKey(hkey);
+    }
+    (out, current)
+}
 fn window_desktop(hwnd: HWND) -> String {
     let Some(manager) = virtual_desktop_manager() else {
         return "未分组".to_string();
     };
     unsafe {
         if let Ok(guid) = manager.GetWindowDesktopId(hwnd) {
-            // 全零 GUID 表示查询失败（不是真实桌面），归到「未分组」
             let empty = guid.data1 == 0
                 && guid.data2 == 0
                 && guid.data3 == 0
                 && guid.data4.iter().all(|b| *b == 0);
             if !empty {
-                let on_current = manager
-                    .IsWindowOnCurrentVirtualDesktop(hwnd)
-                    .map(|b| b.as_bool())
-                    .unwrap_or(false);
-                let short = format!("{:08x}", guid.data1);
-                return if on_current {
-                    format!("桌面 {short}（当前）")
-                } else {
-                    format!("桌面 {short}")
-                };
+                let id = format!("{:08x}", guid.data1);
+                if let Some(idx) = virtual_desktops().0.iter().position(|x| *x == id) {
+                    return format!("桌面 {}", idx + 1);
+                }
+                return format!("桌面 {id}");
             }
         }
     }
