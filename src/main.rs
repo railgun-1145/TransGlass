@@ -1063,7 +1063,19 @@ unsafe fn is_shell_hwnd(hwnd: HWND) -> bool {
     let name = String::from_utf16_lossy(&class_buf[..len as usize]);
     matches!(
         name.as_str(),
-        "Progman" | "WorkerW" | "Shell_TrayWnd" | "NotifyIconOverflowWindow"
+        "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "NotifyIconOverflowWindow"
+            | "XamlExplorerHostIslandWindow"
+            | "TopLevelWindowForOverflowXamlIsland"
+            | "Windows.UI.Composition.DesktopWindowContentBridge"
+            | "Windows.Internal.Shell.TabProxyWindow"
+            | "DV2ControlHost"
+            | "Xaml_WindowedPopupClass"
+            | "Shell_Flyout"
+            | "Windows.UI.Core.CoreWindow"
     )
 }
 
@@ -2788,6 +2800,13 @@ fn main() -> Result<(), eframe::Error> {
     let _single_instance = unsafe { acquire_single_instance() };
     PERF_ON.store(std::env::var_os("TRANSGLASS_DEBUG_PERF").is_some(), Ordering::Relaxed);
     spawn_quit_listener();
+    if std::env::var_os("TRANSGLASS_BALLTEST").is_some() {
+        unsafe {
+            let _ = balltest_create();
+            balltest_draw();
+        }
+    }
+    unsafe { purge_shell_managed() };
     spawn_device_tracking_ticker();
 
     thread::spawn(|| {
@@ -4060,5 +4079,162 @@ unsafe fn toggle_main_window() {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         WINDOW_VISIBLE.store(true, Ordering::Relaxed);
+    }
+}
+
+// ---- 悬浮球试验窗口：Win32 分层窗口 + UpdateLayeredWindow（逐像素透明） ----
+static BALLTEST: AtomicIsize = AtomicIsize::new(0);
+
+unsafe extern "system" fn balltest_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    DefWindowProcW(hwnd, msg, w, l)
+}
+
+unsafe fn balltest_create() -> HWND {
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    let hinst = match GetModuleHandleW(None) {
+        Ok(h) => h,
+        Err(_) => {
+            log_hilite("GetModuleHandle failed");
+            return HWND::default();
+        }
+    };
+    let class_w: Vec<u16> = "TransGlassBall"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let name_w: Vec<u16> = "TransGlass Ball".encode_utf16().chain(std::iter::once(0)).collect();
+    let wc = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(balltest_proc),
+        hInstance: windows::Win32::Foundation::HINSTANCE(hinst.0),
+        lpszClassName: windows::core::PCWSTR(class_w.as_ptr()),
+        ..Default::default()
+    };
+    let atom = RegisterClassW(&wc);
+    if atom == 0 {
+        log_hilite(&format!(
+            "RegisterClass failed err={}",
+            windows::Win32::Foundation::GetLastError().0
+        ));
+    }
+    let hwnd = match CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        windows::core::PCWSTR(class_w.as_ptr()),
+        windows::core::PCWSTR(name_w.as_ptr()),
+        WS_POPUP,
+        1500,
+        380,
+        240,
+        160,
+        None,
+        None,
+        windows::Win32::Foundation::HINSTANCE(hinst.0),
+        None,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            log_hilite(&format!(
+                "CreateWindowEx failed {e} err={}",
+                windows::Win32::Foundation::GetLastError().0
+            ));
+            return HWND::default();
+        }
+    };
+    BALLTEST.store(hwnd.0 as isize, Ordering::Relaxed);
+    hwnd
+}
+
+unsafe fn balltest_draw() {
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC, DeleteObject, Ellipse,
+        GetDC, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
+        BLENDFUNCTION, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+    };
+    let hwnd = BALLTEST.load(Ordering::Relaxed);
+    if hwnd == 0 {
+        return;
+    }
+    let w = 240i32;
+    let h = 160i32;
+    let screen = GetDC(HWND::default());
+    let mem = CreateCompatibleDC(screen);
+    let mut bi: BITMAPINFO = std::mem::zeroed();
+    bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB.0;
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let dib = match CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+        Ok(d) => d,
+        Err(_) => {
+            let _ = DeleteDC(mem);
+            ReleaseDC(HWND::default(), screen);
+            return;
+        }
+    };
+    let old = SelectObject(mem, HGDIOBJ(dib.0));
+    let brush = CreateSolidBrush(COLORREF(0x00E6_7641));
+    let ball = CreateSolidBrush(COLORREF(0x00E6_7641));
+    let circles: [(i32, i32, i32); 4] = [
+        (206, 80, 27),
+        (143, 113, 17),
+        (134, 80, 17),
+        (143, 47, 17),
+    ];
+    for (cx, cy, r) in circles {
+        let b = if r > 20 { ball } else { brush };
+        let _ = SelectObject(mem, HGDIOBJ(b.0));
+        let _ = Ellipse(mem, cx - r, cy - r, cx + r, cy + r);
+    }
+    let pos = POINT { x: 1500, y: 380 };
+    let size = SIZE { cx: w, cy: h };
+    let src = POINT { x: 0, y: 0 };
+    let blend = BLENDFUNCTION {
+        BlendOp: 0,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: 1,
+    };
+    let ok = windows::Win32::UI::WindowsAndMessaging::UpdateLayeredWindow(
+        HWND(hwnd as *mut _),
+        screen,
+        Some(&pos),
+        Some(&size),
+        mem,
+        Some(&src),
+        COLORREF(0),
+        Some(&blend),
+        windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
+    );
+    if ok.is_err() {
+        log_hilite(&format!(
+            "UpdateLayeredWindow failed err={}",
+            windows::Win32::Foundation::GetLastError().0
+        ));
+    } else {
+        log_hilite("balltest drawn ok");
+    }
+    SelectObject(mem, old);
+    let _ = DeleteObject(HGDIOBJ(dib.0));
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+    let _ = DeleteObject(HGDIOBJ(ball.0));
+    let _ = DeleteDC(mem);
+    ReleaseDC(HWND::default(), screen);
+}
+
+/// 把误纳入管理的系统/托盘浮层窗口还原（例如任务栏图标溢出面板被加了图层导致重影）
+unsafe fn purge_shell_managed() {
+    let keys: Vec<isize> = GLOBAL_REGISTRY.iter().map(|kv| *kv.key()).collect();
+    let mut fixed = 0;
+    for k in keys {
+        if is_shell_hwnd(HWND(k as *mut _)) {
+            restore_window(HWND(k as *mut _));
+            fixed += 1;
+        }
+    }
+    if fixed > 0 {
+        push_issue(format!("已自动还原 {fixed} 个被误管理的系统窗口"));
     }
 }

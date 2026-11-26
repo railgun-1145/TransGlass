@@ -1,6 +1,6 @@
 ﻿[package]
 name = "transglass"
-version = "0.8.2"
+version = "0.8.3"
 edition = "2021"
 
 [dependencies]
@@ -19,6 +19,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Console",
     "Win32_System_Com",
     "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
     "Win32_Storage_Xps"
 ] }
 lazy_static = "1.4"
