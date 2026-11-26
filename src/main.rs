@@ -1147,6 +1147,8 @@ struct TransGlassApp {
     wins_at: Option<std::time::Instant>,
     selected: Option<isize>,
     settings_open: bool,
+    /// 设置页当前分类
+    settings_tab: usize,
     mini_mode: bool,
     desk_filter: Option<String>,
     preview_fps: u32,
@@ -1233,6 +1235,7 @@ impl TransGlassApp {
             wins_at: None,
             selected: None,
             settings_open: std::env::var_os("TRANSGLASS_OPEN_SETTINGS").is_some(),
+            settings_tab: 0,
             mini_mode: false,
             desk_filter: None,
             view_mode: load_ui_state().view_mode.unwrap_or(0),
@@ -2276,181 +2279,58 @@ impl eframe::App for TransGlassApp {
         }
 
         if self.settings_open {
-            let mut open = self.settings_open;
+            let mut open = true;
+            let screen = ctx.screen_rect();
+            let size = egui::vec2(screen.width() * 0.92, screen.height() * 0.9);
             egui::Window::new("设置")
                 .open(&mut open)
                 .collapsible(false)
-                .resizable(true)
-                .default_width(440.0)
+                .resizable(false)
+                .movable(false)
+                .fixed_size(size)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.label(egui::RichText::new("快捷键").strong().color(TEXT_SECONDARY));
-                        let mut priority = self.hotkey_priority_ui;
-                        if ui
-                            .checkbox(&mut priority, "快捷键优先（被占用时强制生效）")
-                            .changed()
-                        {
-                            self.hotkey_priority_ui = priority;
-                            if let Err(e) = save_priority_flag(priority) {
-                                push_issue(format!("保存快捷键优先设置失败: {e}"));
-                            }
-                        }
-                        if ui.button("打开快捷键编辑器…").clicked() {
-                            self.open_hotkey_editor();
-                        }
-                        ui.add_space(12.0);
-                        ui.label(egui::RichText::new("输入").strong().color(TEXT_SECONDARY));
-                        if ui
-                            .button(format!("输入模式：{}（点击切换）", input_mode_label()))
-                            .clicked()
-                        {
-                            cycle_input_mode();
-                        }
-                        ui.label(
-                            egui::RichText::new("WinTab 驱动（Wacom/Huion 默认模式）的笔建议用「强制笔」。")
-                                .small()
-                                .weak(),
-                        );
-                        ui.add_space(12.0);
-                        ui.label(egui::RichText::new("窗口").strong().color(TEXT_SECONDARY));
-                        let mut choose_skin = self.ui_state.skin.clone();
-                        let skins = list_skins();
-                        egui::ComboBox::from_label("皮肤")
-                            .selected_text(choose_skin.clone().unwrap_or_else(|| "skin.png".into()))
-                            .show_ui(ui, |ui| {
-                                for name in &skins {
-                                    let selected = choose_skin.as_deref() == Some(name.as_str());
-                                    if ui.selectable_label(selected, name).clicked() {
-                                        choose_skin = Some(name.clone());
-                                    }
-                                }
-                            });
-                        // 纸娃娃模型：宽 Steve / 细 Alex / 自动按皮肤判定
-                        let forced = ui_doll_model(&self.ui_state);
-                        let mut pick: Option<doll::ModelKind> = forced;
-                        let auto_label = match BALL_SKIN
-                            .read()
-                            .ok()
-                            .and_then(|g| g.as_ref().map(|s| s.model))
-                        {
-                            Some(m) => format!("自动（{}）", m.label()),
-                            None => "自动（按皮肤）".to_string(),
-                        };
-                        egui::ComboBox::from_label("纸娃娃模型")
-                            .selected_text(match pick {
-                                Some(m) => m.label(),
-                                None => auto_label.as_str(),
-                            })
-                            .show_ui(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(150.0);
+                            ui.add_space(2.0);
+                            for (i, name) in SETTINGS_TABS.iter().enumerate() {
+                                let sel = self.settings_tab == i;
                                 if ui
-                                    .selectable_label(pick.is_none(), "自动（按皮肤判定）")
+                                    .selectable_label(sel, egui::RichText::new(*name).size(15.0))
                                     .clicked()
                                 {
-                                    pick = None;
+                                    self.settings_tab = i;
                                 }
-                                for m in [doll::ModelKind::Classic, doll::ModelKind::Slim] {
-                                    if ui.selectable_label(pick == Some(m), m.label()).clicked() {
-                                        pick = Some(m);
-                                    }
-                                }
-                            });
-                        let model_changed = pick != forced;
-                        if model_changed {
-                            self.ui_state.doll_model = pick.map(|m| m.as_str().to_string());
-                        }
-                        if choose_skin != self.ui_state.skin || model_changed {
-                            self.ui_state.skin = choose_skin.clone();
-                            save_ui_state(&self.ui_state);
-                            load_ball_skin(
-                                choose_skin.as_deref(),
-                                ui_doll_model(&self.ui_state),
+                            }
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                    .small()
+                                    .weak(),
                             );
-                            unsafe { ball_render() };
-                        }
-                        ui.add_space(6.0);
-                        let mut bsc = f32::from_bits(BALL_SCALE.load(Ordering::Relaxed));
-                        if bsc <= 0.1 {
-                            bsc = 2.1;
-                        }
-                        if ui
-                            .add(egui::Slider::new(&mut bsc, 1.0..=4.0).text("悬浮球大小"))
-                            .changed()
-                        {
-                            BALL_SCALE.store(bsc.to_bits(), Ordering::Relaxed);
-                            self.ui_state.ball_scale = Some(bsc);
-                            save_ui_state(&self.ui_state);
-                            unsafe { ball_render() };
-                        }
-                        ui.label(egui::RichText::new("预览帧率").small().color(TEXT_SECONDARY));
-                        let mut fps = self.preview_fps as f32;
-                        let resp = ui.add(
-                            egui::Slider::new(&mut fps, 0.0..=60.0)
-                                .step_by(1.0)
-                                .suffix(" fps")
-                                .show_value(true),
-                        );
-                        if resp.changed() {
-                            self.preview_fps = fps as u32;
-                            self.ui_state.preview_fps = Some(self.preview_fps);
-                            save_ui_state(&self.ui_state);
-                        }
-                        ui.label(
-                            egui::RichText::new("0 = 关闭预览（只显示占位）；前台窗口按此帧率，其它窗口为 1/4")
-                                .small()
-                                .weak(),
-                        );
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("小窗视图").small().color(TEXT_SECONDARY));
-                        let mut view = self.view_mode;
-                        ui.horizontal(|ui| {
-                            if ui.radio_value(&mut view, 0u8, "紧凑列表").changed() {
-                                self.view_mode = view;
-                                self.ui_state.view_mode = Some(view);
-                                save_ui_state(&self.ui_state);
-                            }
-                            if ui.radio_value(&mut view, 1u8, "缩略图网格").changed() {
-                                self.view_mode = view;
-                                self.ui_state.view_mode = Some(view);
-                                save_ui_state(&self.ui_state);
-                            }
                         });
-                        ui.add_space(8.0);
-                        let mut mini = self.mini_mode;
-                        if ui
-                            .checkbox(&mut mini, "实时小窗（只显示缩略图网格，可随时切回大界面）")
-                            .changed()
-                        {
-                            self.mini_mode = mini;
-                        }
-                        ui.add_space(12.0);
-                        ui.label(egui::RichText::new("维护").strong().color(TEXT_SECONDARY));
-                        if ui.button("运行自检").clicked() {
-                            let _ = selftest::run_hosted();
-                            self.selftest_text = selftest::last_report();
-                            self.selftest_open = true;
-                        }
-                        let busy = UPDATE_RUNNING.load(Ordering::Relaxed);
-                        if ui
-                            .add_enabled(
-                                !busy,
-                                egui::Button::new(if busy { "检查中…" } else { "检查更新" }),
-                            )
-                            .clicked()
-                        {
-                            thread::spawn(|| {
-                                let _ = run_self_update();
-                            });
-                        }
-                        if ui.button("打开配置目录").clicked() {
-                            if let Some(dir) = get_config_path().parent() {
-                                let _ = std::process::Command::new("explorer")
-                                    .arg(dir.as_os_str())
-                                    .spawn();
-                            }
-                        }
+                        ui.separator();
+                        ui.vertical(|ui| {
+                            ui.set_width(ui.available_width());
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    match self.settings_tab {
+                                        0 => self.settings_page_hotkeys(ui),
+                                        1 => self.settings_page_input(ui),
+                                        2 => self.settings_page_window(ui),
+                                        3 => self.settings_page_ball(ui),
+                                        _ => self.settings_page_maint(ui),
+                                    }
+                                });
+                        });
                     });
                 });
-            self.settings_open = open;
+            if !open {
+                self.settings_open = false;
+            }
         }
         if self.selftest_open {
             let mut open = self.selftest_open;
@@ -2758,7 +2638,9 @@ fn main() -> Result<(), eframe::Error> {
     load_ball_tex();
     let boot_state = load_ui_state();
     load_ball_skin(boot_state.skin.as_deref(), ui_doll_model(&boot_state));
-    if let Some(sc) = load_ui_state().ball_scale {
+    BALL_FLOAT.store(boot_state.idle_float.unwrap_or(true), Ordering::Relaxed);
+    BALL_SWAY.store(boot_state.idle_sway.unwrap_or(true), Ordering::Relaxed);
+    if let Some(sc) = boot_state.ball_scale {
         BALL_SCALE.store(sc.to_bits(), Ordering::Relaxed);
     }
     unsafe { ball_spawn() };
@@ -3122,6 +3004,10 @@ struct UiState {
     skin: Option<String>,
     /// 纸娃娃模型：None = 按皮肤自动判定，Some("classic"/"slim") = 强制
     doll_model: Option<String>,
+    /// 待机上下浮动（默认开）
+    idle_float: Option<bool>,
+    /// 待机手臂轻摆（默认开）
+    idle_sway: Option<bool>,
     view_mode: Option<u8>,
     /// 兼容旧配置
     preview_rate: Option<u8>,
@@ -4056,6 +3942,9 @@ static BALL_EXPANDED: AtomicBool = AtomicBool::new(false);
 static BALL_ANIM: AtomicU32 = AtomicU32::new(0);
 static BALL_CURSOR: AtomicU64 = AtomicU64::new(0);
 static BALL_SCALE: AtomicU32 = AtomicU32::new(0); // f32 bits，0..1 弹出动画
+/// 待机动画开关：关掉后静置完全不重绘（省 CPU）
+static BALL_FLOAT: AtomicBool = AtomicBool::new(true);
+static BALL_SWAY: AtomicBool = AtomicBool::new(true);
 /// 纸娃娃：平滑后的身体朝向 / 头部额外偏转 / 头部俯仰（f32 bits）
 static BALL_YAW: AtomicU32 = AtomicU32::new(0);
 static BALL_HEAD_YAW: AtomicU32 = AtomicU32::new(0);
@@ -4451,7 +4340,10 @@ fn spawn_doll_ticker() {
             if hover_changed {
                 last_hover = hover;
             }
-            if moving || active || hover_changed || (t - last_render) >= 0.18 {
+            // 待机动画关掉后，静置就完全不重绘
+            let idle_anim = BALL_FLOAT.load(Ordering::Relaxed) || BALL_SWAY.load(Ordering::Relaxed);
+            let due = idle_anim && (t - last_render) >= 0.18;
+            if moving || active || hover_changed || due {
                 last_render = t;
                 unsafe { ball_render() };
             }
@@ -4519,15 +4411,23 @@ unsafe fn ball_render() {
         let stored = f32::from_bits(BALL_SCALE.load(Ordering::Relaxed));
         let unit = if stored > 0.1 { stored } else { 2.1 };
         let t = anim_secs();
-        // 待机上下浮动
-        let bob = ((t / 2.6) * std::f32::consts::TAU).sin() * 1.4;
+        // 待机上下浮动（设置里可关）
+        let bob = if BALL_FLOAT.load(Ordering::Relaxed) {
+            ((t / 2.6) * std::f32::consts::TAU).sin() * 1.4
+        } else {
+            0.0
+        };
         let pose = doll::Pose {
             yaw: f32::from_bits(BALL_YAW.load(Ordering::Relaxed)),
             cam_pitch: 18.0f32.to_radians(),
             head_yaw: f32::from_bits(BALL_HEAD_YAW.load(Ordering::Relaxed)),
             head_pitch: f32::from_bits(BALL_HEAD_PITCH.load(Ordering::Relaxed)),
-            // 待机手臂轻摆（左右反向）
-            arm_swing: ((t / 5.0) * std::f32::consts::TAU).sin() * 2.2f32.to_radians(),
+            // 待机手臂轻摆（左右反向，设置里可关）
+            arm_swing: if BALL_SWAY.load(Ordering::Relaxed) {
+                ((t / 5.0) * std::f32::consts::TAU).sin() * 2.2f32.to_radians()
+            } else {
+                0.0
+            },
             leg_swing: 0.0,
             scale: unit,
             dist: 95.0,
@@ -4711,7 +4611,7 @@ unsafe fn ball_hit(x: i32, y: i32) -> u8 {
 unsafe fn slider_apply(x: i32) {
     let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
     let p = ball_panel(t);
-    let (x0, _, x1, _) = p.slider;
+    let (x0, _, _, _) = p.slider;
     let travel = slider_travel(p.slider);
     let v = ((x - x0 - 16) as f32 / travel).clamp(0.0, 1.0);
     let alpha = (255.0 - v * 215.0).round().clamp(40.0, 255.0) as u8;
@@ -5074,5 +4974,236 @@ fn load_ball_skin(name: Option<&str>, model: Option<doll::ModelKind>) {
         if let Ok(mut g) = BALL_SKIN.write() {
             *g = Some(skin);
         }
+    }
+}
+
+/// 设置的分类（左边导航）
+pub(crate) const SETTINGS_TABS: [&str; 5] = [
+    "快捷键",
+    "输入",
+    "窗口与预览",
+    "悬浮球与纸娃娃",
+    "维护",
+];
+
+impl TransGlassApp {
+    fn settings_page_hotkeys(&mut self, ui: &mut egui::Ui) {
+        ui.heading("快捷键");
+        ui.add_space(6.0);
+        let mut priority = self.hotkey_priority_ui;
+        if ui
+            .checkbox(&mut priority, "快捷键优先（被别的程序占用时也强制生效）")
+            .changed()
+        {
+            self.hotkey_priority_ui = priority;
+            if let Err(e) = save_priority_flag(priority) {
+                push_issue(format!("保存快捷键优先设置失败: {e}"));
+            }
+        }
+        ui.label(
+            egui::RichText::new("开启后改用低级键盘钩子强制抢占组合键，可能被反作弊/输入法干扰。")
+                .small()
+                .weak(),
+        );
+        ui.add_space(10.0);
+        if ui.button("打开快捷键编辑器…").clicked() {
+            self.open_hotkey_editor();
+        }
+    }
+
+    fn settings_page_input(&mut self, ui: &mut egui::Ui) {
+        ui.heading("输入");
+        ui.add_space(6.0);
+        if ui
+            .button(format!("输入模式：{}（点击切换）", input_mode_label()))
+            .clicked()
+        {
+            cycle_input_mode();
+        }
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("WinTab 驱动（Wacom/Huion 默认模式）的笔建议用「强制笔」。")
+                .small()
+                .weak(),
+        );
+    }
+
+    fn settings_page_window(&mut self, ui: &mut egui::Ui) {
+        ui.heading("窗口与预览");
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("预览帧率").strong().color(TEXT_SECONDARY));
+        let mut fps = self.preview_fps as f32;
+        let resp = ui.add(
+            egui::Slider::new(&mut fps, 0.0..=60.0)
+                .step_by(1.0)
+                .suffix(" fps")
+                .show_value(true),
+        );
+        if resp.changed() {
+            self.preview_fps = fps as u32;
+            self.ui_state.preview_fps = Some(self.preview_fps);
+            save_ui_state(&self.ui_state);
+        }
+        ui.label(
+            egui::RichText::new(
+                "0 = 关闭预览（只显示占位）；前台窗口按此帧率，其它窗口为 1/4。CPU 占用的大头就是这里。",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("小窗视图").strong().color(TEXT_SECONDARY));
+        let mut view = self.view_mode;
+        ui.horizontal(|ui| {
+            if ui.radio_value(&mut view, 0u8, "紧凑列表").changed() {
+                self.view_mode = view;
+                self.ui_state.view_mode = Some(view);
+                save_ui_state(&self.ui_state);
+            }
+            if ui.radio_value(&mut view, 1u8, "缩略图网格").changed() {
+                self.view_mode = view;
+                self.ui_state.view_mode = Some(view);
+                save_ui_state(&self.ui_state);
+            }
+        });
+        ui.add_space(8.0);
+        let mut mini = self.mini_mode;
+        if ui
+            .checkbox(&mut mini, "实时小窗（只显示缩略图网格，可随时切回大界面）")
+            .changed()
+        {
+            self.mini_mode = mini;
+        }
+    }
+
+    fn settings_page_ball(&mut self, ui: &mut egui::Ui) {
+        ui.heading("悬浮球与纸娃娃");
+        ui.add_space(6.0);
+        let mut choose_skin = self.ui_state.skin.clone();
+        let skins = list_skins();
+        egui::ComboBox::from_label("皮肤")
+            .selected_text(choose_skin.clone().unwrap_or_else(|| "skin.png".into()))
+            .show_ui(ui, |ui| {
+                for name in &skins {
+                    let selected = choose_skin.as_deref() == Some(name.as_str());
+                    if ui.selectable_label(selected, name).clicked() {
+                        choose_skin = Some(name.clone());
+                    }
+                }
+            });
+        let forced = ui_doll_model(&self.ui_state);
+        let mut pick: Option<doll::ModelKind> = forced;
+        let auto_label = match BALL_SKIN
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.model))
+        {
+            Some(m) => format!("自动（{}）", m.label()),
+            None => "自动（按皮肤）".to_string(),
+        };
+        egui::ComboBox::from_label("纸娃娃模型")
+            .selected_text(match pick {
+                Some(m) => m.label(),
+                None => auto_label.as_str(),
+            })
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(pick.is_none(), "自动（按皮肤判定）")
+                    .clicked()
+                {
+                    pick = None;
+                }
+                for m in [doll::ModelKind::Classic, doll::ModelKind::Slim] {
+                    if ui.selectable_label(pick == Some(m), m.label()).clicked() {
+                        pick = Some(m);
+                    }
+                }
+            });
+        let model_changed = pick != forced;
+        if model_changed {
+            self.ui_state.doll_model = pick.map(|m| m.as_str().to_string());
+        }
+        if choose_skin != self.ui_state.skin || model_changed {
+            self.ui_state.skin = choose_skin.clone();
+            save_ui_state(&self.ui_state);
+            load_ball_skin(choose_skin.as_deref(), ui_doll_model(&self.ui_state));
+            unsafe { ball_render() };
+        }
+        ui.add_space(8.0);
+        let mut bsc = f32::from_bits(BALL_SCALE.load(Ordering::Relaxed));
+        if bsc <= 0.1 {
+            bsc = 2.1;
+        }
+        if ui
+            .add(egui::Slider::new(&mut bsc, 1.0..=4.0).text("悬浮球大小"))
+            .changed()
+        {
+            BALL_SCALE.store(bsc.to_bits(), Ordering::Relaxed);
+            self.ui_state.ball_scale = Some(bsc);
+            save_ui_state(&self.ui_state);
+            unsafe { ball_render() };
+        }
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("待机动画").strong().color(TEXT_SECONDARY));
+        let mut fl = BALL_FLOAT.load(Ordering::Relaxed);
+        if ui.checkbox(&mut fl, "上下浮动").changed() {
+            BALL_FLOAT.store(fl, Ordering::Relaxed);
+            self.ui_state.idle_float = Some(fl);
+            save_ui_state(&self.ui_state);
+            unsafe { ball_render() };
+        }
+        let mut sw = BALL_SWAY.load(Ordering::Relaxed);
+        if ui.checkbox(&mut sw, "手臂轻摆").changed() {
+            BALL_SWAY.store(sw, Ordering::Relaxed);
+            self.ui_state.idle_sway = Some(sw);
+            save_ui_state(&self.ui_state);
+            unsafe { ball_render() };
+        }
+        ui.label(
+            egui::RichText::new("两个都关掉后，悬浮球静置时完全不重绘（几乎不占 CPU），只在鼠标动的时候转。")
+                .small()
+                .weak(),
+        );
+    }
+
+    fn settings_page_maint(&mut self, ui: &mut egui::Ui) {
+        ui.heading("维护");
+        ui.add_space(6.0);
+        if ui.button("运行自检").clicked() {
+            let _ = selftest::run_hosted();
+            self.selftest_text = selftest::last_report();
+            self.selftest_open = true;
+        }
+        ui.add_space(8.0);
+        let busy = UPDATE_RUNNING.load(Ordering::Relaxed);
+        if ui
+            .add_enabled(
+                !busy,
+                egui::Button::new(if busy { "检查中…" } else { "检查更新" }),
+            )
+            .clicked()
+        {
+            thread::spawn(|| {
+                let _ = run_self_update();
+            });
+        }
+        ui.add_space(8.0);
+        if ui.button("打开配置目录").clicked() {
+            if let Some(dir) = get_config_path().parent() {
+                let _ = std::process::Command::new("explorer")
+                    .arg(dir.as_os_str())
+                    .spawn();
+            }
+        }
+        ui.add_space(12.0);
+        ui.separator();
+        ui.label(
+            egui::RichText::new(format!(
+                "TransGlass v{}　·　配置文件与皮肤/物品贴图都在程序目录",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .small()
+            .weak(),
+        );
     }
 }

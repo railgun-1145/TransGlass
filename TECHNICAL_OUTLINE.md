@@ -41,6 +41,8 @@
 ### 4.3 GUI 渲染
 `egui` 每 100ms 轮询一次注册表状态，确保界面上的滑动条与热键调节同步。
 
+**设置页**：`settings_open` 时弹一个占屏幕 92%×90% 的居中窗口（`fixed_size` + `anchor(CENTER_CENTER)`），左侧 `SETTINGS_TABS` 五个分类（快捷键 / 输入 / 窗口与预览 / 悬浮球与纸娃娃 / 维护），右侧按 `settings_tab` 调 `settings_page_*`。分类页拆成 `impl TransGlassApp` 的独立方法，别再把所有控件塞进一个 `egui::Window`。
+
 ### 4.4 悬浮球：分层窗口与 3D 纸娃娃
 悬浮球是一个 `WS_EX_LAYERED | WS_EX_NOACTIVATE` 的 Win32 窗口，每帧在内存 DIB 上重画后用 `UpdateLayeredWindow(ULW_ALPHA)` 贴到桌面。要点：
 
