@@ -4135,10 +4135,32 @@ unsafe fn ball_render() {
             }
             let o = ((y * BALL_W + x) * 4) as usize;
             if cnt == 0 {
-                dst[o] = 0;
-                dst[o + 1] = 0;
-                dst[o + 2] = 0;
-                dst[o + 3] = 0;
+                // 方块玻璃区域：原本透明的地方也补成玻璃
+                let cx = BALL_W - 42;
+                let cy = BALL_H / 2;
+                let dx = x as i32 - cx;
+                let dy = y as i32 - cy;
+                let r = 27i32;
+                if dx.abs() <= r && dy.abs() <= r {
+                    let edge = dx.abs() >= r - 3 || dy.abs() >= r - 3;
+                    let diag = (dx - dy).abs() <= 1 || (dx + dy).abs() <= 1;
+                    let (cr, cg, cb, ca) = if edge {
+                        (250u32, 253u32, 255u32, 246u32)
+                    } else if diag {
+                        (240, 248, 252, 236)
+                    } else {
+                        (222, 240, 249, 188)
+                    };
+                    dst[o] = (cb * ca / 255) as u8;
+                    dst[o + 1] = (cg * ca / 255) as u8;
+                    dst[o + 2] = (cr * ca / 255) as u8;
+                    dst[o + 3] = ca as u8;
+                } else {
+                    dst[o] = 0;
+                    dst[o + 1] = 0;
+                    dst[o + 2] = 0;
+                    dst[o + 3] = 0;
+                }
             } else {
                 let mut a = (255 * cnt / (ss * ss) as u32) as u8;
                 let (mut rr, mut gg, mut bb) = (r / cnt, g / cnt, b / cnt);
@@ -4149,26 +4171,30 @@ unsafe fn ball_render() {
                 let sdy = y as i32 - by_s;
                 let sd = ((sdx * sdx + sdy * sdy) as f32).sqrt();
                 let _ = bx_s;
-                if sd <= 29.5 {
-                    // 只替换原本的实心填充色，保留白色文字
-                    let is_fill = (rr as i32 - 168).abs() < 60
-                        && (gg as i32 - 143).abs() < 60
-                        && (bb as i32 - 78).abs() < 60;
-                    if sd >= 25.5 {
-                        if is_fill || (rr > 200 && gg > 200 && bb > 200) {
+                // 主球做成方块玻璃（MC 玻璃块）：白框 + 半透明玻璃体 + 斜向高光
+                let cx = BALL_W - 42;
+                let cy = BALL_H / 2;
+                let dx = x as i32 - cx;
+                let dy = y as i32 - cy;
+                let r = 27i32;
+                if dx.abs() <= r && dy.abs() <= r {
+                    let is_white = rr > 200 && gg > 200 && bb > 200;
+                    if !is_white {
+                        let edge = dx.abs() >= r - 3 || dy.abs() >= r - 3;
+                        let diag = (dx - dy).abs() <= 1 || (dx + dy).abs() <= 1;
+                        if edge {
                             rr = 250;
                             gg = 253;
                             bb = 255;
-                            a = 252;
+                            a = 246;
+                        } else {
+                            rr = 222;
+                            gg = 240;
+                            bb = 249;
+                            a = if diag { 236 } else { 188 };
                         }
-                    } else if is_fill {
-                        rr = 224;
-                        gg = 240;
-                        bb = 248;
-                        a = 196;
                     }
-                }
-                dst[o] = (bb as u32 * a as u32 / 255) as u8;
+                }                dst[o] = (bb as u32 * a as u32 / 255) as u8;
                 dst[o + 1] = (gg as u32 * a as u32 / 255) as u8;
                 dst[o + 2] = (rr as u32 * a as u32 / 255) as u8;
                 dst[o + 3] = a;
