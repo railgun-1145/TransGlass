@@ -3341,17 +3341,9 @@ unsafe extern "system" fn enum_win_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
             {
                 return BOOL(1);
             }
-            // DWM 隐身窗口（UWP 幽灵窗口）不算
-            let mut cloaked: u32 = 0;
-            let cloaked_h = windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
-                hwnd,
-                windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
-                &mut cloaked as *mut _ as *mut core::ffi::c_void,
-                std::mem::size_of::<u32>() as u32,
-            )
-            .is_ok()
-                && cloaked != 0;
-            if !cloaked_h {
+            // 注意：其它虚拟桌面上的窗口会被 DWM 标记为 cloaked，
+            // 以前把它们过滤掉了，导致「全部」只能看到当前桌面。这里不再过滤。
+            {
                 let desktop = window_desktop(hwnd);
                 // 判断不出桌面的窗口直接不显示（否则筛选无效）
                 if desktop != "未分组" {
