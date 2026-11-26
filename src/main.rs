@@ -4038,55 +4038,54 @@ unsafe fn ball_render() {
     let (bx, by) = ball_center();
     let r = 27i32;
 
-    // 主球：方块玻璃（贴图采样 + 白色边框）
-    for yy in (by - r)..=(by + r) {
-        for xx in (bx - r)..=(bx + r) {
-            if xx < 0 || yy < 0 || xx >= w || yy >= h {
-                continue;
+    // 主球 + 卫星：统一的圆角玻璃块（抗锯齿）
+    let mut draw_block = |cx: i32, cy: i32, half: f32, is_main: bool| {
+        let span = (half + 2.0).ceil() as i32;
+        for yy in (cy - span)..=(cy + span) {
+            for xx in (cx - span)..=(cx + span) {
+                if xx < 0 || yy < 0 || xx >= w || yy >= h {
+                    continue;
+                }
+                let dx = xx - cx;
+                let dy = yy - cy;
+                let (cov, d) = sq_coverage(dx, dy, half, if is_main { 3.0 } else { 5.0 });
+                if cov <= 0.01 {
+                    continue;
+                }
+                let frame = d > -2.2;
+                let (cr, cg, cb, base) = if frame {
+                    (238u8, 245u8, 249u8, 240u8)
+                } else if is_main {
+                    let (tr, tg, tb, ta) = ball_tex_sample(dx, dy, half as i32);
+                    (tr, tg, tb, ta.max(196))
+                } else {
+                    let (tr, tg, tb, ta) = ball_tex_sample(dx, dy, half as i32);
+                    (tr, tg, tb, (ta.max(200) as f32 * 0.92) as u8)
+                };
+                let a = (base as f32 * cov) as u8;
+                let o = ((yy * w + xx) * 4) as usize;
+                // 与已有像素做 alpha 合成（文字/球与卫星可能重叠）
+                let sa = a as f32 / 255.0;
+                let da = buf[o + 3] as f32 / 255.0;
+                let out_a = sa + da * (1.0 - sa);
+                if out_a <= 0.002 {
+                    continue;
+                }
+                buf[o] = ((cb as f32 * sa + buf[o] as f32 * da * (1.0 - sa)) / out_a) as u8;
+                buf[o + 1] = ((cg as f32 * sa + buf[o + 1] as f32 * da * (1.0 - sa)) / out_a) as u8;
+                buf[o + 2] = ((cr as f32 * sa + buf[o + 2] as f32 * da * (1.0 - sa)) / out_a) as u8;
+                buf[o + 3] = (out_a * 255.0) as u8;
             }
-            let dx = xx - bx;
-            let dy = yy - by;
-            let edge = dx.abs() >= r - 2 || dy.abs() >= r - 2;
-            let (cr, cg, cb, ca) = if edge {
-                (238u8, 245u8, 249u8, 245u8)
-            } else {
-                let (tr, tg, tb, ta) = ball_tex_sample(dx, dy, r);
-                (tr, tg, tb, ta.max(190))
-            };
-            let o = ((yy * w + xx) * 4) as usize;
-            buf[o] = (cb as u32 * ca as u32 / 255) as u8;
-            buf[o + 1] = (cg as u32 * ca as u32 / 255) as u8;
-            buf[o + 2] = (cr as u32 * ca as u32 / 255) as u8;
-            buf[o + 3] = ca;
         }
-    }
+    };
 
-    // 卫星：白色圆 + 强调色文字（先铺白色圆）
+    draw_block(bx, by, 27.0, true);
     if t > 0.02 {
         for (sx, sy) in ball_satellites(t) {
-            let sr = (17.0 * (0.6 + 0.4 * t)) as i32;
-            for yy in (sy - sr)..=(sy + sr) {
-                for xx in (sx - sr)..=(sx + sr) {
-                    if xx < 0 || yy < 0 || xx >= w || yy >= h {
-                        continue;
-                    }
-                    let dx = xx - sx;
-                    let dy = yy - sy;
-                    if dx * dx + dy * dy > sr * sr {
-                        continue;
-                    }
-                    let o = ((yy * w + xx) * 4) as usize;
-                    let edge = dx * dx + dy * dy >= (sr - 2) * (sr - 2);
-                    let v = if edge { 214u8 } else { 255u8 };
-                    buf[o] = v;
-                    buf[o + 1] = v;
-                    buf[o + 2] = v;
-                    buf[o + 3] = 255;
-                }
-            }
+            let sr = 17.0 * (0.6 + 0.4 * t);
+            draw_block(sx, sy, sr, false);
         }
     }
-
     // 文字（GDI 只写 RGB，最后统一补 alpha）
     let _ = SetBkMode(mem, TRANSPARENT);
     let _ = SetTextColor(mem, COLORREF(0x00FF_FFFF));
@@ -4100,7 +4099,7 @@ unsafe fn ball_render() {
     let _ = DrawTextW(mem, &mut label, &mut lr, windows::Win32::Graphics::Gdi::DT_LEFT);
 
     if t > 0.02 {
-        let _ = SetTextColor(mem, COLORREF(0x00A8_8F4E));
+        let _ = SetTextColor(mem, COLORREF(0x00F0_F6FA));
         let font_sat = CreateFontW(
             12, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 0, 0,
             windows::core::w!("Microsoft YaHei"),
@@ -4456,4 +4455,15 @@ fn ball_tex_sample(dx: i32, dy: i32, r: i32) -> (u8, u8, u8, u8) {
     // 贴图 alpha 往往偏低，提一点让方块可见
     let a = (p[3] as u32 * 5 / 4).min(255) as u8;
     (p[0], p[1], p[2], a)
+}
+
+/// 圆角矩形覆盖率（0..1），用于抗锯齿
+fn sq_coverage(dx: i32, dy: i32, half: f32, rad: f32) -> (f32, f32) {
+    let qx = (dx.abs() as f32) - (half - rad);
+    let qy = (dy.abs() as f32) - (half - rad);
+    let ox = qx.max(0.0);
+    let oy = qy.max(0.0);
+    let d = (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0) - rad;
+    let cov = (0.5 - d).clamp(0.0, 1.0);
+    (cov, d)
 }
