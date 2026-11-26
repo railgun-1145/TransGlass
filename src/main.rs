@@ -1104,6 +1104,8 @@ struct TransGlassApp {
     desk_filter: Option<String>,
     preview_fps: u32,
     view_mode: u8,
+    hover: Option<(isize, std::time::Instant)>,
+    hover_seen: bool,
     last_mini: bool,
     issues_ver: u32,
     issues_cache: Vec<String>,
@@ -1182,6 +1184,8 @@ impl TransGlassApp {
             mini_mode: false,
             desk_filter: None,
             view_mode: load_ui_state().view_mode.unwrap_or(0),
+            hover: None,
+            hover_seen: false,
             preview_fps: { let s = load_ui_state(); s.preview_fps.unwrap_or(match s.preview_rate { Some(3) => 0, Some(2) => 2, Some(1) => 8, _ => 15 }) },
             last_mini: false,
             issues_ver: u32::MAX,
@@ -1191,6 +1195,17 @@ impl TransGlassApp {
         }
     }
 
+    fn note_hover(&mut self, hwnd: isize) {
+        self.hover_seen = true;
+        let fresh = match self.hover {
+            Some((h, _)) if h == hwnd => false,
+            _ => true,
+        };
+        if fresh {
+            self.hover = Some((hwnd, std::time::Instant::now()));
+            unsafe { hide_hilite() };
+        }
+    }
     fn refresh_window_list(&mut self, force: bool) {
         let due = self
             .wins_at
@@ -1384,6 +1399,7 @@ impl TransGlassApp {
 
     fn detail_pane(&mut self, ui: &mut egui::Ui) {
         self.refresh_window_list(false);
+        self.hover_seen = false;
         // 顶部桌面选择：控制当前显示的桌面
         let (ids, current_id) = virtual_desktops();
         let mut desks: Vec<String> = Vec::new();
@@ -1488,6 +1504,20 @@ impl TransGlassApp {
             }
             self.refresh_window_list(true);
         }
+        // 悬停 1.5 秒后在桌面上高亮该窗口
+        match self.hover {
+            Some((h, t0)) if self.hover_seen => {
+                if t0.elapsed().as_millis() >= 1500 {
+                    unsafe { show_hilite(HWND(h as *mut _)) };
+                } else {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+                }
+            }
+            _ => {
+                self.hover = None;
+                unsafe { hide_hilite() };
+            }
+        }
     }
 
     /// 紧凑列表视图：一行一个窗口，空间利用率高
@@ -1591,6 +1621,20 @@ impl TransGlassApp {
                 }
             }
             self.refresh_window_list(true);
+        }
+        // 悬停 1.5 秒后在桌面上高亮该窗口
+        match self.hover {
+            Some((h, t0)) if self.hover_seen => {
+                if t0.elapsed().as_millis() >= 1500 {
+                    unsafe { show_hilite(HWND(h as *mut _)) };
+                } else {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+                }
+            }
+            _ => {
+                self.hover = None;
+                unsafe { hide_hilite() };
+            }
         }
     }
     fn window_card(
@@ -2147,6 +2191,21 @@ impl eframe::App for TransGlassApp {
             }
             self.detail_pane(ui);
         });
+
+        // 悬停 1.5 秒 → 在桌面上高亮目标窗口（网格/列表两种视图都走这里）
+        match self.hover {
+            Some((h, t0)) if self.hover_seen => {
+                if t0.elapsed().as_millis() >= 1500 {
+                    unsafe { show_hilite(HWND(h as *mut _)) };
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(150));
+                }
+            }
+            _ => {
+                self.hover = None;
+                unsafe { hide_hilite() };
+            }
+        }
 
         if self.settings_open {
             let mut open = self.settings_open;
@@ -3744,4 +3803,112 @@ unsafe fn capture_window(hwnd: HWND) -> Option<egui::ColorImage> {
     let _ = DeleteDC(mem);
     ReleaseDC(None, screen);
     img
+}
+
+// ---------------------------------------------------------------------------
+// 桌面高亮预览：悬停 1.5 秒后在目标窗口四周画一圈强调色边框
+// ---------------------------------------------------------------------------
+
+static HILITE_HWND: AtomicIsize = AtomicIsize::new(0);
+
+unsafe extern "system" fn hilite_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    DefWindowProcW(hwnd, msg, w, l)
+}
+
+unsafe fn ensure_hilite() -> HWND {
+    let existing = HILITE_HWND.load(Ordering::Relaxed);
+    if existing != 0 {
+        return HWND(existing as *mut _);
+    }
+
+    let class_w: Vec<u16> = "TransGlassHilite"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let wc = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(hilite_proc),
+        hInstance: Default::default(),
+        ..Default::default()
+    };
+    let _ = RegisterClassW(&wc);
+    let hwnd = match CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        windows::core::PCWSTR(class_w.as_ptr()),
+        windows::core::PCWSTR(class_w.as_ptr()),
+        WS_POPUP,
+        0,
+        0,
+        10,
+        10,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        Ok(h) => h,
+        Err(_) => return HWND::default(),
+    };
+    let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_COLORKEY);
+    HILITE_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+    hwnd
+}
+
+unsafe fn show_hilite(target: HWND) {
+    use windows::Win32::Graphics::Gdi::{
+        CreateSolidBrush, DeleteObject, FillRect, GetDC, ReleaseDC, HGDIOBJ,
+    };
+    let mut r = RECT::default();
+    if GetWindowRect(target, &mut r).is_err() {
+        return;
+    }
+    let hl = ensure_hilite();
+    if hl.0.is_null() {
+        return;
+    }
+    let pad = 4;
+    let x = r.left - pad;
+    let y = r.top - pad;
+    let w = (r.right - r.left) + pad * 2;
+    let h = (r.bottom - r.top) + pad * 2;
+    let _ = SetWindowPos(
+        hl,
+        HWND_TOPMOST,
+        x,
+        y,
+        w,
+        h,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+    );
+    let hdc = GetDC(hl);
+    if !hdc.0.is_null() {
+        let black = CreateSolidBrush(COLORREF(0));
+        let accent = CreateSolidBrush(COLORREF(0x00E67641));
+        let full = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        let _ = FillRect(hdc, &full, black);
+        let bw = 4;
+        for e in [
+            RECT { left: 0, top: 0, right: w, bottom: bw },
+            RECT { left: 0, top: h - bw, right: w, bottom: h },
+            RECT { left: 0, top: 0, right: bw, bottom: h },
+            RECT { left: w - bw, top: 0, right: w, bottom: h },
+        ] {
+            let _ = FillRect(hdc, &e, accent);
+        }
+        let _ = DeleteObject(HGDIOBJ(black.0));
+        let _ = DeleteObject(HGDIOBJ(accent.0));
+        ReleaseDC(hl, hdc);
+    }
+}
+
+unsafe fn hide_hilite() {
+    let h = HILITE_HWND.load(Ordering::Relaxed);
+    if h != 0 {
+        let _ = ShowWindow(HWND(h as *mut _), SW_HIDE);
+    }
 }
