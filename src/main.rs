@@ -2248,6 +2248,10 @@ impl TransGlassApp {
     }
     fn validate_hotkey_spec(spec: &HotkeySpec) -> Result<(), String> {
         unsafe {
+            // 空键 = 未绑定，允许保存
+            if spec.key.trim().is_empty() {
+                return Ok(());
+            }
             let mods = parse_modifiers(&spec.modifiers);
             let vk = parse_vk(&spec.key);
             if vk.is_none() {
@@ -2272,6 +2276,9 @@ impl TransGlassApp {
 
         let mut check = |name: &str, spec: &HotkeySpec| -> Result<(), String> {
             Self::validate_hotkey_spec(spec)?;
+            if spec.key.trim().is_empty() {
+                return Ok(());
+            }
             let key = (spec.modifiers.trim().to_uppercase(), spec.key.trim().to_uppercase());
             if let Some(prev) = used.insert(key.clone(), name.to_string()) {
                 return Err(format!("快捷键冲突：{} 与 {} 使用了相同组合（{} + {}）", prev, name, key.0, key.1));
@@ -2496,7 +2503,8 @@ impl eframe::App for TransGlassApp {
 
         if self.hotkey_capture.is_some() {
             let mut captured: Option<(String, String)> = None;
-            // 刚点「录入」的那一下鼠标左键不能算，否则会立刻绑成"鼠标左键"
+            let mut cancel = false;
+            // 刚点绑定位的那一下鼠标左键不能算，否则会立刻绑成"鼠标左键"
             let armed = self
                 .hotkey_capture_at
                 .map(|t| t.elapsed().as_secs_f32() > 0.18)
@@ -2510,6 +2518,10 @@ impl eframe::App for TransGlassApp {
                         ..
                     } = e
                     {
+                        if *key == egui::Key::Escape {
+                            cancel = true;
+                            break;
+                        }
                         if let Some(k) = egui_key_to_vk_name(*key) {
                             captured = Some((egui_modifiers_to_string(*modifiers), k));
                             break;
@@ -2542,7 +2554,10 @@ impl eframe::App for TransGlassApp {
                     }
                 }
             });
-            if let Some((mods, key)) = captured {
+            if cancel {
+                self.hotkey_capture = None;
+                self.hotkey_message = Some("已取消".into());
+            } else if let Some((mods, key)) = captured {
                 self.apply_hotkey_capture(mods, key);
             }
         }
@@ -3375,7 +3390,10 @@ unsafe fn try_register_hotkey(id: i32, spec: &HotkeySpec, name: &str) -> bool {
 pub(crate) fn hotkey_slots(cfg: &HotkeyConfig) -> Vec<(i32, &'static str, HotkeySpec)> {
     HotkeySlot::ALL
         .iter()
-        .filter(|slot| slot.enabled(cfg))
+        .filter(|slot| {
+            // 键位空着 = 未绑定：不注册、也不报"无法识别"
+            slot.enabled(cfg) && !slot.get(cfg).key.trim().is_empty()
+        })
         .map(|slot| (slot.bind_id(), slot.label(), slot.get(cfg)))
         .collect()
 }
@@ -3663,70 +3681,87 @@ impl HotkeySlot {
 }
 
 /// 编辑器下拉可选的按键（`parse_vk` 全部支持这些名字）
-pub(crate) const KEY_CHOICES: &[&str] = &[
-    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
-    "S", "T", "U", "V", "W", "X", "Y", "Z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-    "鼠标左键", "鼠标右键", "鼠标中键", "鼠标侧键1", "鼠标侧键2", "滚轮上", "滚轮下",
-    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14",
-    "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24", "SPACE", "TAB",
-    "ENTER", "ESC", "BACKSPACE", "DELETE", "INSERT", "HOME", "END", "PAGEUP", "PAGEDOWN",
-    "LEFT", "UP", "RIGHT", "DOWN", "`", "-", "=", "[", "]", "\\", ";", "'", ",", ".", "/",
-];
-
-/// 四个修饰键的复选框；改动后重写 "ALT+SHIFT" 形式的字符串。
-fn hotkey_mods_ui(ui: &mut egui::Ui, modifiers: &mut String) -> bool {
-    let up = modifiers.to_uppercase();
-    let mut alt = up.contains("ALT");
-    let mut ctrl = up.contains("CTRL") || up.contains("CONTROL");
-    let mut shift = up.contains("SHIFT");
-    let mut win = up.contains("WIN");
-    let mut changed = false;
-    changed |= ui.checkbox(&mut alt, "Alt").changed();
-    changed |= ui.checkbox(&mut ctrl, "Ctrl").changed();
-    changed |= ui.checkbox(&mut shift, "Shift").changed();
-    changed |= ui.checkbox(&mut win, "Win").changed();
-    if changed {
-        let mut parts: Vec<&str> = Vec::new();
-        if alt {
-            parts.push("ALT");
-        }
-        if ctrl {
-            parts.push("CTRL");
-        }
-        if shift {
-            parts.push("SHIFT");
-        }
-        if win {
-            parts.push("WIN");
-        }
-        *modifiers = parts.join("+");
+/// 键位显示：`ALT+SHIFT` + `P` → `Alt + Shift + P`
+pub(crate) fn hotkey_display(spec: &HotkeySpec) -> String {
+    if spec.key.trim().is_empty() {
+        return String::new();
     }
-    changed
+    let mut parts: Vec<String> = Vec::new();
+    for m in spec.modifiers.split('+') {
+        let m = m.trim();
+        if m.is_empty() {
+            continue;
+        }
+        let upper = m.to_uppercase();
+        let nice = match upper.as_str() {
+            "ALT" => "Alt",
+            "CTRL" | "CONTROL" => "Ctrl",
+            "SHIFT" => "Shift",
+            "WIN" => "Win",
+            other => other,
+        };
+        parts.push(nice.to_string());
+    }
+    parts.push(spec.key.trim().to_string());
+    parts.join(" + ")
 }
 
-/// 按键下拉；返回是否改动。
-fn hotkey_key_ui(ui: &mut egui::Ui, key: &mut String, salt: &str) -> bool {
-    let mut changed = false;
-    let current = key.trim().to_uppercase();
-    egui::ComboBox::from_id_source(format!("{salt}_key"))
-        .selected_text(if current.is_empty() {
-            "选择按键".to_string()
-        } else {
-            current.clone()
-        })
-        .width(96.0)
-        .show_ui(ui, |ui| {
-            for choice in KEY_CHOICES {
-                if ui.selectable_label(current == *choice, *choice).clicked() {
-                    *key = (*choice).to_string();
-                    changed = true;
-                }
-            }
-        });
-    changed
+/// 战争雷霆式的绑定位：一格按钮，点一下进入录入；录入中整格变强调色。
+/// 返回 (点击, 右键点击)
+fn hotkey_cell(
+    ui: &mut egui::Ui,
+    text: &str,
+    capturing: bool,
+    conflict: bool,
+    dim: bool,
+) -> (bool, bool) {
+    let font = egui::FontId::proportional(13.0);
+    let pad = egui::vec2(10.0, 5.0);
+    let min_w = 150.0;
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        font.clone(),
+        egui::Color32::WHITE,
+    );
+    let size = egui::vec2(
+        (galley.size().x + pad.x * 2.0).max(min_w),
+        galley.size().y + pad.y * 2.0,
+    );
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hover = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.12);
+    let (bg, border, fg) = if capturing {
+        (ACCENT_SOFT, ACCENT, ACCENT)
+    } else if conflict {
+        (egui::Color32::from_rgb(0xFD, 0xEC, 0xEC), ERROR, ERROR)
+    } else if dim {
+        (egui::Color32::from_rgb(0xFA, 0xFA, 0xFA), BORDER, TEXT_SECONDARY)
+    } else if hover > 0.01 {
+        (
+            lerp_color(SURFACE, HOVER_FILL, hover),
+            lerp_color(BORDER, egui::Color32::from_rgb(0xC8, 0xC8, 0xC8), hover),
+            TEXT_PRIMARY,
+        )
+    } else {
+        (SURFACE, BORDER, TEXT_PRIMARY)
+    };
+    ui.painter()
+        .rect(rect, egui::Rounding::same(6.0), bg, egui::Stroke::new(1.0, border));
+    ui.painter().text(
+        egui::pos2(rect.left() + pad.x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font,
+        fg,
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    (resp.clicked(), resp.secondary_clicked())
 }
 
-/// 统一卡片外观：圆角 10、细描边、内边距，和 DSH 面板的卡片风格保持一致。
+/// 统一卡片外观：圆角 10、细描边、内边距，和 DSH 面板的卡片风格保持一致。/// 统一卡片外观：圆角 10、细描边、内边距，和 DSH 面板的卡片风格保持一致。
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::none()
         .fill(SURFACE)
@@ -5398,8 +5433,8 @@ impl TransGlassApp {
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new(
-                "点「录入」后按任意键或鼠标键即可绑定（支持鼠标侧键1/2、中键、滚轮上下）；\
-                 鼠标左键/右键必须配修饰键。",
+                "点按位格进入录入，再按任意键或鼠标键即可绑定（支持鼠标侧键1/2、中键、滚轮上下）；\
+                 鼠标左键/右键必须配修饰键；Esc 取消，右键点按位格直接清除。",
             )
             .small()
             .weak(),
@@ -5469,38 +5504,105 @@ impl TransGlassApp {
 
     /// 快捷键编辑（内嵌，不再单开二级窗口）。每行一个功能：勾选 / 名称 / 修饰键 / 按键 / 录入。
     fn hotkey_editor_inline(&mut self, ui: &mut egui::Ui) {
-        for slot in HotkeySlot::ALL {
-            let optional = slot.optional();
-            let mut enabled = !optional || slot.enabled(&self.hotkey_draft);
-            let mut spec = slot.get(&self.hotkey_draft);
+        // 冲突检测：同一个组合出现在多个槽位 → 标红
+        let displays: Vec<String> = HotkeySlot::ALL
+            .iter()
+            .map(|slot| hotkey_display(&slot.get(&self.hotkey_draft)))
+            .collect();
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for d in &displays {
+            if !d.is_empty() {
+                *counts.entry(d.as_str()).or_insert(0) += 1;
+            }
+        }
+        let conflicted: Vec<bool> = displays
+            .iter()
+            .map(|d| !d.is_empty() && counts.get(d.as_str()).copied().unwrap_or(0) > 1)
+            .collect();
+
+        // 表头
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+            ui.add_sized(
+                [200.0, 18.0],
+                egui::Label::new(egui::RichText::new("操作").small().weak()),
+            );
+            ui.label(egui::RichText::new("按键").small().weak());
+        });
+        ui.add_space(2.0);
+        ui.separator();
+
+        for (i, slot) in HotkeySlot::ALL.iter().enumerate() {
+            let enabled = slot.enabled(&self.hotkey_draft);
+            let display = displays[i].clone();
+            let capturing = self.hotkey_capture == Some(slot.capture_target());
+            let dim = display.is_empty();
+            let conflict = conflicted[i];
+            let mut clear_now = false;
+            let mut start_capture = false;
+            let mut cancel_capture = false;
             ui.horizontal(|ui| {
-                if optional {
-                    if ui.checkbox(&mut enabled, "").changed() {
-                        slot.set_enabled(&mut self.hotkey_draft, enabled);
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                if slot.optional() {
+                    let mut on = enabled;
+                    if ui.checkbox(&mut on, "").changed() {
+                        slot.set_enabled(&mut self.hotkey_draft, on);
                     }
                 } else {
                     ui.add_space(18.0);
                 }
                 ui.add_sized(
-                    [96.0, 22.0],
+                    [200.0, 24.0],
                     egui::Label::new(egui::RichText::new(slot.label()).size(13.0)),
                 );
-                ui.add_enabled_ui(enabled, |ui| {
-                    hotkey_mods_ui(ui, &mut spec.modifiers);
-                    hotkey_key_ui(ui, &mut spec.key, slot.id());
-                });
-                if ui
-                    .add_enabled(enabled, egui::Button::new("录入"))
-                    .on_hover_text("按下想用的按键或鼠标键")
-                    .clicked()
-                {
-                    self.hotkey_capture = Some(slot.capture_target());
-                    self.hotkey_capture_at = Some(std::time::Instant::now());
-                    self.hotkey_message = Some("按下按键或鼠标键…".into());
+                let cell_text = if capturing {
+                    "按下按键…"
+                } else if dim {
+                    "未绑定"
+                } else {
+                    display.as_str()
+                };
+                let (clicked, right_clicked) =
+                    hotkey_cell(ui, cell_text, capturing, conflict, dim && !capturing);
+                if clicked {
+                    if capturing {
+                        cancel_capture = true;
+                    } else {
+                        start_capture = true;
+                    }
+                }
+                if right_clicked && !dim {
+                    clear_now = true;
+                }
+                if !dim {
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("清除").size(12.0)).frame(false))
+                        .on_hover_text("右键点按格也能清除")
+                        .clicked()
+                    {
+                        clear_now = true;
+                    }
                 }
             });
-            if enabled {
-                slot.set(&mut self.hotkey_draft, spec);
+            if start_capture {
+                self.hotkey_capture = Some(slot.capture_target());
+                self.hotkey_capture_at = Some(std::time::Instant::now());
+                self.hotkey_message = Some("按下按键或鼠标键，Esc 取消".into());
+            }
+            if cancel_capture {
+                self.hotkey_capture = None;
+                self.hotkey_message = Some("已取消".into());
+            }
+            if clear_now {
+                if slot.optional() {
+                    slot.set_enabled(&mut self.hotkey_draft, false);
+                } else {
+                    let mut s = slot.get(&self.hotkey_draft);
+                    s.key.clear();
+                    s.modifiers.clear();
+                    slot.set(&mut self.hotkey_draft, s);
+                }
+                self.hotkey_message = Some(format!("已清除「{}」的按键", slot.label()));
             }
             ui.add_space(2.0);
         }
