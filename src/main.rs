@@ -1156,7 +1156,7 @@ impl TransGlassApp {
             thumbs: std::collections::HashMap::new(),
             wins_at: None,
             selected: None,
-            settings_open: false,
+            settings_open: std::env::var_os("TRANSGLASS_OPEN_SETTINGS").is_some(),
             mini_mode: false,
             last_mini: false,
             issues_ver: u32::MAX,
