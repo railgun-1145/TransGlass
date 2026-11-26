@@ -5463,7 +5463,7 @@ unsafe fn ball_render() {
             w as usize,
             h as usize,
             bx as f32,
-            by as f32 + 3.0 + bob.round(),
+            by as f32 + 3.0 + bob,
             skin,
             &pose,
         );
