@@ -4140,9 +4140,34 @@ unsafe fn ball_render() {
                 dst[o + 2] = 0;
                 dst[o + 3] = 0;
             } else {
-                let a = (255 * cnt / (ss * ss) as u32) as u8;
-                let (rr, gg, bb) = (r / cnt, g / cnt, b / cnt);
-                // 预乘
+                let mut a = (255 * cnt / (ss * ss) as u32) as u8;
+                let (mut rr, mut gg, mut bb) = (r / cnt, g / cnt, b / cnt);
+                // 主球做成"MC 无痕玻璃"：半透明玻璃体 + 白色外圈
+                let bx_s = BALL_W / 2 + 40;
+                let by_s = BALL_H / 2;
+                let sdx = x as i32 - (BALL_W - 42);
+                let sdy = y as i32 - by_s;
+                let sd = ((sdx * sdx + sdy * sdy) as f32).sqrt();
+                let _ = bx_s;
+                if sd <= 29.5 {
+                    // 只替换原本的实心填充色，保留白色文字
+                    let is_fill = (rr as i32 - 168).abs() < 60
+                        && (gg as i32 - 143).abs() < 60
+                        && (bb as i32 - 78).abs() < 60;
+                    if sd >= 25.5 {
+                        if is_fill || (rr > 200 && gg > 200 && bb > 200) {
+                            rr = 250;
+                            gg = 253;
+                            bb = 255;
+                            a = 252;
+                        }
+                    } else if is_fill {
+                        rr = 224;
+                        gg = 240;
+                        bb = 248;
+                        a = 196;
+                    }
+                }
                 dst[o] = (bb as u32 * a as u32 / 255) as u8;
                 dst[o + 1] = (gg as u32 * a as u32 / 255) as u8;
                 dst[o + 2] = (rr as u32 * a as u32 / 255) as u8;
