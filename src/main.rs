@@ -2680,6 +2680,7 @@ fn main() -> Result<(), eframe::Error> {
     let _single_instance = unsafe { acquire_single_instance() };
     PERF_ON.store(std::env::var_os("TRANSGLASS_DEBUG_PERF").is_some(), Ordering::Relaxed);
     spawn_quit_listener();
+    load_ball_tex();
     unsafe { ball_spawn() };
     unsafe { purge_shell_managed() };
     spawn_device_tracking_ticker();
@@ -4001,84 +4002,122 @@ unsafe fn ball_satellites(t: f32) -> [(i32, i32); 6] {
 
 unsafe fn ball_render() {
     use windows::Win32::Graphics::Gdi::{
-        CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, PS_SOLID,
-        DrawTextW, Ellipse, GetDC, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-        BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BI_RGB, DIB_RGB_COLORS, HGDIOBJ, TRANSPARENT,
+        CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW, GetDC,
+        ReleaseDC, SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER,
+        BLENDFUNCTION, BI_RGB, DIB_RGB_COLORS, HGDIOBJ, TRANSPARENT,
     };
     let hwnd = BALL_HWND.load(Ordering::Relaxed);
     if hwnd == 0 {
         return;
     }
-    let ss = 3i32; // 3 倍超采样，边缘更圆滑
-    let w2 = BALL_W * ss;
-    let h2 = BALL_H * ss;
+    let w = BALL_W;
+    let h = BALL_H;
     let screen = GetDC(HWND::default());
-    let mem_big = CreateCompatibleDC(screen);
+    let mem = CreateCompatibleDC(screen);
     let mut bi: BITMAPINFO = std::mem::zeroed();
     bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-    bi.bmiHeader.biWidth = w2;
-    bi.bmiHeader.biHeight = -h2;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB.0;
-    let mut bits_big: *mut core::ffi::c_void = std::ptr::null_mut();
-    let dib_big = match CreateDIBSection(mem_big, &bi, DIB_RGB_COLORS, &mut bits_big, None, 0) {
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let dib = match CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
         Ok(d) => d,
         Err(_) => {
-            let _ = DeleteDC(mem_big);
+            let _ = DeleteDC(mem);
             ReleaseDC(HWND::default(), screen);
             return;
         }
     };
-    let old_big = SelectObject(mem_big, HGDIOBJ(dib_big.0));
-    let magenta = CreateSolidBrush(COLORREF(0x00FF_00FF));
-    let full = RECT { left: 0, top: 0, right: w2, bottom: h2 };
-    let _ = windows::Win32::Graphics::Gdi::FillRect(mem_big, &full, magenta);
+    let old = SelectObject(mem, HGDIOBJ(dib.0));
+    let buf = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
+    buf.fill(0);
 
     let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
-    let accent = CreateSolidBrush(COLORREF(0x00A8_8F4E));
     let (bx, by) = ball_center();
-    let (bx, by) = (bx * ss, by * ss);
-    let white_pen = CreatePen(PS_SOLID, 2 * ss, COLORREF(0x00FF_FFFF));
-    let border_pen = CreatePen(PS_SOLID, 1 * ss, COLORREF(0x00DB_D5D1));
-    let _ = SelectObject(mem_big, HGDIOBJ(accent.0));
-    let _ = SelectObject(mem_big, HGDIOBJ(white_pen.0));
-    let br = 27 * ss;
-    let _ = Ellipse(mem_big, bx - br, by - br, bx + br, by + br);
-    let _ = SetBkMode(mem_big, TRANSPARENT);
-    let _ = SetTextColor(mem_big, COLORREF(0x00FF_FFFF));
-    let font = CreateFontW(
-        20 * ss, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0,
+    let r = 27i32;
+
+    // 主球：方块玻璃（贴图采样 + 白色边框）
+    for yy in (by - r)..=(by + r) {
+        for xx in (bx - r)..=(bx + r) {
+            if xx < 0 || yy < 0 || xx >= w || yy >= h {
+                continue;
+            }
+            let dx = xx - bx;
+            let dy = yy - by;
+            let edge = dx.abs() >= r - 2 || dy.abs() >= r - 2;
+            let (cr, cg, cb, ca) = if edge {
+                (238u8, 245u8, 249u8, 245u8)
+            } else {
+                let (tr, tg, tb, ta) = ball_tex_sample(dx, dy, r);
+                (tr, tg, tb, ta.max(190))
+            };
+            let o = ((yy * w + xx) * 4) as usize;
+            buf[o] = (cb as u32 * ca as u32 / 255) as u8;
+            buf[o + 1] = (cg as u32 * ca as u32 / 255) as u8;
+            buf[o + 2] = (cr as u32 * ca as u32 / 255) as u8;
+            buf[o + 3] = ca;
+        }
+    }
+
+    // 卫星：白色圆 + 强调色文字（先铺白色圆）
+    if t > 0.02 {
+        for (sx, sy) in ball_satellites(t) {
+            let sr = (17.0 * (0.6 + 0.4 * t)) as i32;
+            for yy in (sy - sr)..=(sy + sr) {
+                for xx in (sx - sr)..=(sx + sr) {
+                    if xx < 0 || yy < 0 || xx >= w || yy >= h {
+                        continue;
+                    }
+                    let dx = xx - sx;
+                    let dy = yy - sy;
+                    if dx * dx + dy * dy > sr * sr {
+                        continue;
+                    }
+                    let o = ((yy * w + xx) * 4) as usize;
+                    let edge = dx * dx + dy * dy >= (sr - 2) * (sr - 2);
+                    let v = if edge { 214u8 } else { 255u8 };
+                    buf[o] = v;
+                    buf[o + 1] = v;
+                    buf[o + 2] = v;
+                    buf[o + 3] = 255;
+                }
+            }
+        }
+    }
+
+    // 文字（GDI 只写 RGB，最后统一补 alpha）
+    let _ = SetBkMode(mem, TRANSPARENT);
+    let _ = SetTextColor(mem, COLORREF(0x00FF_FFFF));
+    let font_ball = CreateFontW(
+        20, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0,
         windows::core::w!("Microsoft YaHei"),
     );
-    let old_font = SelectObject(mem_big, HGDIOBJ(font.0));
+    let old_font = SelectObject(mem, HGDIOBJ(font_ball.0));
     let mut label: Vec<u16> = if t > 0.5 { "×" } else { "T" }.encode_utf16().collect();
-    let mut lr = RECT { left: bx - 14 * ss, top: by - 12 * ss, right: bx + 34 * ss, bottom: by + 20 * ss };
-    let _ = SetBkMode(mem_big, TRANSPARENT);
-
-    let _ = DrawTextW(mem_big, &mut label, &mut lr, windows::Win32::Graphics::Gdi::DT_LEFT);
+    let mut lr = RECT { left: bx - 12, top: by - 12, right: bx + 16, bottom: by + 14 };
+    let _ = DrawTextW(mem, &mut label, &mut lr, windows::Win32::Graphics::Gdi::DT_LEFT);
 
     if t > 0.02 {
-        let sats = ball_satellites(t);
-        let labels = ["透-", "透+", "置顶", "穿透", "模式", "还原"];
-        let white_brush = CreateSolidBrush(COLORREF(0x00FF_FFFF));
-        let sat_font = CreateFontW(
-            12 * ss, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 0, 0,
+        let _ = SetTextColor(mem, COLORREF(0x00A8_8F4E));
+        let font_sat = CreateFontW(
+            12, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 0, 0,
             windows::core::w!("Microsoft YaHei"),
         );
-        let sat_old = SelectObject(mem_big, HGDIOBJ(sat_font.0));
-        let _ = SetTextColor(mem_big, COLORREF(0x00A8_8F4E));
-        for (i, (sx, sy)) in sats.iter().enumerate() {
-            let r = (17.0 * (0.6 + 0.4 * t)) as i32 * ss;
-            let (sx, sy) = (sx * ss, sy * ss);
-            let _ = SelectObject(mem_big, HGDIOBJ(white_brush.0));
-            let _ = SelectObject(mem_big, HGDIOBJ(border_pen.0));
-            let _ = Ellipse(mem_big, sx - r, sy - r, sx + r, sy + r);
+        let old_sat = SelectObject(mem, HGDIOBJ(font_sat.0));
+        let labels = ["透-", "透+", "置顶", "穿透", "模式", "还原"];
+        for (i, (sx, sy)) in ball_satellites(t).iter().enumerate() {
+            let sr = (17.0 * (0.6 + 0.4 * t)) as i32;
             let mut txt: Vec<u16> = labels[i].encode_utf16().collect();
-            let mut tr = RECT { left: sx - r, top: sy - r, right: sx + r, bottom: sy + r };
-            let _ = SetBkMode(mem_big, TRANSPARENT);
+            let mut tr = RECT {
+                left: sx - sr,
+                top: sy - sr,
+                right: sx + sr,
+                bottom: sy + sr,
+            };
             let _ = DrawTextW(
-                mem_big,
+                mem,
                 &mut txt,
                 &mut tr,
                 windows::Win32::Graphics::Gdi::DT_CENTER
@@ -4086,119 +4125,14 @@ unsafe fn ball_render() {
                     | windows::Win32::Graphics::Gdi::DT_SINGLELINE,
             );
         }
-        SelectObject(mem_big, sat_old);
-        let _ = DeleteObject(HGDIOBJ(sat_font.0));
-        let _ = DeleteObject(HGDIOBJ(white_brush.0));
+        SelectObject(mem, old_sat);
+        let _ = DeleteObject(HGDIOBJ(font_sat.0));
     }
 
-    // 下采样到最终尺寸（洋红=透明），预乘 alpha
-    let mem = CreateCompatibleDC(screen);
-    let mut bi2: BITMAPINFO = std::mem::zeroed();
-    bi2.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-    bi2.bmiHeader.biWidth = BALL_W;
-    bi2.bmiHeader.biHeight = -BALL_H;
-    bi2.bmiHeader.biPlanes = 1;
-    bi2.bmiHeader.biBitCount = 32;
-    bi2.bmiHeader.biCompression = BI_RGB.0;
-    let mut bits_small: *mut core::ffi::c_void = std::ptr::null_mut();
-    let dib = match CreateDIBSection(mem, &bi2, DIB_RGB_COLORS, &mut bits_small, None, 0) {
-        Ok(d) => d,
-        Err(_) => {
-            SelectObject(mem_big, old_big);
-            let _ = DeleteDC(mem_big);
-            ReleaseDC(HWND::default(), screen);
-            return;
-        }
-    };
-    let old_small = SelectObject(mem, HGDIOBJ(dib.0));
-    let src = std::slice::from_raw_parts(bits_big as *const u8, (w2 * h2 * 4) as usize);
-    let dst = std::slice::from_raw_parts_mut(bits_small as *mut u8, (BALL_W * BALL_H * 4) as usize);
-    for y in 0..BALL_H {
-        for x in 0..BALL_W {
-            let mut r = 0u32;
-            let mut g = 0u32;
-            let mut b = 0u32;
-            let mut cnt = 0u32;
-            for dy in 0..ss {
-                for dx in 0..ss {
-                    let sx = x * ss + dx;
-                    let sy = y * ss + dy;
-                    let o = ((sy * w2 + sx) * 4) as usize;
-                    let (bb, gg, rr) = (src[o], src[o + 1], src[o + 2]);
-                    if !(rr == 0xFF && gg == 0x00 && bb == 0xFF) {
-                        r += rr as u32;
-                        g += gg as u32;
-                        b += bb as u32;
-                        cnt += 1;
-                    }
-                }
-            }
-            let o = ((y * BALL_W + x) * 4) as usize;
-            if cnt == 0 {
-                // 方块玻璃区域：原本透明的地方也补成玻璃
-                let cx = BALL_W - 42;
-                let cy = BALL_H / 2;
-                let dx = x as i32 - cx;
-                let dy = y as i32 - cy;
-                let r = 27i32;
-                if dx.abs() <= r && dy.abs() <= r {
-                    let edge = dx.abs() >= r - 3 || dy.abs() >= r - 3;
-                    let diag = (dx - dy).abs() <= 1 || (dx + dy).abs() <= 1;
-                    let (cr, cg, cb, ca) = if edge {
-                        (250u32, 253u32, 255u32, 246u32)
-                    } else if diag {
-                        (240, 248, 252, 236)
-                    } else {
-                        (222, 240, 249, 188)
-                    };
-                    dst[o] = (cb * ca / 255) as u8;
-                    dst[o + 1] = (cg * ca / 255) as u8;
-                    dst[o + 2] = (cr * ca / 255) as u8;
-                    dst[o + 3] = ca as u8;
-                } else {
-                    dst[o] = 0;
-                    dst[o + 1] = 0;
-                    dst[o + 2] = 0;
-                    dst[o + 3] = 0;
-                }
-            } else {
-                let mut a = (255 * cnt / (ss * ss) as u32) as u8;
-                let (mut rr, mut gg, mut bb) = (r / cnt, g / cnt, b / cnt);
-                // 主球做成"MC 无痕玻璃"：半透明玻璃体 + 白色外圈
-                let bx_s = BALL_W / 2 + 40;
-                let by_s = BALL_H / 2;
-                let sdx = x as i32 - (BALL_W - 42);
-                let sdy = y as i32 - by_s;
-                let sd = ((sdx * sdx + sdy * sdy) as f32).sqrt();
-                let _ = bx_s;
-                // 主球做成方块玻璃（MC 玻璃块）：白框 + 半透明玻璃体 + 斜向高光
-                let cx = BALL_W - 42;
-                let cy = BALL_H / 2;
-                let dx = x as i32 - cx;
-                let dy = y as i32 - cy;
-                let r = 27i32;
-                if dx.abs() <= r && dy.abs() <= r {
-                    let is_white = rr > 200 && gg > 200 && bb > 200;
-                    if !is_white {
-                        let edge = dx.abs() >= r - 3 || dy.abs() >= r - 3;
-                        let diag = (dx - dy).abs() <= 1 || (dx + dy).abs() <= 1;
-                        if edge {
-                            rr = 250;
-                            gg = 253;
-                            bb = 255;
-                            a = 246;
-                        } else {
-                            rr = 222;
-                            gg = 240;
-                            bb = 249;
-                            a = if diag { 236 } else { 188 };
-                        }
-                    }
-                }                dst[o] = (bb as u32 * a as u32 / 255) as u8;
-                dst[o + 1] = (gg as u32 * a as u32 / 255) as u8;
-                dst[o + 2] = (rr as u32 * a as u32 / 255) as u8;
-                dst[o + 3] = a;
-            }
+    // 文字像素 alpha 补齐（GDI 不写 alpha）
+    for px in buf.chunks_exact_mut(4) {
+        if px[3] == 0 && (px[0] != 0 || px[1] != 0 || px[2] != 0) {
+            px[3] = 255;
         }
     }
 
@@ -4206,8 +4140,8 @@ unsafe fn ball_render() {
         x: BALL_POS_X.load(Ordering::Relaxed),
         y: BALL_POS_Y.load(Ordering::Relaxed),
     };
-    let size = SIZE { cx: BALL_W, cy: BALL_H };
-    let origin = POINT { x: 0, y: 0 };
+    let size = SIZE { cx: w, cy: h };
+    let src = POINT { x: 0, y: 0 };
     let blend = BLENDFUNCTION {
         BlendOp: 0,
         BlendFlags: 0,
@@ -4220,22 +4154,17 @@ unsafe fn ball_render() {
         Some(&pos),
         Some(&size),
         mem,
-        Some(&origin),
+        Some(&src),
         COLORREF(0),
         Some(&blend),
         windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
     );
 
-    SelectObject(mem, old_small);
-    SelectObject(mem_big, old_font);
-    SelectObject(mem_big, old_big);
-    let _ = DeleteObject(HGDIOBJ(font.0));
-    let _ = DeleteObject(HGDIOBJ(accent.0));
-    let _ = DeleteObject(HGDIOBJ(magenta.0));
+    SelectObject(mem, old_font);
+    SelectObject(mem, old);
+    let _ = DeleteObject(HGDIOBJ(font_ball.0));
     let _ = DeleteObject(HGDIOBJ(dib.0));
-    let _ = DeleteObject(HGDIOBJ(dib_big.0));
     let _ = DeleteDC(mem);
-    let _ = DeleteDC(mem_big);
     ReleaseDC(HWND::default(), screen);
 }
 unsafe fn ball_hit(x: i32, y: i32) -> u8 {
@@ -4498,4 +4427,33 @@ unsafe fn ball_apply(target: HWND, action: BallAction) {
         }
     }
     request_ui_repaint();
+}
+
+static BALL_TEX: std::sync::OnceLock<image::RgbaImage> = std::sync::OnceLock::new();
+
+fn load_ball_tex() {
+    let p = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("ball_glass.png")));
+    if let Some(p) = p {
+        if let Ok(img) = image::open(&p) {
+            let _ = BALL_TEX.set(img.to_rgba8());
+        }
+    }
+}
+
+/// 在方块内按纹理坐标采样玻璃贴图
+fn ball_tex_sample(dx: i32, dy: i32, r: i32) -> (u8, u8, u8, u8) {
+    let Some(tex) = BALL_TEX.get() else {
+        return (26, 36, 44, 200);
+    };
+    let (tw, th) = (tex.width() as f32, tex.height() as f32);
+    let u = ((dx + r) as f32 / (2 * r) as f32).clamp(0.0, 1.0);
+    let v = ((dy + r) as f32 / (2 * r) as f32).clamp(0.0, 1.0);
+    let tx = (u * (tw - 1.0)).round() as u32;
+    let ty = (v * (th - 1.0)).round() as u32;
+    let p = tex.get_pixel(tx, ty);
+    // 贴图 alpha 往往偏低，提一点让方块可见
+    let a = (p[3] as u32 * 5 / 4).min(255) as u8;
+    (p[0], p[1], p[2], a)
 }
