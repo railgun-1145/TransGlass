@@ -3812,6 +3812,36 @@ unsafe fn capture_window(hwnd: HWND) -> Option<egui::ColorImage> {
 static HILITE_HWND: AtomicIsize = AtomicIsize::new(0);
 
 unsafe extern "system" fn hilite_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    use windows::Win32::Graphics::Gdi::{
+        BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HGDIOBJ, PAINTSTRUCT,
+    };
+    if msg == WM_ERASEBKGND {
+        return LRESULT(1);
+    }
+    if msg == WM_PAINT {
+        let mut ps = PAINTSTRUCT::default();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        if !hdc.0.is_null() {
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let black = CreateSolidBrush(COLORREF(0));
+            let _ = FillRect(hdc, &rc, black);
+            let accent = CreateSolidBrush(COLORREF(0x00E67641));
+            let bw = 4;
+            for e in [
+                RECT { left: 0, top: 0, right: rc.right, bottom: bw },
+                RECT { left: 0, top: rc.bottom - bw, right: rc.right, bottom: rc.bottom },
+                RECT { left: 0, top: 0, right: bw, bottom: rc.bottom },
+                RECT { left: rc.right - bw, top: 0, right: rc.right, bottom: rc.bottom },
+            ] {
+                let _ = FillRect(hdc, &e, accent);
+            }
+            let _ = DeleteObject(HGDIOBJ(black.0));
+            let _ = DeleteObject(HGDIOBJ(accent.0));
+        }
+        let _ = EndPaint(hwnd, &ps);
+        return LRESULT(0);
+    }
     DefWindowProcW(hwnd, msg, w, l)
 }
 
