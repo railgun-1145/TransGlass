@@ -1662,219 +1662,79 @@ impl eframe::App for TransGlassApp {
             egui::Window::new("快捷键设置")
                 .open(&mut open)
                 .collapsible(false)
-                .resizable(false)
+                .resizable(true)
+                .default_width(380.0)
                 .show(ctx, |ui| {
                     let path = get_config_path();
                     ui.label(format!("配置文件：{}", path.display()));
                     ui.add_space(8.0);
 
-                    egui::Grid::new("hotkey_editor_grid")
-                        .striped(true)
+                    // 统一槽位表驱动：新增热键 = HotkeySlot 加一个变体 + ALL 加一项
+                    egui::ScrollArea::vertical()
+                        .max_height(430.0)
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.label("");
-                            ui.label("修饰键");
-                            ui.label("按键");
-                            ui.label("");
-                            ui.end_row();
-
-                            ui.label("增加透明度");
-                            ui.text_edit_singleline(&mut self.hotkey_draft.increase.modifiers);
-                            ui.text_edit_singleline(&mut self.hotkey_draft.increase.key);
-                            if ui.button("录入").clicked() {
-                                self.hotkey_capture = Some(HotkeyCaptureTarget::Increase);
-                                self.hotkey_message = Some("请按下组合键".into());
-                            }
-                            ui.end_row();
-
-                            ui.label("减少透明度");
-                            ui.text_edit_singleline(&mut self.hotkey_draft.decrease.modifiers);
-                            ui.text_edit_singleline(&mut self.hotkey_draft.decrease.key);
-                            if ui.button("录入").clicked() {
-                                self.hotkey_capture = Some(HotkeyCaptureTarget::Decrease);
-                                self.hotkey_message = Some("请按下组合键".into());
-                            }
-                            ui.end_row();
-
-                            ui.label("切换置顶");
-                            ui.text_edit_singleline(&mut self.hotkey_draft.toggle_top.modifiers);
-                            ui.text_edit_singleline(&mut self.hotkey_draft.toggle_top.key);
-                            if ui.button("录入").clicked() {
-                                self.hotkey_capture = Some(HotkeyCaptureTarget::ToggleTop);
-                                self.hotkey_message = Some("请按下组合键".into());
-                            }
-                            ui.end_row();
-
-                            let mut enable_mouse = self.hotkey_draft.toggle_click_through.is_some();
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut enable_mouse, "鼠标点透");
-                            });
-                            if enable_mouse && self.hotkey_draft.toggle_click_through.is_none() {
-                                self.hotkey_draft.toggle_click_through = defaults.toggle_click_through.clone();
-                            }
-                            if !enable_mouse {
-                                self.hotkey_draft.toggle_click_through = None;
-                            }
-                            let mut mouse_mods = self
-                                .hotkey_draft
-                                .toggle_click_through
-                                .clone()
-                                .unwrap_or_else(|| defaults.toggle_click_through.clone().unwrap())
-                                .modifiers;
-                            let mut mouse_key = self
-                                .hotkey_draft
-                                .toggle_click_through
-                                .clone()
-                                .unwrap_or_else(|| defaults.toggle_click_through.clone().unwrap())
-                                .key;
-                            ui.add_enabled(enable_mouse, egui::TextEdit::singleline(&mut mouse_mods));
-                            ui.add_enabled(enable_mouse, egui::TextEdit::singleline(&mut mouse_key));
-                            if ui.add_enabled(enable_mouse, egui::Button::new("录入")).clicked() {
-                                self.hotkey_capture = Some(HotkeyCaptureTarget::ToggleMouse);
-                                self.hotkey_message = Some("请按下组合键".into());
-                            }
-                            if enable_mouse {
-                                self.hotkey_draft.toggle_click_through = Some(HotkeySpec {
-                                    modifiers: mouse_mods,
-                                    key: mouse_key,
+                            for slot in HotkeySlot::ALL {
+                                let optional = slot.optional();
+                                let mut enabled = !optional || slot.enabled(&self.hotkey_draft);
+                                let mut spec = slot.get(&self.hotkey_draft);
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        if optional {
+                                            if ui.checkbox(&mut enabled, "").changed() {
+                                                slot.set_enabled(&mut self.hotkey_draft, enabled);
+                                            }
+                                        } else {
+                                            ui.add_space(18.0);
+                                        }
+                                        ui.add(egui::Label::new(
+                                            egui::RichText::new(slot.label()).small(),
+                                        ));
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .add_enabled(
+                                                        enabled,
+                                                        egui::Button::new("录入").small(),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.hotkey_capture =
+                                                        Some(slot.capture_target());
+                                                    self.hotkey_message =
+                                                        Some("请按下组合键".into());
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(18.0);
+                                        ui.add_enabled_ui(enabled, |ui| {
+                                            hotkey_mods_ui(ui, &mut spec.modifiers);
+                                            hotkey_key_ui(ui, &mut spec.key, slot.id());
+                                        });
+                                    });
                                 });
+                                if enabled {
+                                    slot.set(&mut self.hotkey_draft, spec);
+                                }
                             }
-                            ui.end_row();
-
-                            let mut enable_pen = self.hotkey_draft.toggle_pen_passthrough.is_some();
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut enable_pen, "笔点透");
-                            });
-                            if enable_pen && self.hotkey_draft.toggle_pen_passthrough.is_none() {
-                                self.hotkey_draft.toggle_pen_passthrough = defaults.toggle_pen_passthrough.clone();
-                            }
-                            if !enable_pen {
-                                self.hotkey_draft.toggle_pen_passthrough = None;
-                            }
-                            let mut pen_mods = self
-                                .hotkey_draft
-                                .toggle_pen_passthrough
-                                .clone()
-                                .unwrap_or_else(|| defaults.toggle_pen_passthrough.clone().unwrap())
-                                .modifiers;
-                            let mut pen_key = self
-                                .hotkey_draft
-                                .toggle_pen_passthrough
-                                .clone()
-                                .unwrap_or_else(|| defaults.toggle_pen_passthrough.clone().unwrap())
-                                .key;
-                            ui.add_enabled(enable_pen, egui::TextEdit::singleline(&mut pen_mods));
-                            ui.add_enabled(enable_pen, egui::TextEdit::singleline(&mut pen_key));
-                            if ui.add_enabled(enable_pen, egui::Button::new("录入")).clicked() {
-                                self.hotkey_capture = Some(HotkeyCaptureTarget::TogglePen);
-                                self.hotkey_message = Some("请按下组合键".into());
-                            }
-                            if enable_pen {
-                                self.hotkey_draft.toggle_pen_passthrough = Some(HotkeySpec {
-                                    modifiers: pen_mods,
-                                    key: pen_key,
-                                });
-                            }
-                            ui.end_row();
-
-                            let mut enable_mode = self.hotkey_draft.input_mode_cycle.is_some();
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut enable_mode, "输入模式切换");
-                            });
-                            if enable_mode && self.hotkey_draft.input_mode_cycle.is_none() {
-                                self.hotkey_draft.input_mode_cycle = defaults.input_mode_cycle.clone();
-                            }
-                            if !enable_mode {
-                                self.hotkey_draft.input_mode_cycle = None;
-                            }
-                            let mut mode_mods = self
-                                .hotkey_draft
-                                .input_mode_cycle
-                                .clone()
-                                .unwrap_or_else(|| defaults.input_mode_cycle.clone().unwrap())
-                                .modifiers;
-                            let mut mode_key = self
-                                .hotkey_draft
-                                .input_mode_cycle
-                                .clone()
-                                .unwrap_or_else(|| defaults.input_mode_cycle.clone().unwrap())
-                                .key;
-                            ui.add_enabled(enable_mode, egui::TextEdit::singleline(&mut mode_mods));
-                            ui.add_enabled(enable_mode, egui::TextEdit::singleline(&mut mode_key));
-                            if ui.add_enabled(enable_mode, egui::Button::new("录入")).clicked() {
-                                self.hotkey_capture = Some(HotkeyCaptureTarget::CycleInputMode);
-                                self.hotkey_message = Some("请按下组合键".into());
-                            }
-                            if enable_mode {
-                                self.hotkey_draft.input_mode_cycle = Some(HotkeySpec {
-                                    modifiers: mode_mods,
-                                    key: mode_key,
-                                });
-                            }
-                            ui.end_row();
-
-                            ui.label("还原当前窗口");
-                            ui.text_edit_singleline(&mut self.hotkey_draft.reset_current.modifiers);
-                            ui.text_edit_singleline(&mut self.hotkey_draft.reset_current.key);
-                            if ui.button("录入").clicked() {
-                                self.hotkey_capture = Some(HotkeyCaptureTarget::ResetCurrent);
-                                self.hotkey_message = Some("请按下组合键".into());
-                            }
-                            ui.end_row();
-
-                            ui.label("还原所有窗口");
-                            ui.text_edit_singleline(&mut self.hotkey_draft.reset_all.modifiers);
-                            ui.text_edit_singleline(&mut self.hotkey_draft.reset_all.key);
-                            if ui.button("录入").clicked() {
-                                self.hotkey_capture = Some(HotkeyCaptureTarget::ResetAll);
-                                self.hotkey_message = Some("请按下组合键".into());
-                            }
-                            ui.end_row();
-
-                            ui.label("检查更新");
-                            ui.text_edit_singleline(&mut self.hotkey_draft.update.modifiers);
-                            ui.text_edit_singleline(&mut self.hotkey_draft.update.key);
-                            if ui.button("录入").clicked() {
-                                self.hotkey_capture = Some(HotkeyCaptureTarget::Update);
-                                self.hotkey_message = Some("请按下组合键".into());
-                            }
-                            ui.end_row();
-
-                            let mut enable_reload = self.hotkey_draft.reload.is_some();
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut enable_reload, "重载配置");
-                            });
-                            if enable_reload && self.hotkey_draft.reload.is_none() {
-                                self.hotkey_draft.reload = defaults.reload.clone();
-                            }
-                            if !enable_reload {
-                                self.hotkey_draft.reload = None;
-                            }
-                            let mut reload_mods = self
-                                .hotkey_draft
-                                .reload
-                                .clone()
-                                .unwrap_or_else(|| defaults.reload.clone().unwrap())
-                                .modifiers;
-                            let mut reload_key = self
-                                .hotkey_draft
-                                .reload
-                                .clone()
-                                .unwrap_or_else(|| defaults.reload.clone().unwrap())
-                                .key;
-                            ui.add_enabled(enable_reload, egui::TextEdit::singleline(&mut reload_mods));
-                            ui.add_enabled(enable_reload, egui::TextEdit::singleline(&mut reload_key));
-                            if ui.add_enabled(enable_reload, egui::Button::new("录入")).clicked() {
-                                self.hotkey_capture = Some(HotkeyCaptureTarget::Reload);
-                                self.hotkey_message = Some("请按下组合键".into());
-                            }
-                            if enable_reload {
-                                self.hotkey_draft.reload = Some(HotkeySpec {
-                                    modifiers: reload_mods,
-                                    key: reload_key,
-                                });
-                            }
-                            ui.end_row();
                         });
+
+                    ui.add_space(6.0);
+                    match Self::validate_config(&self.hotkey_draft) {
+                        Ok(()) => {
+                            ui.label(egui::RichText::new("组合键均合法且无冲突").small().weak());
+                        }
+                        Err(err) => {
+                            ui.label(
+                                egui::RichText::new(format!("配置有问题：{err}"))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(255, 120, 120)),
+                            );
+                        }
+                    }
 
                     ui.add_space(10.0);
                     if self.hotkey_draft.mouse.is_none() {
@@ -2253,46 +2113,16 @@ struct HotkeyConfig {
 
 fn default_config() -> HotkeyConfig {
     HotkeyConfig {
-        increase: HotkeySpec {
-            modifiers: "ALT".into(),
-            key: "Z".into(),
-        },
-        decrease: HotkeySpec {
-            modifiers: "ALT".into(),
-            key: "X".into(),
-        },
-        toggle_top: HotkeySpec {
-            modifiers: "ALT".into(),
-            key: "T".into(),
-        },
-        toggle_click_through: Some(HotkeySpec {
-            modifiers: "ALT".into(),
-            key: "P".into(),
-        }),
-        toggle_pen_passthrough: Some(HotkeySpec {
-            modifiers: "ALT+SHIFT".into(),
-            key: "P".into(),
-        }),
-        input_mode_cycle: Some(HotkeySpec {
-            modifiers: "ALT+SHIFT".into(),
-            key: "M".into(),
-        }),
-        reset_current: HotkeySpec {
-            modifiers: "ALT".into(),
-            key: "R".into(),
-        },
-        reset_all: HotkeySpec {
-            modifiers: "ALT+SHIFT".into(),
-            key: "R".into(),
-        },
-        update: HotkeySpec {
-            modifiers: "ALT".into(),
-            key: "U".into(),
-        },
-        reload: Some(HotkeySpec {
-            modifiers: "ALT+SHIFT".into(),
-            key: "C".into(),
-        }),
+        increase: HotkeySlot::Increase.default_spec(),
+        decrease: HotkeySlot::Decrease.default_spec(),
+        toggle_top: HotkeySlot::ToggleTop.default_spec(),
+        toggle_click_through: Some(HotkeySlot::ToggleClick.default_spec()),
+        toggle_pen_passthrough: Some(HotkeySlot::TogglePen.default_spec()),
+        input_mode_cycle: Some(HotkeySlot::CycleInputMode.default_spec()),
+        reset_current: HotkeySlot::ResetCurrent.default_spec(),
+        reset_all: HotkeySlot::ResetAll.default_spec(),
+        update: HotkeySlot::Update.default_spec(),
+        reload: Some(HotkeySlot::Reload.default_spec()),
         mouse: Some(MouseBindingsSpec {
             xbutton1: Some("decrease".into()),
             xbutton2: Some("increase".into()),
@@ -2513,34 +2343,11 @@ unsafe fn try_register_hotkey(id: i32, spec: &HotkeySpec, name: &str) -> bool {
 ///
 /// 主程序的 `bind_hotkeys()` 与自检模块共用这一份，避免两处各写一遍默认值而漂移。
 pub(crate) fn hotkey_slots(cfg: &HotkeyConfig) -> Vec<(i32, &'static str, HotkeySpec)> {
-    let toggle_click = cfg.toggle_click_through.clone().unwrap_or(HotkeySpec {
-        modifiers: "ALT".into(),
-        key: "P".into(),
-    });
-    let toggle_pen = cfg.toggle_pen_passthrough.clone().unwrap_or(HotkeySpec {
-        modifiers: "ALT+SHIFT".into(),
-        key: "P".into(),
-    });
-    let reload = cfg.reload.clone().unwrap_or(HotkeySpec {
-        modifiers: "ALT+SHIFT".into(),
-        key: "C".into(),
-    });
-
-    let mut slots = vec![
-        (1, "增加透明度", cfg.increase.clone()),
-        (2, "减少透明度", cfg.decrease.clone()),
-        (3, "切换置顶", cfg.toggle_top.clone()),
-        (4, "切换鼠标点透", toggle_click),
-        (5, "切换笔点透", toggle_pen),
-        (6, "还原当前窗口", cfg.reset_current.clone()),
-        (7, "还原全部窗口", cfg.reset_all.clone()),
-        (8, "检查更新", cfg.update.clone()),
-        (9, "重载热键配置", reload),
-    ];
-    if let Some(spec) = cfg.input_mode_cycle.as_ref() {
-        slots.push((10, "切换输入模式", spec.clone()));
-    }
-    slots
+    HotkeySlot::ALL
+        .iter()
+        .filter(|slot| slot.enabled(cfg))
+        .map(|slot| (slot.bind_id(), slot.label(), slot.get(cfg)))
+        .collect()
 }
 
 unsafe fn bind_hotkeys(cfg: &HotkeyConfig) {
@@ -2632,4 +2439,258 @@ fn current_priority_flag() -> bool {
         })
         .and_then(|cfg| cfg.hotkey_priority)
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// 热键槽位表：编辑器、绑定、面板总览共用同一份描述。
+// 新增一个热键功能时只需三步：加变体 -> 在 ALL 登记 -> 补 label/id/默认值。
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HotkeySlot {
+    Increase,
+    Decrease,
+    ToggleTop,
+    ToggleClick,
+    TogglePen,
+    CycleInputMode,
+    ResetCurrent,
+    ResetAll,
+    Update,
+    Reload,
+}
+
+impl HotkeySlot {
+    pub(crate) const ALL: [HotkeySlot; 10] = [
+        HotkeySlot::Increase,
+        HotkeySlot::Decrease,
+        HotkeySlot::ToggleTop,
+        HotkeySlot::ToggleClick,
+        HotkeySlot::TogglePen,
+        HotkeySlot::CycleInputMode,
+        HotkeySlot::ResetCurrent,
+        HotkeySlot::ResetAll,
+        HotkeySlot::Update,
+        HotkeySlot::Reload,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            HotkeySlot::Increase => "增加透明度",
+            HotkeySlot::Decrease => "减少透明度",
+            HotkeySlot::ToggleTop => "切换置顶",
+            HotkeySlot::ToggleClick => "切换鼠标点透",
+            HotkeySlot::TogglePen => "切换笔点透",
+            HotkeySlot::CycleInputMode => "切换输入模式",
+            HotkeySlot::ResetCurrent => "还原当前窗口",
+            HotkeySlot::ResetAll => "还原全部窗口",
+            HotkeySlot::Update => "检查更新",
+            HotkeySlot::Reload => "重载热键配置",
+        }
+    }
+
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            HotkeySlot::Increase => "increase",
+            HotkeySlot::Decrease => "decrease",
+            HotkeySlot::ToggleTop => "toggle_top",
+            HotkeySlot::ToggleClick => "toggle_click",
+            HotkeySlot::TogglePen => "toggle_pen",
+            HotkeySlot::CycleInputMode => "input_mode",
+            HotkeySlot::ResetCurrent => "reset_current",
+            HotkeySlot::ResetAll => "reset_all",
+            HotkeySlot::Update => "update",
+            HotkeySlot::Reload => "reload",
+        }
+    }
+
+    pub(crate) fn optional(self) -> bool {
+        matches!(
+            self,
+            HotkeySlot::ToggleClick
+                | HotkeySlot::TogglePen
+                | HotkeySlot::CycleInputMode
+                | HotkeySlot::Reload
+        )
+    }
+
+    /// 默认键位：唯一来源，default_config 与编辑器共用，避免两处漂移。
+    pub(crate) fn default_spec(self) -> HotkeySpec {
+        let (mods, key) = match self {
+            HotkeySlot::Increase => ("ALT", "Z"),
+            HotkeySlot::Decrease => ("ALT", "X"),
+            HotkeySlot::ToggleTop => ("ALT", "T"),
+            HotkeySlot::ToggleClick => ("ALT", "P"),
+            HotkeySlot::TogglePen => ("ALT+SHIFT", "P"),
+            HotkeySlot::CycleInputMode => ("ALT+SHIFT", "M"),
+            HotkeySlot::ResetCurrent => ("ALT", "R"),
+            HotkeySlot::ResetAll => ("ALT+SHIFT", "R"),
+            HotkeySlot::Update => ("ALT", "U"),
+            HotkeySlot::Reload => ("ALT+SHIFT", "C"),
+        };
+        HotkeySpec {
+            modifiers: mods.into(),
+            key: key.into(),
+        }
+    }
+
+    pub(crate) fn bind_id(self) -> i32 {
+        match self {
+            HotkeySlot::Increase => 1,
+            HotkeySlot::Decrease => 2,
+            HotkeySlot::ToggleTop => 3,
+            HotkeySlot::ToggleClick => 4,
+            HotkeySlot::TogglePen => 5,
+            HotkeySlot::ResetCurrent => 6,
+            HotkeySlot::ResetAll => 7,
+            HotkeySlot::Update => 8,
+            HotkeySlot::Reload => 9,
+            HotkeySlot::CycleInputMode => 10,
+        }
+    }
+
+    pub(crate) fn enabled(self, cfg: &HotkeyConfig) -> bool {
+        match self {
+            HotkeySlot::ToggleClick => cfg.toggle_click_through.is_some(),
+            HotkeySlot::TogglePen => cfg.toggle_pen_passthrough.is_some(),
+            HotkeySlot::CycleInputMode => cfg.input_mode_cycle.is_some(),
+            HotkeySlot::Reload => cfg.reload.is_some(),
+            _ => true,
+        }
+    }
+
+    pub(crate) fn set_enabled(self, cfg: &mut HotkeyConfig, on: bool) {
+        match self {
+            HotkeySlot::ToggleClick => {
+                cfg.toggle_click_through = if on { Some(self.default_spec()) } else { None }
+            }
+            HotkeySlot::TogglePen => {
+                cfg.toggle_pen_passthrough = if on { Some(self.default_spec()) } else { None }
+            }
+            HotkeySlot::CycleInputMode => {
+                cfg.input_mode_cycle = if on { Some(self.default_spec()) } else { None }
+            }
+            HotkeySlot::Reload => {
+                cfg.reload = if on { Some(self.default_spec()) } else { None }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn get(self, cfg: &HotkeyConfig) -> HotkeySpec {
+        match self {
+            HotkeySlot::Increase => cfg.increase.clone(),
+            HotkeySlot::Decrease => cfg.decrease.clone(),
+            HotkeySlot::ToggleTop => cfg.toggle_top.clone(),
+            HotkeySlot::ToggleClick => cfg
+                .toggle_click_through
+                .clone()
+                .unwrap_or_else(|| self.default_spec()),
+            HotkeySlot::TogglePen => cfg
+                .toggle_pen_passthrough
+                .clone()
+                .unwrap_or_else(|| self.default_spec()),
+            HotkeySlot::CycleInputMode => cfg
+                .input_mode_cycle
+                .clone()
+                .unwrap_or_else(|| self.default_spec()),
+            HotkeySlot::ResetCurrent => cfg.reset_current.clone(),
+            HotkeySlot::ResetAll => cfg.reset_all.clone(),
+            HotkeySlot::Update => cfg.update.clone(),
+            HotkeySlot::Reload => cfg.reload.clone().unwrap_or_else(|| self.default_spec()),
+        }
+    }
+
+    pub(crate) fn set(self, cfg: &mut HotkeyConfig, spec: HotkeySpec) {
+        match self {
+            HotkeySlot::Increase => cfg.increase = spec,
+            HotkeySlot::Decrease => cfg.decrease = spec,
+            HotkeySlot::ToggleTop => cfg.toggle_top = spec,
+            HotkeySlot::ToggleClick => cfg.toggle_click_through = Some(spec),
+            HotkeySlot::TogglePen => cfg.toggle_pen_passthrough = Some(spec),
+            HotkeySlot::CycleInputMode => cfg.input_mode_cycle = Some(spec),
+            HotkeySlot::ResetCurrent => cfg.reset_current = spec,
+            HotkeySlot::ResetAll => cfg.reset_all = spec,
+            HotkeySlot::Update => cfg.update = spec,
+            HotkeySlot::Reload => cfg.reload = Some(spec),
+        }
+    }
+
+    pub(crate) fn capture_target(self) -> HotkeyCaptureTarget {
+        match self {
+            HotkeySlot::Increase => HotkeyCaptureTarget::Increase,
+            HotkeySlot::Decrease => HotkeyCaptureTarget::Decrease,
+            HotkeySlot::ToggleTop => HotkeyCaptureTarget::ToggleTop,
+            HotkeySlot::ToggleClick => HotkeyCaptureTarget::ToggleMouse,
+            HotkeySlot::TogglePen => HotkeyCaptureTarget::TogglePen,
+            HotkeySlot::CycleInputMode => HotkeyCaptureTarget::CycleInputMode,
+            HotkeySlot::ResetCurrent => HotkeyCaptureTarget::ResetCurrent,
+            HotkeySlot::ResetAll => HotkeyCaptureTarget::ResetAll,
+            HotkeySlot::Update => HotkeyCaptureTarget::Update,
+            HotkeySlot::Reload => HotkeyCaptureTarget::Reload,
+        }
+    }
+}
+
+/// 编辑器下拉可选的按键（`parse_vk` 全部支持这些名字）
+pub(crate) const KEY_CHOICES: &[&str] = &[
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
+    "S", "T", "U", "V", "W", "X", "Y", "Z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14",
+    "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24", "SPACE", "TAB",
+    "ENTER", "ESC", "BACKSPACE", "DELETE", "INSERT", "HOME", "END", "PAGEUP", "PAGEDOWN",
+    "LEFT", "UP", "RIGHT", "DOWN", "`", "-", "=", "[", "]", "\\", ";", "'", ",", ".", "/",
+];
+
+/// 四个修饰键的复选框；改动后重写 "ALT+SHIFT" 形式的字符串。
+fn hotkey_mods_ui(ui: &mut egui::Ui, modifiers: &mut String) -> bool {
+    let up = modifiers.to_uppercase();
+    let mut alt = up.contains("ALT");
+    let mut ctrl = up.contains("CTRL") || up.contains("CONTROL");
+    let mut shift = up.contains("SHIFT");
+    let mut win = up.contains("WIN");
+    let mut changed = false;
+    changed |= ui.checkbox(&mut alt, "Alt").changed();
+    changed |= ui.checkbox(&mut ctrl, "Ctrl").changed();
+    changed |= ui.checkbox(&mut shift, "Shift").changed();
+    changed |= ui.checkbox(&mut win, "Win").changed();
+    if changed {
+        let mut parts: Vec<&str> = Vec::new();
+        if alt {
+            parts.push("ALT");
+        }
+        if ctrl {
+            parts.push("CTRL");
+        }
+        if shift {
+            parts.push("SHIFT");
+        }
+        if win {
+            parts.push("WIN");
+        }
+        *modifiers = parts.join("+");
+    }
+    changed
+}
+
+/// 按键下拉；返回是否改动。
+fn hotkey_key_ui(ui: &mut egui::Ui, key: &mut String, salt: &str) -> bool {
+    let mut changed = false;
+    let current = key.trim().to_uppercase();
+    egui::ComboBox::from_id_source(format!("{salt}_key"))
+        .selected_text(if current.is_empty() {
+            "选择按键".to_string()
+        } else {
+            current.clone()
+        })
+        .width(96.0)
+        .show_ui(ui, |ui| {
+            for choice in KEY_CHOICES {
+                if ui.selectable_label(current == *choice, *choice).clicked() {
+                    *key = (*choice).to_string();
+                    changed = true;
+                }
+            }
+        });
+    changed
 }

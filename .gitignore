@@ -4,3 +4,5 @@
 /dist/
 /*.zip
 /debug.log
+
+build.log
