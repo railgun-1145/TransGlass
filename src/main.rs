@@ -1103,6 +1103,7 @@ struct TransGlassApp {
     mini_mode: bool,
     desk_filter: Option<String>,
     preview_fps: u32,
+    view_mode: u8,
     last_mini: bool,
     issues_ver: u32,
     issues_cache: Vec<String>,
@@ -1180,6 +1181,7 @@ impl TransGlassApp {
             settings_open: std::env::var_os("TRANSGLASS_OPEN_SETTINGS").is_some(),
             mini_mode: false,
             desk_filter: None,
+            view_mode: load_ui_state().view_mode.unwrap_or(0),
             preview_fps: { let s = load_ui_state(); s.preview_fps.unwrap_or(match s.preview_rate { Some(3) => 0, Some(2) => 2, Some(1) => 8, _ => 15 }) },
             last_mini: false,
             issues_ver: u32::MAX,
@@ -1460,6 +1462,10 @@ impl TransGlassApp {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(repaint_ms));
         }
 
+        if self.view_mode == 0 {
+            self.list_view(ui, &wins);
+            return;
+        }
         let mut toggle: Option<isize> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -1483,6 +1489,109 @@ impl TransGlassApp {
         }
     }
 
+    /// 紧凑列表视图：一行一个窗口，空间利用率高
+    fn list_view(&mut self, ui: &mut egui::Ui, wins: &[(isize, String, String)]) {
+        let mut toggle: Option<isize> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (hwnd, title, desktop) in wins {
+                    let (alpha, top) = GLOBAL_REGISTRY
+                        .get(hwnd)
+                        .map(|s| (s.current_alpha, s.user_pref_topmost))
+                        .unwrap_or((255, false));
+                    egui::Frame::none()
+                        .fill(SURFACE)
+                        .stroke(egui::Stroke::new(1.0, BORDER))
+                        .rounding(egui::Rounding::same(8.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if let Some(tex) = self.thumbnail(ui.ctx(), *hwnd) {
+                                    let ts = tex.size();
+                                    let aspect = ts[1] as f32 / ts[0].max(1) as f32;
+                                    let w = 58.0;
+                                    let h = (w * aspect).clamp(26.0, 36.0);
+                                    let resp = ui.add(
+                                        egui::Image::new(egui::load::SizedTexture::new(
+                                            tex.id(),
+                                            egui::vec2(w, h),
+                                        ))
+                                        .rounding(4.0)
+                                        .sense(egui::Sense::click()),
+                                    );
+                                    if resp.clicked() {
+                                        toggle = Some(*hwnd);
+                                    }
+                                    resp.context_menu(|ui| window_menu(ui, *hwnd, title));
+                                } else {
+                                    let (rect, resp) = ui
+                                        .allocate_exact_size(egui::vec2(58.0, 32.0), egui::Sense::click());
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        4.0,
+                                        egui::Color32::from_rgb(0xF1, 0xF3, 0xF6),
+                                    );
+                                    if resp.clicked() {
+                                        toggle = Some(*hwnd);
+                                    }
+                                }
+                                ui.vertical(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(title).small().strong(),
+                                        )
+                                        .truncate(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{}% ｜ {desktop}",
+                                            (alpha as f32 / 255.0 * 100.0).round() as i32
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                top,
+                                                egui::RichText::new("置顶").small(),
+                                            )
+                                            .clicked()
+                                        {
+                                            unsafe { toggle_topmost(HWND(*hwnd as *mut _)) };
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
+            });
+        let repaint_ms = if self.preview_fps == 0 {
+            0
+        } else {
+            (1000 / self.preview_fps.max(1) as u64).max(16)
+        };
+        if repaint_ms > 0 {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(repaint_ms));
+        }
+        if let Some(h) = toggle {
+            let managed = GLOBAL_REGISTRY.get(&h).is_some();
+            unsafe {
+                if managed {
+                    restore_window(HWND(h as *mut _));
+                } else {
+                    control_window(HWND(h as *mut _));
+                }
+            }
+            self.refresh_window_list(true);
+        }
+    }
     fn window_card(
         &mut self,
         ui: &mut egui::Ui,
@@ -1996,6 +2105,20 @@ impl eframe::App for TransGlassApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.mini_mode {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("TransGlass").color(ACCENT).strong().size(16.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("▣ 大界面").clicked() {
+                            self.mini_mode = false;
+                        }
+                        if ui.button("⚙").clicked() {
+                            self.settings_open = true;
+                        }
+                    });
+                });
+                ui.separator();
+            }
             ui.add_space(10.0);
             let issues = snapshot_issues();
             if !issues.is_empty() {
@@ -2080,6 +2203,21 @@ impl eframe::App for TransGlassApp {
                                 .small()
                                 .weak(),
                         );
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("视图").small().color(TEXT_SECONDARY));
+                        let mut view = self.view_mode;
+                        ui.horizontal(|ui| {
+                            if ui.radio_value(&mut view, 0u8, "紧凑列表").changed() {
+                                self.view_mode = view;
+                                self.ui_state.view_mode = Some(view);
+                                save_ui_state(&self.ui_state);
+                            }
+                            if ui.radio_value(&mut view, 1u8, "缩略图网格").changed() {
+                                self.view_mode = view;
+                                self.ui_state.view_mode = Some(view);
+                                save_ui_state(&self.ui_state);
+                            }
+                        });
                         ui.add_space(8.0);
                         let mut mini = self.mini_mode;
                         if ui
@@ -2765,6 +2903,7 @@ struct UiState {
     always_on_top: Option<bool>,
     /// 预览帧率（0 = 关闭）
     preview_fps: Option<u32>,
+    view_mode: Option<u8>,
     /// 兼容旧配置
     preview_rate: Option<u8>,
 }
