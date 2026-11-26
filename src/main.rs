@@ -2681,6 +2681,7 @@ fn main() -> Result<(), eframe::Error> {
     PERF_ON.store(std::env::var_os("TRANSGLASS_DEBUG_PERF").is_some(), Ordering::Relaxed);
     spawn_quit_listener();
     load_ball_tex();
+    load_ball_skin();
     unsafe { ball_spawn() };
     unsafe { purge_shell_managed() };
     spawn_device_tracking_ticker();
@@ -4039,6 +4040,7 @@ unsafe fn ball_render() {
     let r = 27i32;
 
     // 主球 + 卫星：统一的圆角玻璃块（抗锯齿）
+    {
     let mut draw_block = |cx: i32, cy: i32, half: f32, is_main: bool| {
         let span = (half + 2.0).ceil() as i32;
         for yy in (cy - span)..=(cy + span) {
@@ -4086,6 +4088,50 @@ unsafe fn ball_render() {
             draw_block(sx, sy, sr, false);
         }
     }
+    }
+
+    // 中间方块：MC 纸娃娃（基岩版风格，正面 UV 拼装）
+    if let Some(skin) = BALL_SKIN.get() {
+        let unit = 1.3f32;
+        let top = by as f32 - 32.0 * unit * 0.5 + 3.0;
+        let left = bx as f32 - 8.0 * unit;
+        let mut part = |u0: u32, v0: u32, pw: u32, ph: u32, ox: f32, oy: f32| -> () {
+            let x0 = (left + ox * unit) as i32;
+            let y0 = (top + oy * unit) as i32;
+            let wpx = (pw as f32 * unit) as i32;
+            let hpx = (ph as f32 * unit) as i32;
+            for yy in 0..hpx {
+                for xx in 0..wpx {
+                    let tx = u0 + (xx as f32 / unit) as u32;
+                    let ty = v0 + (yy as f32 / unit) as u32;
+                    if tx >= skin.width() || ty >= skin.height() {
+                        continue;
+                    }
+                    let px = skin.get_pixel(tx, ty);
+                    if px[3] == 0 {
+                        continue;
+                    }
+                    let gx = x0 + xx;
+                    let gy = y0 + yy;
+                    if gx < 0 || gy < 0 || gx >= w || gy >= h {
+                        continue;
+                    }
+                    let o = ((gy * w + gx) * 4) as usize;
+                    buf[o] = px[2];
+                    buf[o + 1] = px[1];
+                    buf[o + 2] = px[0];
+                    buf[o + 3] = 255;
+                }
+            }
+        };
+        part(8, 8, 8, 8, 4.0, 0.0);      // 头
+        part(20, 20, 8, 12, 4.0, 8.0);   // 身体
+        part(44, 20, 4, 12, 0.0, 8.0);   // 右臂
+        part(36, 52, 4, 12, 12.0, 8.0);  // 左臂
+        part(4, 20, 4, 12, 4.0, 20.0);   // 右腿
+        part(20, 52, 4, 12, 8.0, 20.0);  // 左腿
+    }
+
     // 文字（GDI 只写 RGB，最后统一补 alpha）
     let _ = SetBkMode(mem, TRANSPARENT);
     let _ = SetTextColor(mem, COLORREF(0x00FF_FFFF));
@@ -4466,4 +4512,18 @@ fn sq_coverage(dx: i32, dy: i32, half: f32, rad: f32) -> (f32, f32) {
     let d = (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0) - rad;
     let cov = (0.5 - d).clamp(0.0, 1.0);
     (cov, d)
+}
+
+
+static BALL_SKIN: std::sync::OnceLock<image::RgbaImage> = std::sync::OnceLock::new();
+
+fn load_ball_skin() {
+    let p = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("skin.png")));
+    if let Some(p) = p {
+        if let Ok(img) = image::open(&p) {
+            let _ = BALL_SKIN.set(img.to_rgba8());
+        }
+    }
 }
