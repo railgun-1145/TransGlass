@@ -1114,6 +1114,8 @@ struct TransGlassApp {
     desk_filter: Option<String>,
     preview_fps: u32,
     view_mode: u8,
+    card_rects: std::collections::HashMap<isize, egui::Rect>,
+    ball_open: bool,
     hover: Option<(isize, std::time::Instant)>,
     hover_seen: bool,
     last_mini: bool,
@@ -1194,6 +1196,8 @@ impl TransGlassApp {
             mini_mode: false,
             desk_filter: None,
             view_mode: load_ui_state().view_mode.unwrap_or(0),
+            card_rects: std::collections::HashMap::new(),
+            ball_open: true,
             hover: None,
             hover_seen: false,
             preview_fps: { let s = load_ui_state(); s.preview_fps.unwrap_or(match s.preview_rate { Some(3) => 0, Some(2) => 2, Some(1) => 8, _ => 15 }) },
@@ -1665,6 +1669,16 @@ impl TransGlassApp {
             .get(&hwnd)
             .map(|s| (s.current_alpha, s.user_pref_topmost, s.mouse_passthrough, s.pen_passthrough));
         let (alpha, top, _mouse, _pen) = managed.unwrap_or((255, false, false, false));
+        // 悬停缩放动画（用上一帧的矩形判断，1 帧延迟无感）
+        let hovered = self
+            .card_rects
+            .get(&hwnd)
+            .and_then(|r| ui.ctx().pointer_hover_pos().map(|p| r.contains(p)))
+            .unwrap_or(false);
+        let anim = ui
+            .ctx()
+            .animate_bool_with_time(egui::Id::new(("card_hover", hwnd)), hovered, 0.12);
+        let zoom = 1.0 + 0.035 * anim;
         let card_w = if self.mini_mode { 172.0 } else { 232.0 };
         let card_resp = ui.allocate_ui_with_layout(
             egui::vec2(card_w, if self.mini_mode { 190.0 } else { 224.0 }),
@@ -1678,7 +1692,7 @@ impl TransGlassApp {
                     .show(ui, |ui| {
                         let box_w = card_w - 18.0;
                         let box_h = if self.mini_mode { 96.0 } else { 118.0 };
-                        let img_size = egui::vec2(box_w, box_h);
+                        let img_size = egui::vec2(box_w * zoom, box_h * zoom);
                         match self.thumbnail(ui.ctx(), hwnd) {
                             Some(tex) => {
                                 let resp = ui.add(
@@ -1775,7 +1789,7 @@ impl TransGlassApp {
                     });
             },
         );
-        let _ = &card_resp;
+        self.card_rects.insert(hwnd, card_resp.response.rect);
         ui.add_space(8.0);
     }
 
@@ -2058,6 +2072,55 @@ impl eframe::App for TransGlassApp {
         }
 
         // 3. UI 绘制 (更简洁现代的布局)
+        // 悬浮球：独立的小窗口，点一下显示/隐藏主面板
+        if self.ball_open {
+            let ball_id = egui::ViewportId::from_hash_of("tg_ball");
+            let builder = egui::ViewportBuilder::default()
+                .with_inner_size([68.0, 68.0])
+                .with_decorations(false)
+                .with_always_on_top()
+                .with_resizable(false)
+                .with_transparent(true)
+                .with_position([1820.0, 520.0]);
+            let mut clicked = false;
+            let mut hide_ball = false;
+            ctx.show_viewport_immediate(ball_id, builder, |ctx, _class| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(68.0, 68.0),
+                            egui::Sense::click_and_drag(),
+                        );
+                        let hover = resp.hovered();
+                        let base = if hover { 30.0 } else { 27.0 };
+                        ui.painter().circle_filled(rect.center(), base, ACCENT);
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "T",
+                            egui::FontId::proportional(20.0),
+                            egui::Color32::WHITE,
+                        );
+                        if resp.dragged() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                        if resp.clicked() {
+                            clicked = true;
+                        }
+                        if resp.secondary_clicked() {
+                            hide_ball = true;
+                        }
+                    });
+            });
+            if clicked {
+                unsafe { toggle_main_window() };
+            }
+            if hide_ball {
+                self.ball_open = false;
+            }
+        }
+
         // 3. 大界面：左侧导航（桌面分组 + 窗口），右侧详情
         self.refresh_window_list(false);
 
@@ -3875,3 +3938,20 @@ unsafe fn hide_hilite() {
     }
 }
 
+
+/// 悬浮球点击：显示/隐藏主窗口
+unsafe fn toggle_main_window() {
+    let h = ROOT_HWND.load(Ordering::Relaxed);
+    if h == 0 {
+        return;
+    }
+    let hwnd = HWND(h as *mut _);
+    if WINDOW_VISIBLE.load(Ordering::Relaxed) {
+        hide_root_window();
+        WINDOW_VISIBLE.store(false, Ordering::Relaxed);
+    } else {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
+        WINDOW_VISIBLE.store(true, Ordering::Relaxed);
+    }
+}

@@ -13,7 +13,7 @@
 #endif
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.7.2"
+  #define MyAppVersion "0.8.0"
 #endif
 
 [Setup]
