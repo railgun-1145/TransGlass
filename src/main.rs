@@ -886,7 +886,26 @@ unsafe fn toggle_topmost(hwnd: HWND) {
     if is_shell_hwnd(hwnd) {
         return;
     }
-    if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&(hwnd.0 as isize)) {
+    // 未管理的窗口先纳入管理，否则点了没反应（旧 bug：toggle_topmost 没有自动注册）
+    let hwnd_val = hwnd.0 as isize;
+    if GLOBAL_REGISTRY.get(&hwnd_val).is_none() {
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let is_top = (ex_style & WS_EX_TOPMOST.0) != 0;
+        let title = get_window_title(hwnd);
+        GLOBAL_REGISTRY.insert(
+            hwnd_val,
+            WindowState {
+                original_ex_style: ex_style,
+                current_alpha: 255,
+                original_is_topmost: is_top,
+                user_pref_topmost: is_top,
+                mouse_passthrough: false,
+                pen_passthrough: false,
+                title,
+            },
+        );
+    }
+    if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&hwnd_val) {
         state.user_pref_topmost = !state.user_pref_topmost;
         let _ = apply_transparency_to_hwnd(
             hwnd,
