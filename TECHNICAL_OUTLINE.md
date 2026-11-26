@@ -41,6 +41,12 @@
 ### 4.3 GUI 渲染
 `egui` 每 100ms 轮询一次注册表状态，确保界面上的滑动条与热键调节同步。
 
+**视觉样式（对齐驱动 App 那种克制风）**：颜色都是灰/白——`BG_BASE #FAFAFA`、`BG_SIDEBAR #F9FAFB`、`SURFACE #FFF`、`BORDER #E5E7EB`、`TEXT_PRIMARY #1F2328`、`TEXT_SECONDARY #6B7280`，强调色只有 `ACCENT #4E8FA8` 和它的淡底 `ACCENT_SOFT #E9F2F6`。控件圆角 8、卡片 12、窗口 12；卡片带 1px 描边 + 很轻的投影；弹窗统一 `popup_shadow`（blur 16、alpha 28）。
+
+**两个自绘组件**（`nav_row` / `chip`）：驱动 App 的导航行和桌面胶囊。都用 `animate_bool_with_time` 做 120~160ms 的过渡——悬停淡入 `HOVER_FILL`，选中淡入 `ACCENT_SOFT`，导航行左侧还有一条 3px 强调条；文字用 `lerp_color` 从 `TEXT_PRIMARY` 渐变到 `ACCENT`。卡片悬停则是描边/投影随 `anim` 渐变（`lerp_color(BORDER, #9FC8D6, anim)`）。设置页打开/切分类时 `ui.set_opacity()` 做 150ms 淡入（`settings_fade` 记时间戳）。
+
+**图标**：任务栏/标题栏用 `ViewportBuilder::with_icon()` 读程序目录的 `icon.png`（那块 MC 玻璃）；exe 文件图标靠 `build.rs` 里 `embed_resource::compile("app_icon.rc")` 嵌入 `icon.ico`（由 icon.png 生成的多尺寸 ico），这样资源管理器/快捷方式也是同一块玻璃。
+
 **设置页**：`settings_open` 时弹一个占屏幕 92%×90% 的居中窗口（`fixed_size` + `anchor(CENTER_CENTER)`），左侧 `SETTINGS_TABS` 五个分类（快捷键 / 输入 / 窗口与预览 / 悬浮球与纸娃娃 / 维护），右侧按 `settings_tab` 调 `settings_page_*`。分类页拆成 `impl TransGlassApp` 的独立方法，别再把所有控件塞进一个 `egui::Window`。
 
 ### 4.4 悬浮球：分层窗口与 3D 纸娃娃

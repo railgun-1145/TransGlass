@@ -1149,6 +1149,8 @@ struct TransGlassApp {
     settings_open: bool,
     /// 设置页当前分类
     settings_tab: usize,
+    /// 设置页淡入起点（切分类/刚打开时重置）
+    settings_fade: Option<std::time::Instant>,
     mini_mode: bool,
     desk_filter: Option<String>,
     preview_fps: u32,
@@ -1236,6 +1238,7 @@ impl TransGlassApp {
             selected: None,
             settings_open: std::env::var_os("TRANSGLASS_OPEN_SETTINGS").is_some(),
             settings_tab: 0,
+            settings_fade: None,
             mini_mode: false,
             desk_filter: None,
             view_mode: load_ui_state().view_mode.unwrap_or(0),
@@ -1385,12 +1388,8 @@ impl TransGlassApp {
                     for (hwnd, title, _) in &items {
                         let managed = GLOBAL_REGISTRY.contains_key(hwnd);
                         let mark = if managed { "●" } else { "○" };
-                        let mut text = egui::RichText::new(format!("{mark} {title}")).small();
-                        if !managed {
-                            text = text.weak();
-                        }
-                        let resp = ui
-                            .selectable_label(cur_sel == Some(*hwnd), text)
+                        let label = format!("{mark} {title}");
+                        let resp = nav_row(ui, cur_sel == Some(*hwnd), &label, !managed)
                             .on_hover_text(if managed {
                                 "点击复原这个窗口（再点一次重新控制）"
                             } else {
@@ -1486,20 +1485,11 @@ impl TransGlassApp {
         }
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("桌面").small().weak());
-            if ui
-                .selectable_label(self.desk_filter.is_none(), egui::RichText::new("全部").small())
-                .clicked()
-            {
+            if chip(ui, self.desk_filter.is_none(), "全部").clicked() {
                 self.desk_filter = None;
             }
             for d in &desks {
-                if ui
-                    .selectable_label(
-                        self.desk_filter.as_deref() == Some(d.as_str()),
-                        egui::RichText::new(d).small(),
-                    )
-                    .clicked()
-                {
+                if chip(ui, self.desk_filter.as_deref() == Some(d.as_str()), d).clicked() {
                     self.desk_filter = Some(d.clone());
                 }
             }
@@ -1732,8 +1722,17 @@ impl TransGlassApp {
             |ui| {
                 egui::Frame::none()
                     .fill(SURFACE)
-                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        lerp_color(BORDER, egui::Color32::from_rgb(0x9F, 0xC8, 0xD6), anim),
+                    ))
                     .rounding(egui::Rounding::same(12.0))
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 1.0 + anim),
+                        blur: 6.0 + 8.0 * anim,
+                        spread: 0.0,
+                        color: egui::Color32::from_black_alpha((10.0 + 16.0 * anim) as u8),
+                    })
                     .inner_margin(egui::Margin::same(8.0))
                     .show(ui, |ui| {
                         let box_w = card_w - 18.0;
@@ -2133,6 +2132,7 @@ impl eframe::App for TransGlassApp {
                 // 全局开关没有意义，这里不再提供。
                 if ui.button("⚙ 设置").clicked() {
                     self.settings_open = true;
+                    self.settings_fade = Some(std::time::Instant::now());
                 }
                 if ui
                     .button(if self.mini_mode { "▣ 返回大界面" } else { "▤ 小窗模式" })
@@ -2238,6 +2238,7 @@ impl eframe::App for TransGlassApp {
                         }
                         if ui.button("⚙").clicked() {
                             self.settings_open = true;
+                    self.settings_fade = Some(std::time::Instant::now());
                         }
                     });
                 });
@@ -2280,6 +2281,11 @@ impl eframe::App for TransGlassApp {
 
         if self.settings_open {
             let mut open = true;
+            // PCL 那种快速淡入：切分类 / 刚打开时 150ms 从透明推上来
+            let fade = self
+                .settings_fade
+                .map(|t| (t.elapsed().as_secs_f32() / 0.15).clamp(0.0, 1.0))
+                .unwrap_or(1.0);
             let screen = ctx.screen_rect();
             let size = egui::vec2(screen.width() * 0.92, screen.height() * 0.9);
             egui::Window::new("设置")
@@ -2290,6 +2296,7 @@ impl eframe::App for TransGlassApp {
                 .fixed_size(size)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
+                    ui.set_opacity(fade);
                     ui.horizontal_top(|ui| {
                         ui.vertical(|ui| {
                             ui.set_width(150.0);
@@ -2299,8 +2306,10 @@ impl eframe::App for TransGlassApp {
                                 if ui
                                     .selectable_label(sel, egui::RichText::new(*name).size(15.0))
                                     .clicked()
+                                    && self.settings_tab != i
                                 {
                                     self.settings_tab = i;
+                                    self.settings_fade = Some(std::time::Instant::now());
                                 }
                             }
                             ui.add_space(10.0);
@@ -2749,10 +2758,14 @@ fn main() -> Result<(), eframe::Error> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([
             ui_state.w.filter(|w| *w >= 860.0).unwrap_or(1000.0),
-            ui_state.h.filter(|h| *h >= 560.0).unwrap_or(700.0),
+            ui_state.h.filter(|h| *h >= 560.0).unwrap_or(720.0),
         ])
         .with_title("TransGlass 控制面板")
         .with_visible(true);
+    // 任务栏/标题栏图标：就是那块 MC 玻璃（程序目录的 icon.png）
+    if let Some(icon) = window_icon_data() {
+        viewport = viewport.with_icon(icon);
+    }
     if let (Some(x), Some(y)) = (ui_state.x, ui_state.y) {
         viewport = viewport.with_position([x, y]);
     }
@@ -3015,6 +3028,26 @@ struct UiState {
 
 fn ui_doll_model(st: &UiState) -> Option<doll::ModelKind> {
     st.doll_model.as_deref().and_then(doll::ModelKind::parse)
+}
+
+/// 任务栏 / 标题栏图标：读程序目录的 icon.png（那块 MC 玻璃），失败就没图标。
+fn window_icon_data() -> Option<egui::IconData> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    for name in ["icon.png", "icon2.png", "tray_icon.png"] {
+        if let Ok(img) = image::open(dir.join(name)) {
+            let rgba = img.to_rgba8();
+            let (w, h) = (rgba.width(), rgba.height());
+            if w == 0 || h == 0 {
+                continue;
+            }
+            return Some(egui::IconData {
+                rgba: rgba.into_raw(),
+                width: w,
+                height: h,
+            });
+        }
+    }
+    None
 }
 
 fn ui_state_path() -> PathBuf {
@@ -3465,8 +3498,105 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
         .inner
 }
 
+/// 两个颜色按 t 插值（含 alpha），做悬停/选中的过渡
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let f = |x: u8, y: u8| -> u8 { (x as f32 + (y as f32 - x as f32) * t).round() as u8 };
+    egui::Color32::from_rgba_unmultiplied(
+        f(a.r(), b.r()),
+        f(a.g(), b.g()),
+        f(a.b(), b.b()),
+        f(a.a(), b.a()),
+    )
+}
+
+/// 导航行（驱动 App 那种）：圆角悬停底 + 选中时左侧强调条，悬停/选中都带过渡
+fn nav_row(ui: &mut egui::Ui, selected: bool, label: &str, weak: bool) -> egui::Response {
+    let height = 24.0;
+    let width = ui.available_width().max(40.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let hover = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.12);
+    let sel = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("sel"), selected, 0.16);
+    if sel > 0.01 {
+        ui.painter()
+            .rect_filled(rect, egui::Rounding::same(7.0), lerp_color(HOVER_FILL, ACCENT_SOFT, sel));
+    } else if hover > 0.01 {
+        ui.painter().rect_filled(
+            rect,
+            egui::Rounding::same(7.0),
+            lerp_color(egui::Color32::TRANSPARENT, HOVER_FILL, hover),
+        );
+    }
+    if sel > 0.01 {
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 3.0, rect.top() + 6.0),
+            egui::vec2(3.0, height - 12.0),
+        );
+        ui.painter().rect_filled(
+            bar,
+            egui::Rounding::same(2.0),
+            egui::Color32::from_rgba_unmultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), (255.0 * sel) as u8),
+        );
+    }
+    let base = if weak { TEXT_SECONDARY } else { TEXT_PRIMARY };
+    let color = lerp_color(base, ACCENT, sel * 0.85);
+    ui.painter().text(
+        egui::pos2(rect.left() + 13.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(12.5),
+        color,
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// 圆角胶囊（桌面筛选那种），选中 = 强调色浅底 + 强调色字
+fn chip(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
+    let font = egui::FontId::proportional(12.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font.clone(), egui::Color32::WHITE);
+    let pad = egui::vec2(10.0, 4.0);
+    let size = egui::vec2(galley.size().x + pad.x * 2.0, galley.size().y + pad.y * 2.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hover = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.12);
+    let sel = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("sel"), selected, 0.16);
+    let bg = if sel > 0.01 {
+        lerp_color(HOVER_FILL, ACCENT_SOFT, sel)
+    } else if hover > 0.01 {
+        lerp_color(egui::Color32::TRANSPARENT, HOVER_FILL, hover)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    if bg != egui::Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, egui::Rounding::same(999.0), bg);
+    }
+    let fg = lerp_color(TEXT_SECONDARY, ACCENT, sel);
+    ui.painter()
+        .text(rect.center(), egui::Align2::CENTER_CENTER, label, font, fg);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
 // ---- 面板配色（取值来自 DSH 界面取样）----
 pub(crate) const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4E, 0x8F, 0xA8);
+/// 强调色的淡底（导航选中、胶囊选中）
+pub(crate) const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(0xE9, 0xF2, 0xF6);
+/// 悬停底色
+pub(crate) const HOVER_FILL: egui::Color32 = egui::Color32::from_rgb(0xEF, 0xF1, 0xF4);
 pub(crate) const SURFACE: egui::Color32 = egui::Color32::WHITE;
 pub(crate) const BG_BASE: egui::Color32 = egui::Color32::from_rgb(0xFA, 0xFA, 0xFA);
 pub(crate) const BG_SIDEBAR: egui::Color32 = egui::Color32::from_rgb(0xF9, 0xFA, 0xFB);
@@ -3505,9 +3635,16 @@ fn apply_panel_theme(ctx: &egui::Context) {
     for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
         w.rounding = egui::Rounding::same(8.0);
     }
+    // 弹窗/菜单的柔和投影（驱动 App 那种轻微悬浮感）
+    v.popup_shadow = egui::epaint::Shadow {
+        offset: egui::vec2(0.0, 4.0),
+        blur: 16.0,
+        spread: 0.0,
+        color: egui::Color32::from_black_alpha(28),
+    };
     style.visuals = v;
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.button_padding = egui::vec2(11.0, 6.0);
     style.spacing.window_margin = egui::Margin::same(12.0);
     style.spacing.menu_margin = egui::Margin::same(8.0);
     style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(19.0));
