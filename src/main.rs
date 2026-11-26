@@ -1117,7 +1117,7 @@ struct TransGlassApp {
     card_rects: std::collections::HashMap<isize, egui::Rect>,
     ball_open: bool,
     ball_expanded: bool,
-    ball_size: f32,
+    ball_size: egui::Vec2,
     ball_pos: egui::Pos2,
     hover: Option<(isize, std::time::Instant)>,
     hover_seen: bool,
@@ -1202,7 +1202,7 @@ impl TransGlassApp {
             card_rects: std::collections::HashMap::new(),
             ball_open: true,
             ball_expanded: false,
-            ball_size: 68.0,
+            ball_size: egui::vec2(68.0, 68.0),
             ball_pos: egui::pos2(1540.0, 420.0),
             hover: None,
             hover_seen: false,
@@ -2078,20 +2078,24 @@ impl eframe::App for TransGlassApp {
         }
 
         // 3. UI 绘制 (更简洁现代的布局)
-        // 悬浮球：单击展开卫星小工具，再单击收起；双击打开主面板；可拖动
+        // 悬浮球：单击向左侧弹出小按钮（弧线排列），再单击收回；双击打开主界面
         if self.ball_open {
             let ball_id = egui::ViewportId::from_hash_of("tg_ball");
-            let want = if self.ball_expanded { 248.0 } else { 68.0 };
-            if (self.ball_size - want).abs() > 0.5 {
+            let want = if self.ball_expanded {
+                egui::vec2(230.0, 150.0)
+            } else {
+                egui::vec2(68.0, 68.0)
+            };
+            if (self.ball_size - want).length() > 0.5 {
                 let d = (want - self.ball_size) * 0.5;
-                self.ball_pos.x -= d;
-                self.ball_pos.y -= d;
+                self.ball_pos.x -= d.x;
+                self.ball_pos.y -= d.y;
                 self.ball_size = want;
-                ctx.send_viewport_cmd_to(ball_id, egui::ViewportCommand::InnerSize(egui::vec2(want, want)));
+                ctx.send_viewport_cmd_to(ball_id, egui::ViewportCommand::InnerSize(want));
                 ctx.send_viewport_cmd_to(ball_id, egui::ViewportCommand::OuterPosition(self.ball_pos));
             }
             let builder = egui::ViewportBuilder::default()
-                .with_inner_size([self.ball_size, self.ball_size])
+                .with_inner_size([self.ball_size.x, self.ball_size.y])
                 .with_position([self.ball_pos.x, self.ball_pos.y])
                 .with_decorations(false)
                 .with_always_on_top()
@@ -2107,49 +2111,71 @@ impl eframe::App for TransGlassApp {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none())
                     .show(ctx, |ui| {
-                        let side = ctx.screen_rect().size().x;
-                        let center = egui::pos2(side * 0.5, side * 0.5);
+                        let sz = ctx.screen_rect().size();
+                        // 球固定在右侧中部
+                        let ball_c = egui::pos2(sz.x - 34.0, sz.y * 0.5);
+                        let t = ui.ctx().animate_bool_with_time(
+                            egui::Id::new("tg_ball_arc"),
+                            expanded,
+                            0.14,
+                        );
                         let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(side, side),
+                            egui::vec2(sz.x, sz.y),
                             egui::Sense::click_and_drag(),
                         );
-                        let hover = resp.hovered();
-                        let base = if hover { 30.0 } else { 27.0 };
-                        ui.painter().circle_filled(center, base, ACCENT);
+                        let near_ball = (resp.hover_pos().unwrap_or(egui::pos2(-999.0, -999.0))
+                            - ball_c)
+                            .length()
+                            < 34.0;
+                        let base = if near_ball { 30.0 } else { 27.0 };
+                        ui.painter().circle_filled(ball_c, base, ACCENT);
                         ui.painter().text(
-                            center,
+                            ball_c,
                             egui::Align2::CENTER_CENTER,
-                            if expanded { "×" } else { "T" },
-                            egui::FontId::proportional(if expanded { 24.0 } else { 20.0 }),
+                            if t > 0.5 { "×" } else { "T" },
+                            egui::FontId::proportional(20.0),
                             egui::Color32::WHITE,
                         );
-                        if expanded {
-                            let r = side * 0.5 - 34.0;
-                            let items: [(f32, &str, u8); 4] = [
-                                (-2.356, "面板", 1),
-                                (-0.785, "小窗", 2),
-                                (0.785, "设置", 3),
-                                (2.356, "还原", 4),
-                            ];
-                            for (ang, label, code) in items {
-                                let p = center + egui::vec2(ang.cos() * r, ang.sin() * r);
-                                let rc = egui::Rect::from_center_size(p, egui::vec2(44.0, 44.0));
+                        if t > 0.02 {
+                            // 弹出面板底色（次级悬浮层，圆角），避免透明失效露出黑块
+                            let pr = egui::Rect::from_min_max(
+                                egui::pos2(1.0, 1.0),
+                                egui::pos2(sz.x - 1.0, sz.y - 1.0),
+                            );
+                            ui.painter().rect_filled(
+                                pr,
+                                14.0,
+                                egui::Color32::from_rgba_unmultiplied(0x1E, 0x23, 0x2E, (238.0 * t) as u8),
+                            );
+                            ui.painter().rect_stroke(
+                                pr,
+                                14.0,
+                                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0x35, 0x3C, 0x4A, (255.0 * t) as u8)),
+                            );
+                            let items: [(&str, u8); 3] =
+                                [("面板", 1), ("小窗", 2), ("还原", 4)];
+                            for (i, (label, code)) in items.iter().enumerate() {
+                                let ang = (152.0 + i as f32 * 32.0).to_radians();
+                                let radius = 40.0 + 52.0 * t;
+                                let p = ball_c + egui::vec2(ang.cos() * radius, ang.sin() * radius);
+                                let rc = egui::Rect::from_center_size(p, egui::vec2(36.0, 36.0));
                                 let r2 = ui.allocate_rect(rc, egui::Sense::click());
-                                let col = if r2.hovered() {
-                                    egui::Color32::from_rgb(0x2E, 0x5B, 0xC8)
+                                let hovered = r2.hovered();
+                                let col = if hovered {
+                                    egui::Color32::from_rgba_unmultiplied(0x2E, 0x5B, 0xC8, (235.0 * t) as u8)
                                 } else {
-                                    egui::Color32::from_rgb(0x41, 0x76, 0xE6)
+                                    egui::Color32::from_rgba_unmultiplied(0x41, 0x76, 0xE6, (200.0 * t) as u8)
                                 };
-                                ui.painter().circle_filled(p, 20.0, col);
+                                ui.painter().circle_filled(p, 17.0 * (0.6 + 0.4 * t), col);
                                 ui.painter().text(
                                     p,
                                     egui::Align2::CENTER_CENTER,
-                                    label,
-                                    egui::FontId::proportional(12.0),
-                                    egui::Color32::WHITE,
+                                    *label,
+                                    egui::FontId::proportional(11.0 * t.max(0.6)),
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, (240.0 * t) as u8),
                                 );
                                 if r2.clicked() {
-                                    action = code;
+                                    action = *code;
                                 }
                             }
                         }
@@ -2158,7 +2184,7 @@ impl eframe::App for TransGlassApp {
                         }
                         if resp.double_clicked() {
                             dbl_ball = true;
-                        } else if resp.clicked() {
+                        } else if resp.clicked() && near_ball {
                             click_ball = true;
                         }
                         if resp.secondary_clicked() {
@@ -2186,10 +2212,6 @@ impl eframe::App for TransGlassApp {
                 1 => unsafe { toggle_main_window() },
                 2 => {
                     self.mini_mode = true;
-                    hide_root_window();
-                }
-                3 => {
-                    self.settings_open = true;
                     unsafe {
                         let h = ROOT_HWND.load(Ordering::Relaxed);
                         if h != 0 {
@@ -2199,9 +2221,7 @@ impl eframe::App for TransGlassApp {
                         }
                     }
                 }
-                4 => unsafe {
-                    restore_all_windows();
-                },
+                4 => unsafe { restore_all_windows() },
                 _ => {}
             }
             if action != 0 {
