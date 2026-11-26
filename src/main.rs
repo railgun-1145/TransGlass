@@ -3945,8 +3945,11 @@ static BALL_REQ_RESTORE: AtomicBool = AtomicBool::new(false);
 
 const BALL_W: i32 = 250;
 const BALL_H: i32 = 170;
-const BALL_X: i32 = 1500;
-const BALL_Y: i32 = 380;
+static BALL_POS_X: AtomicI32 = AtomicI32::new(1500);
+static BALL_POS_Y: AtomicI32 = AtomicI32::new(380);
+static BALL_DRAGGING: AtomicBool = AtomicBool::new(false);
+static BALL_DOWN_POS: AtomicU64 = AtomicU64::new(0);
+static BALL_MOVED: AtomicBool = AtomicBool::new(false);
 
 fn ball_expand_target() -> bool {
     BALL_EXPANDED.load(Ordering::Relaxed)
@@ -4103,7 +4106,10 @@ unsafe fn ball_render() {
         }
     }
 
-    let pos = POINT { x: BALL_X, y: BALL_Y };
+    let pos = POINT {
+        x: BALL_POS_X.load(Ordering::Relaxed),
+        y: BALL_POS_Y.load(Ordering::Relaxed),
+    };
     let size = SIZE { cx: BALL_W, cy: BALL_H };
     let origin = POINT { x: 0, y: 0 };
     let blend = BLENDFUNCTION {
@@ -4228,8 +4234,8 @@ unsafe fn ball_spawn() {
         windows::core::PCWSTR(class_w.as_ptr()),
         windows::core::PCWSTR(name_w.as_ptr()),
         WS_POPUP,
-        BALL_X,
-        BALL_Y,
+        BALL_POS_X.load(Ordering::Relaxed),
+        BALL_POS_Y.load(Ordering::Relaxed),
         BALL_W,
         BALL_H,
         None,
