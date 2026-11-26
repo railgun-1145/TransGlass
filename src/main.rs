@@ -2126,11 +2126,8 @@ impl eframe::App for TransGlassApp {
                     unsafe { restore_all_windows() };
                     self.refresh_window_list(true);
                 }
-                let any_pass = GLOBAL_REGISTRY.iter().any(|kv| kv.value().mouse_passthrough && kv.value().pen_passthrough);
-                let mut pass_ui = any_pass;
-                if ui.checkbox(&mut pass_ui, "穿透").changed() {
-                    unsafe { set_all_passthrough(pass_ui) };
-                }
+                // 穿透是"每个窗口独立"的功能，放在窗口的右键菜单里（鼠标点透/笔点透），
+                // 全局开关没有意义，这里不再提供。
                 if ui.button("⚙ 设置").clicked() {
                     self.settings_open = true;
                 }
@@ -4105,12 +4102,14 @@ const MC_GROOVE: (u8, u8, u8) = (55, 55, 55);
 
 struct BallPanel {
     panel: (i32, i32, i32, i32),
+    /// 纸娃娃站立的深色底（MC 背包里放角色/物品的那块凹槽底）
+    stage: (i32, i32, i32, i32),
     buttons: [(i32, i32, i32, i32); 4],
     slider: (i32, i32, i32, i32),
 }
 
-/// 展开布局：左边竖着 4 个 MC 按钮（置顶 / 穿透 / 模式 / 还原），底部一条透明度滑条。
-/// t = 0..1 弹出动画，面板从右侧滑进来。
+/// 展开布局：左边竖着 4 个 MC 按钮（置顶 / 穿透 / 模式 / 还原），右边一块深色底站着纸娃娃，
+/// 底部一条透明度滑条。t = 0..1 弹出动画，面板从右侧滑进来。
 fn ball_panel(t: f32) -> BallPanel {
     let off = ((1.0 - t.clamp(0.0, 1.0)) * 22.0).round() as i32;
     let px0 = 24 + off;
@@ -4121,8 +4120,14 @@ fn ball_panel(t: f32) -> BallPanel {
     for (i, y) in [40i32, 72, 104, 136].iter().enumerate() {
         buttons[i] = (bx, *y, bx + bw, *y + 26);
     }
+    let stage = (px0 + 134, 30, px0 + 214, 192);
     let slider = (bx, 196, px0 + 206, 222);
-    BallPanel { panel, buttons, slider }
+    BallPanel {
+        panel,
+        stage,
+        buttons,
+        slider,
+    }
 }
 
 fn mc_fill(buf: &mut [u8], w: i32, h: i32, x0: i32, y0: i32, x1: i32, y1: i32, c: (u8, u8, u8)) {
@@ -4154,6 +4159,16 @@ fn draw_mc_panel(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32)) {
     mc_fill(buf, w, h, x0 + 2, y0 + 2, x0 + 3, y1 - 2, MC_WHITE);
     mc_fill(buf, w, h, x0 + 2, y1 - 3, x1 - 2, y1 - 2, MC_SHADOW);
     mc_fill(buf, w, h, x1 - 3, y0 + 2, x1 - 2, y1 - 2, MC_SHADOW);
+}
+
+/// 纸娃娃的深色底：MC 背包里那种凹进去的槽底（上/左更暗，下/右稍亮）
+fn draw_mc_stage(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32)) {
+    let (x0, y0, x1, y1) = r;
+    mc_fill(buf, w, h, x0, y0, x1, y1, (58, 58, 58));
+    mc_fill(buf, w, h, x0, y0, x1, y0 + 2, (34, 34, 34));
+    mc_fill(buf, w, h, x0, y0, x0 + 2, y1, (34, 34, 34));
+    mc_fill(buf, w, h, x0, y1 - 2, x1, y1, (96, 96, 96));
+    mc_fill(buf, w, h, x1 - 2, y0, x1, y1, (96, 96, 96));
 }
 
 fn draw_mc_button(
@@ -4426,11 +4441,12 @@ unsafe fn ball_render() {
     let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
     let (bx, by) = ball_center();
 
-    // 展开面板：MC 背包风格（4 个按钮 + 底部透明度条）
+    // 展开面板：MC 背包风格（深色底座 + 4 个按钮 + 底部透明度条）
     if t > 0.02 {
         let p = ball_panel(t);
         let hover = BALL_HOVER.load(Ordering::Relaxed);
         draw_mc_panel(buf, w, h, p.panel);
+        draw_mc_stage(buf, w, h, p.stage);
         for (i, r) in p.buttons.iter().enumerate() {
             draw_mc_button(buf, w, h, *r, hover == (i as u8 + 1), false);
         }
@@ -4807,27 +4823,6 @@ unsafe fn purge_shell_managed() {
             restore_window(HWND(k as *mut _));
         }
     }
-}
-
-/// 一键开/关所有已管理窗口的鼠标+笔穿透
-unsafe fn set_all_passthrough(on: bool) {
-    let keys: Vec<isize> = GLOBAL_REGISTRY.iter().map(|kv| *kv.key()).collect();
-    for k in keys {
-        let hwnd = HWND(k as *mut _);
-        let values = {
-            let mut out = None;
-            if let Some(mut st) = GLOBAL_REGISTRY.get_mut(&k) {
-                st.mouse_passthrough = on;
-                st.pen_passthrough = on;
-                out = Some((st.current_alpha, st.user_pref_topmost));
-            }
-            out
-        };
-        if let Some((alpha, top)) = values {
-            let _ = apply_transparency_to_hwnd(hwnd, alpha, top, on, on);
-        }
-    }
-    request_ui_repaint();
 }
 
 #[derive(Clone, Copy)]
