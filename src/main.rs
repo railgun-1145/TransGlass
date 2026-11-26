@@ -3991,7 +3991,7 @@ unsafe fn ball_satellites(t: f32) -> [(i32, i32); 6] {
 
 unsafe fn ball_render() {
     use windows::Win32::Graphics::Gdi::{
-        CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC, DeleteObject,
+        CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, PS_SOLID,
         DrawTextW, Ellipse, GetDC, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
         BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BI_RGB, DIB_RGB_COLORS, HGDIOBJ, TRANSPARENT,
     };
@@ -4029,7 +4029,10 @@ unsafe fn ball_render() {
     let accent = CreateSolidBrush(COLORREF(0x00E6_7641));
     let (bx, by) = ball_center();
     let (bx, by) = (bx * ss, by * ss);
+    let white_pen = CreatePen(PS_SOLID, 2 * ss, COLORREF(0x00FF_FFFF));
+    let border_pen = CreatePen(PS_SOLID, 1 * ss, COLORREF(0x00DB_D5D1));
     let _ = SelectObject(mem_big, HGDIOBJ(accent.0));
+    let _ = SelectObject(mem_big, HGDIOBJ(white_pen.0));
     let br = 27 * ss;
     let _ = Ellipse(mem_big, bx - br, by - br, bx + br, by + br);
     let _ = SetBkMode(mem_big, TRANSPARENT);
@@ -4048,17 +4051,34 @@ unsafe fn ball_render() {
     if t > 0.02 {
         let sats = ball_satellites(t);
         let labels = ["透-", "透+", "置顶", "穿透", "模式", "还原"];
+        let white_brush = CreateSolidBrush(COLORREF(0x00FF_FFFF));
+        let sat_font = CreateFontW(
+            12 * ss, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 0, 0,
+            windows::core::w!("Microsoft YaHei"),
+        );
+        let sat_old = SelectObject(mem_big, HGDIOBJ(sat_font.0));
+        let _ = SetTextColor(mem_big, COLORREF(0x00E6_7641));
         for (i, (sx, sy)) in sats.iter().enumerate() {
             let r = (17.0 * (0.6 + 0.4 * t)) as i32 * ss;
             let (sx, sy) = (sx * ss, sy * ss);
-            let _ = SelectObject(mem_big, HGDIOBJ(accent.0));
+            let _ = SelectObject(mem_big, HGDIOBJ(white_brush.0));
+            let _ = SelectObject(mem_big, HGDIOBJ(border_pen.0));
             let _ = Ellipse(mem_big, sx - r, sy - r, sx + r, sy + r);
             let mut txt: Vec<u16> = labels[i].encode_utf16().collect();
-            let mut tr = RECT { left: sx - 22 * ss, top: sy - 9 * ss, right: sx + 22 * ss, bottom: sy + 12 * ss };
+            let mut tr = RECT { left: sx - r, top: sy - r, right: sx + r, bottom: sy + r };
             let _ = SetBkMode(mem_big, TRANSPARENT);
-
-            let _ = DrawTextW(mem_big, &mut txt, &mut tr, windows::Win32::Graphics::Gdi::DT_CENTER);
+            let _ = DrawTextW(
+                mem_big,
+                &mut txt,
+                &mut tr,
+                windows::Win32::Graphics::Gdi::DT_CENTER
+                    | windows::Win32::Graphics::Gdi::DT_VCENTER
+                    | windows::Win32::Graphics::Gdi::DT_SINGLELINE,
+            );
         }
+        SelectObject(mem_big, sat_old);
+        let _ = DeleteObject(HGDIOBJ(sat_font.0));
+        let _ = DeleteObject(HGDIOBJ(white_brush.0));
     }
 
     // 下采样到最终尺寸（洋红=透明），预乘 alpha
