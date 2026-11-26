@@ -2090,156 +2090,6 @@ impl eframe::App for TransGlassApp {
         }
 
         // 3. UI 绘制 (更简洁现代的布局)
-        // 悬浮球：单击向左侧弹出小按钮（弧线排列），再单击收回；双击打开主界面
-        if self.ball_open {
-            let ball_id = egui::ViewportId::from_hash_of("tg_ball");
-            let want = if self.ball_expanded {
-                egui::vec2(230.0, 150.0)
-            } else {
-                egui::vec2(68.0, 68.0)
-            };
-            if (self.ball_size - want).length() > 0.5 {
-                let d = (want - self.ball_size) * 0.5;
-                self.ball_pos.x -= d.x;
-                self.ball_pos.y -= d.y;
-                self.ball_size = want;
-                ctx.send_viewport_cmd_to(ball_id, egui::ViewportCommand::InnerSize(want));
-                ctx.send_viewport_cmd_to(ball_id, egui::ViewportCommand::OuterPosition(self.ball_pos));
-            }
-            let builder = egui::ViewportBuilder::default()
-                .with_inner_size([self.ball_size.x, self.ball_size.y])
-                .with_position([self.ball_pos.x, self.ball_pos.y])
-                .with_decorations(false)
-                .with_always_on_top()
-                .with_resizable(false)
-                .with_transparent(true);
-            let mut click_ball = false;
-            let mut dbl_ball = false;
-            let mut drag_ball = false;
-            let mut hide_ball = false;
-            let mut action: u8 = 0;
-            let expanded = self.ball_expanded;
-            ctx.show_viewport_immediate(ball_id, builder, |ctx, _class| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::none())
-                    .show(ctx, |ui| {
-                        let sz = ctx.screen_rect().size();
-                        // 球固定在右侧中部
-                        let ball_c = egui::pos2(sz.x - 34.0, sz.y * 0.5);
-                        let t = ui.ctx().animate_bool_with_time(
-                            egui::Id::new("tg_ball_arc"),
-                            expanded,
-                            0.14,
-                        );
-                        let (rect, resp) = ui.allocate_exact_size(
-                            egui::vec2(sz.x, sz.y),
-                            egui::Sense::click_and_drag(),
-                        );
-                        let near_ball = (resp.hover_pos().unwrap_or(egui::pos2(-999.0, -999.0))
-                            - ball_c)
-                            .length()
-                            < 34.0;
-                        let base = if near_ball { 30.0 } else { 27.0 };
-                        ui.painter().circle_filled(ball_c, base, ACCENT);
-                        ui.painter().text(
-                            ball_c,
-                            egui::Align2::CENTER_CENTER,
-                            if t > 0.5 { "×" } else { "T" },
-                            egui::FontId::proportional(20.0),
-                            egui::Color32::WHITE,
-                        );
-                        if t > 0.02 {
-                            // 弹出面板底色（次级悬浮层，圆角），避免透明失效露出黑块
-                            let pr = egui::Rect::from_min_max(
-                                egui::pos2(1.0, 1.0),
-                                egui::pos2(sz.x - 1.0, sz.y - 1.0),
-                            );
-                            ui.painter().rect_filled(
-                                pr,
-                                14.0,
-                                egui::Color32::from_rgba_unmultiplied(0x1E, 0x23, 0x2E, (238.0 * t) as u8),
-                            );
-                            ui.painter().rect_stroke(
-                                pr,
-                                14.0,
-                                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0x35, 0x3C, 0x4A, (255.0 * t) as u8)),
-                            );
-                            let items: [(&str, u8); 3] =
-                                [("面板", 1), ("小窗", 2), ("还原", 4)];
-                            for (i, (label, code)) in items.iter().enumerate() {
-                                let ang = (152.0 + i as f32 * 32.0).to_radians();
-                                let radius = 40.0 + 52.0 * t;
-                                let p = ball_c + egui::vec2(ang.cos() * radius, ang.sin() * radius);
-                                let rc = egui::Rect::from_center_size(p, egui::vec2(36.0, 36.0));
-                                let r2 = ui.allocate_rect(rc, egui::Sense::click());
-                                let hovered = r2.hovered();
-                                let col = if hovered {
-                                    egui::Color32::from_rgba_unmultiplied(0x2E, 0x5B, 0xC8, (235.0 * t) as u8)
-                                } else {
-                                    egui::Color32::from_rgba_unmultiplied(0x41, 0x76, 0xE6, (200.0 * t) as u8)
-                                };
-                                ui.painter().circle_filled(p, 17.0 * (0.6 + 0.4 * t), col);
-                                ui.painter().text(
-                                    p,
-                                    egui::Align2::CENTER_CENTER,
-                                    *label,
-                                    egui::FontId::proportional(11.0 * t.max(0.6)),
-                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, (240.0 * t) as u8),
-                                );
-                                if r2.clicked() {
-                                    action = *code;
-                                }
-                            }
-                        }
-                        if resp.dragged() {
-                            drag_ball = true;
-                        }
-                        if resp.double_clicked() {
-                            dbl_ball = true;
-                        } else if resp.clicked() && near_ball {
-                            click_ball = true;
-                        }
-                        if resp.secondary_clicked() {
-                            hide_ball = true;
-                        }
-                        let _ = rect;
-                    });
-            });
-            if drag_ball {
-                if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
-                    self.ball_pos = outer.min;
-                }
-            }
-            if click_ball {
-                self.ball_expanded = !self.ball_expanded;
-            }
-            if dbl_ball {
-                self.ball_expanded = false;
-                unsafe { toggle_main_window() };
-            }
-            if hide_ball {
-                self.ball_open = false;
-            }
-            match action {
-                1 => unsafe { toggle_main_window() },
-                2 => {
-                    self.mini_mode = true;
-                    unsafe {
-                        let h = ROOT_HWND.load(Ordering::Relaxed);
-                        if h != 0 {
-                            let _ = ShowWindow(HWND(h as *mut _), SW_SHOW);
-                            let _ = SetForegroundWindow(HWND(h as *mut _));
-                            WINDOW_VISIBLE.store(true, Ordering::Relaxed);
-                        }
-                    }
-                }
-                4 => unsafe { restore_all_windows() },
-                _ => {}
-            }
-            if action != 0 {
-                self.ball_expanded = false;
-            }
-        }
         // 3. 大界面：左侧导航（桌面分组 + 窗口），右侧详情
         self.refresh_window_list(false);
 
@@ -2800,12 +2650,7 @@ fn main() -> Result<(), eframe::Error> {
     let _single_instance = unsafe { acquire_single_instance() };
     PERF_ON.store(std::env::var_os("TRANSGLASS_DEBUG_PERF").is_some(), Ordering::Relaxed);
     spawn_quit_listener();
-    if std::env::var_os("TRANSGLASS_BALLTEST").is_some() {
-        unsafe {
-            let _ = balltest_create();
-            balltest_draw();
-        }
-    }
+    unsafe { ball_spawn() };
     unsafe { purge_shell_managed() };
     spawn_device_tracking_ticker();
 
@@ -4083,85 +3928,59 @@ unsafe fn toggle_main_window() {
 }
 
 // ---- 悬浮球试验窗口：Win32 分层窗口 + UpdateLayeredWindow（逐像素透明） ----
-static BALLTEST: AtomicIsize = AtomicIsize::new(0);
+// ---- 悬浮球：Win32 分层窗口（ARGB 逐像素透明）+ 自带点击处理 ----
+static BALL_HWND: AtomicIsize = AtomicIsize::new(0);
+static BALL_EXPANDED: AtomicBool = AtomicBool::new(false);
+static BALL_ANIM: AtomicU32 = AtomicU32::new(0); // f32 bits，0..1 弹出动画
+static BALL_REQ_PANEL: AtomicBool = AtomicBool::new(false);
+static BALL_REQ_MINI: AtomicBool = AtomicBool::new(false);
+static BALL_REQ_RESTORE: AtomicBool = AtomicBool::new(false);
 
-unsafe extern "system" fn balltest_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    DefWindowProcW(hwnd, msg, w, l)
+const BALL_W: i32 = 250;
+const BALL_H: i32 = 170;
+const BALL_X: i32 = 1500;
+const BALL_Y: i32 = 380;
+
+fn ball_expand_target() -> bool {
+    BALL_EXPANDED.load(Ordering::Relaxed)
 }
 
-unsafe fn balltest_create() -> HWND {
-    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    let hinst = match GetModuleHandleW(None) {
-        Ok(h) => h,
-        Err(_) => {
-            log_hilite("GetModuleHandle failed");
-            return HWND::default();
-        }
-    };
-    let class_w: Vec<u16> = "TransGlassBall"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let name_w: Vec<u16> = "TransGlass Ball".encode_utf16().chain(std::iter::once(0)).collect();
-    let wc = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc: Some(balltest_proc),
-        hInstance: windows::Win32::Foundation::HINSTANCE(hinst.0),
-        lpszClassName: windows::core::PCWSTR(class_w.as_ptr()),
-        ..Default::default()
-    };
-    let atom = RegisterClassW(&wc);
-    if atom == 0 {
-        log_hilite(&format!(
-            "RegisterClass failed err={}",
-            windows::Win32::Foundation::GetLastError().0
-        ));
+unsafe fn ball_center() -> (i32, i32) {
+    (BALL_W - 42, BALL_H / 2)
+}
+
+unsafe fn ball_satellites(t: f32) -> [(i32, i32); 3] {
+    let (bx, by) = ball_center();
+    let mut out = [(0, 0); 3];
+    let angles = [150.0f32, 180.0, 210.0];
+    for (i, a) in angles.iter().enumerate() {
+        let rad = a.to_radians();
+        let r = 42.0 + 54.0 * t;
+        out[i] = (
+            bx + (rad.cos() * r) as i32,
+            by + (rad.sin() * r) as i32,
+        );
     }
-    let hwnd = match CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-        windows::core::PCWSTR(class_w.as_ptr()),
-        windows::core::PCWSTR(name_w.as_ptr()),
-        WS_POPUP,
-        1500,
-        380,
-        240,
-        160,
-        None,
-        None,
-        windows::Win32::Foundation::HINSTANCE(hinst.0),
-        None,
-    ) {
-        Ok(h) => h,
-        Err(e) => {
-            log_hilite(&format!(
-                "CreateWindowEx failed {e} err={}",
-                windows::Win32::Foundation::GetLastError().0
-            ));
-            return HWND::default();
-        }
-    };
-    BALLTEST.store(hwnd.0 as isize, Ordering::Relaxed);
-    hwnd
+    out
 }
 
-unsafe fn balltest_draw() {
+unsafe fn ball_render() {
     use windows::Win32::Graphics::Gdi::{
-        CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC, DeleteObject, Ellipse,
-        GetDC, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
-        BLENDFUNCTION, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+        CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC, DeleteObject,
+        DrawTextW, Ellipse, GetDC, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+        BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BI_RGB, DIB_RGB_COLORS,
+        HGDIOBJ, TRANSPARENT,
     };
-    let hwnd = BALLTEST.load(Ordering::Relaxed);
+    let hwnd = BALL_HWND.load(Ordering::Relaxed);
     if hwnd == 0 {
         return;
     }
-    let w = 240i32;
-    let h = 160i32;
     let screen = GetDC(HWND::default());
     let mem = CreateCompatibleDC(screen);
     let mut bi: BITMAPINFO = std::mem::zeroed();
     bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biWidth = BALL_W;
+    bi.bmiHeader.biHeight = -BALL_H;
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB.0;
@@ -4175,21 +3994,67 @@ unsafe fn balltest_draw() {
         }
     };
     let old = SelectObject(mem, HGDIOBJ(dib.0));
-    let brush = CreateSolidBrush(COLORREF(0x00E6_7641));
-    let ball = CreateSolidBrush(COLORREF(0x00E6_7641));
-    let circles: [(i32, i32, i32); 4] = [
-        (206, 80, 27),
-        (143, 113, 17),
-        (134, 80, 17),
-        (143, 47, 17),
-    ];
-    for (cx, cy, r) in circles {
-        let b = if r > 20 { ball } else { brush };
-        let _ = SelectObject(mem, HGDIOBJ(b.0));
-        let _ = Ellipse(mem, cx - r, cy - r, cx + r, cy + r);
+    // 用洋红做透明键色填充，之后凡是这个颜色的像素 alpha=0
+    let magenta = CreateSolidBrush(COLORREF(0x00FF_00FF));
+    let full = RECT { left: 0, top: 0, right: BALL_W, bottom: BALL_H };
+    let _ = windows::Win32::Graphics::Gdi::FillRect(mem, &full, magenta);
+
+    let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
+    let accent = CreateSolidBrush(COLORREF(0x00E6_7641));
+    let (bx, by) = ball_center();
+    let _ = SelectObject(mem, HGDIOBJ(accent.0));
+    let br = 27;
+    let _ = Ellipse(mem, bx - br, by - br, bx + br, by + br);
+    let _ = SetBkMode(mem, TRANSPARENT);
+    let _ = SetTextColor(mem, COLORREF(0x00FF_FFFF));
+    let font = CreateFontW(
+        20, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0,
+        windows::core::w!("Microsoft YaHei"),
+    );
+    let old_font = SelectObject(mem, HGDIOBJ(font.0));
+    let mut label: Vec<u16> = if t > 0.5 { "×" } else { "T" }
+        .encode_utf16()
+        .collect();
+    let mut lr = RECT { left: bx - 14, top: by - 12, right: bx + 34, bottom: by + 20 };
+    let _ = DrawTextW(mem, &mut label, &mut lr, windows::Win32::Graphics::Gdi::DT_LEFT);
+
+    if t > 0.02 {
+        let sats = ball_satellites(t);
+        let labels = ["面板", "小窗", "还原"];
+        for (i, (sx, sy)) in sats.iter().enumerate() {
+            let r = (17.0 * (0.6 + 0.4 * t)) as i32;
+            let _ = SelectObject(mem, HGDIOBJ(accent.0));
+            let _ = Ellipse(mem, sx - r, sy - r, sx + r, sy + r);
+            let mut txt: Vec<u16> = labels[i].encode_utf16().collect();
+            let mut tr = RECT {
+                left: sx - 22,
+                top: sy - 9,
+                right: sx + 22,
+                bottom: sy + 12,
+            };
+            let _ = DrawTextW(mem, &mut txt, &mut tr, windows::Win32::Graphics::Gdi::DT_CENTER);
+        }
     }
-    let pos = POINT { x: 1500, y: 380 };
-    let size = SIZE { cx: w, cy: h };
+
+    // 后处理：洋红→全透明，其它→不透明
+    let n = (BALL_W * BALL_H) as usize;
+    let buf = std::slice::from_raw_parts_mut(bits as *mut u8, n * 4);
+    for i in 0..n {
+        let o = i * 4;
+        let (b, g, r) = (buf[o], buf[o + 1], buf[o + 2]);
+        if r == 0xFF && g == 0x00 && b == 0xFF {
+            // 透明像素必须预乘为全 0，否则 ULW 会当成不透明画出来
+            buf[o] = 0;
+            buf[o + 1] = 0;
+            buf[o + 2] = 0;
+            buf[o + 3] = 0;
+        } else {
+            buf[o + 3] = 0xFF;
+        }
+    }
+
+    let pos = POINT { x: BALL_X, y: BALL_Y };
+    let size = SIZE { cx: BALL_W, cy: BALL_H };
     let src = POINT { x: 0, y: 0 };
     let blend = BLENDFUNCTION {
         BlendOp: 0,
@@ -4197,7 +4062,7 @@ unsafe fn balltest_draw() {
         SourceConstantAlpha: 255,
         AlphaFormat: 1,
     };
-    let ok = windows::Win32::UI::WindowsAndMessaging::UpdateLayeredWindow(
+    let _ = UpdateLayeredWindow(
         HWND(hwnd as *mut _),
         screen,
         Some(&pos),
@@ -4208,33 +4073,127 @@ unsafe fn balltest_draw() {
         Some(&blend),
         windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
     );
-    if ok.is_err() {
-        log_hilite(&format!(
-            "UpdateLayeredWindow failed err={}",
-            windows::Win32::Foundation::GetLastError().0
-        ));
-    } else {
-        log_hilite("balltest drawn ok");
-    }
+
+    SelectObject(mem, old_font);
     SelectObject(mem, old);
+    let _ = DeleteObject(HGDIOBJ(font.0));
+    let _ = DeleteObject(HGDIOBJ(accent.0));
+    let _ = DeleteObject(HGDIOBJ(magenta.0));
     let _ = DeleteObject(HGDIOBJ(dib.0));
-    let _ = DeleteObject(HGDIOBJ(brush.0));
-    let _ = DeleteObject(HGDIOBJ(ball.0));
     let _ = DeleteDC(mem);
     ReleaseDC(HWND::default(), screen);
 }
 
-/// 把误纳入管理的系统/托盘浮层窗口还原（例如任务栏图标溢出面板被加了图层导致重影）
+unsafe fn ball_hit(x: i32, y: i32) -> u8 {
+    let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
+    let (bx, by) = ball_center();
+    if ((x - bx).pow(2) + (y - by).pow(2)) <= 30 * 30 {
+        return 9; // 球本身
+    }
+    if t > 0.5 {
+        for (i, (sx, sy)) in ball_satellites(t).iter().enumerate() {
+            if ((x - sx).pow(2) + (y - sy).pow(2)) <= 20 * 20 {
+                return (i + 1) as u8;
+            }
+        }
+    }
+    0
+}
+
+unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    match msg {
+        WM_LBUTTONUP => {
+            let x = (l.0 & 0xFFFF) as i32;
+            let y = ((l.0 >> 16) & 0xFFFF) as i32;
+            match ball_hit(x, y) {
+                9 => {
+                    let target = !ball_expand_target();
+                    BALL_EXPANDED.store(target, Ordering::Relaxed);
+                    let steps = 6;
+                    for i in 0..=steps {
+                        let v = i as f32 / steps as f32;
+                        let t = if target { v } else { 1.0 - v };
+                        BALL_ANIM.store(t.to_bits(), Ordering::Relaxed);
+                        ball_render();
+                        std::thread::sleep(std::time::Duration::from_millis(14));
+                    }
+                }
+                1 => {
+                    BALL_REQ_PANEL.store(true, Ordering::Relaxed);
+                    BALL_EXPANDED.store(false, Ordering::Relaxed);
+                    BALL_ANIM.store(0f32.to_bits(), Ordering::Relaxed);
+                    ball_render();
+                }
+                2 => {
+                    BALL_REQ_MINI.store(true, Ordering::Relaxed);
+                    BALL_EXPANDED.store(false, Ordering::Relaxed);
+                    BALL_ANIM.store(0f32.to_bits(), Ordering::Relaxed);
+                    ball_render();
+                }
+                3 => {
+                    BALL_REQ_RESTORE.store(true, Ordering::Relaxed);
+                    BALL_EXPANDED.store(false, Ordering::Relaxed);
+                    BALL_ANIM.store(0f32.to_bits(), Ordering::Relaxed);
+                    ball_render();
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, w, l),
+    }
+}
+
+unsafe fn ball_spawn() {
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    if BALL_HWND.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let hinst = match GetModuleHandleW(None) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let class_w: Vec<u16> = "TransGlassBall2".encode_utf16().chain(std::iter::once(0)).collect();
+    let name_w: Vec<u16> = "TransGlass".encode_utf16().chain(std::iter::once(0)).collect();
+    let wc = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(ball_proc),
+        hInstance: windows::Win32::Foundation::HINSTANCE(hinst.0),
+        lpszClassName: windows::core::PCWSTR(class_w.as_ptr()),
+        ..Default::default()
+    };
+    let _ = RegisterClassW(&wc);
+    let hwnd = match CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        windows::core::PCWSTR(class_w.as_ptr()),
+        windows::core::PCWSTR(name_w.as_ptr()),
+        WS_POPUP,
+        BALL_X,
+        BALL_Y,
+        BALL_W,
+        BALL_H,
+        None,
+        None,
+        windows::Win32::Foundation::HINSTANCE(hinst.0),
+        None,
+    ) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let _ = ShowWindow(hwnd, SW_SHOWNA);
+    BALL_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+    ball_render();
+}
+
 unsafe fn purge_shell_managed() {
     let keys: Vec<isize> = GLOBAL_REGISTRY.iter().map(|kv| *kv.key()).collect();
-    let mut fixed = 0;
     for k in keys {
         if is_shell_hwnd(HWND(k as *mut _)) {
             restore_window(HWND(k as *mut _));
-            fixed += 1;
         }
-    }
-    if fixed > 0 {
-        push_issue(format!("已自动还原 {fixed} 个被误管理的系统窗口"));
     }
 }
