@@ -1080,6 +1080,9 @@ struct TransGlassApp {
     thumbs: std::collections::HashMap<isize, (egui::TextureHandle, std::time::Instant)>,
     wins_at: Option<std::time::Instant>,
     selected: Option<isize>,
+    settings_open: bool,
+    mini_mode: bool,
+    last_mini: bool,
     issues_ver: u32,
     issues_cache: Vec<String>,
     overview_ver: u32,
@@ -1153,6 +1156,9 @@ impl TransGlassApp {
             thumbs: std::collections::HashMap::new(),
             wins_at: None,
             selected: None,
+            settings_open: false,
+            mini_mode: false,
+            last_mini: false,
             issues_ver: u32::MAX,
             issues_cache: Vec::new(),
             overview_ver: u32::MAX,
@@ -1357,7 +1363,7 @@ impl TransGlassApp {
         let managed = GLOBAL_REGISTRY
             .get(&hwnd)
             .map(|s| (s.current_alpha, s.user_pref_topmost, s.mouse_passthrough, s.pen_passthrough));
-        let card_w = 232.0;
+        let card_w = if self.mini_mode { 172.0 } else { 232.0 };
         ui.allocate_ui_with_layout(
             egui::vec2(card_w, 208.0),
             egui::Layout::top_down(egui::Align::Min),
@@ -1368,7 +1374,7 @@ impl TransGlassApp {
                     .rounding(egui::Rounding::same(12.0))
                     .inner_margin(egui::Margin::same(8.0))
                     .show(ui, |ui| {
-                        let img_size = egui::vec2(card_w - 18.0, 118.0);
+                        let img_size = egui::vec2(card_w - 18.0, if self.mini_mode { 96.0 } else { 118.0 });
                         match self.thumbnail(ui.ctx(), hwnd) {
                             Some(tex) => {
                                 let resp = ui.add(
@@ -1715,6 +1721,7 @@ impl eframe::App for TransGlassApp {
         // 3. 大界面：左侧导航（桌面分组 + 窗口），右侧详情
         self.refresh_window_list(false);
 
+        if !self.mini_mode {
         egui::TopBottomPanel::bottom("actions_bar").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -1722,33 +1729,15 @@ impl eframe::App for TransGlassApp {
                     unsafe { restore_all_windows() };
                     self.refresh_window_list(true);
                 }
-                if ui.button("🛠 快捷键").clicked() {
-                    self.open_hotkey_editor();
+                if ui.button("⚙ 设置").clicked() {
+                    self.settings_open = true;
                 }
-                if ui.button("🧪 自检").clicked() {
-                    let _ = selftest::run_hosted();
-                    self.selftest_text = selftest::last_report();
-                    self.selftest_open = true;
+                if ui
+                    .button(if self.mini_mode { "▣ 返回大界面" } else { "▤ 小窗模式" })
+                    .clicked()
+                {
+                    self.mini_mode = !self.mini_mode;
                 }
-                let busy = UPDATE_RUNNING.load(Ordering::Relaxed);
-                let label = if busy { "检查中…" } else { "🚀 检查更新" };
-                if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
-                    thread::spawn(|| {
-                        let _ = run_self_update();
-                    });
-                }
-                if busy {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(400));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut priority = self.hotkey_priority_ui;
-                    if ui.checkbox(&mut priority, "快捷键优先").changed() {
-                        self.hotkey_priority_ui = priority;
-                        if let Err(e) = save_priority_flag(priority) {
-                            push_issue(format!("保存快捷键优先设置失败: {e}"));
-                        }
-                    }
-                });
             });
             if let Ok(msg) = UPDATE_MSG.read() {
                 if let Some(msg) = msg.as_ref() {
@@ -1817,6 +1806,26 @@ impl eframe::App for TransGlassApp {
                 self.nav_windows(ui);
             });
 
+        }
+
+        // 小窗模式：切换窗口尺寸与置顶
+        if self.mini_mode != self.last_mini {
+            self.last_mini = self.mini_mode;
+            if self.mini_mode {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(400.0, 560.0)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                    egui::WindowLevel::AlwaysOnTop,
+                ));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1000.0, 700.0)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.always_on_top {
+                    egui::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::WindowLevel::Normal
+                }));
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(10.0);
             let issues = snapshot_issues();
@@ -1846,6 +1855,81 @@ impl eframe::App for TransGlassApp {
             self.detail_pane(ui);
         });
 
+        if self.settings_open {
+            let mut open = self.settings_open;
+            egui::Window::new("设置")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_width(440.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.label(egui::RichText::new("快捷键").strong().color(TEXT_SECONDARY));
+                        let mut priority = self.hotkey_priority_ui;
+                        if ui
+                            .checkbox(&mut priority, "快捷键优先（被占用时强制生效）")
+                            .changed()
+                        {
+                            self.hotkey_priority_ui = priority;
+                            if let Err(e) = save_priority_flag(priority) {
+                                push_issue(format!("保存快捷键优先设置失败: {e}"));
+                            }
+                        }
+                        if ui.button("打开快捷键编辑器…").clicked() {
+                            self.open_hotkey_editor();
+                        }
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("输入").strong().color(TEXT_SECONDARY));
+                        if ui
+                            .button(format!("输入模式：{}（点击切换）", input_mode_label()))
+                            .clicked()
+                        {
+                            cycle_input_mode();
+                        }
+                        ui.label(
+                            egui::RichText::new("WinTab 驱动（Wacom/Huion 默认模式）的笔建议用「强制笔」。")
+                                .small()
+                                .weak(),
+                        );
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("窗口").strong().color(TEXT_SECONDARY));
+                        let mut mini = self.mini_mode;
+                        if ui
+                            .checkbox(&mut mini, "实时小窗（只显示缩略图网格，可随时切回大界面）")
+                            .changed()
+                        {
+                            self.mini_mode = mini;
+                        }
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("维护").strong().color(TEXT_SECONDARY));
+                        if ui.button("运行自检").clicked() {
+                            let _ = selftest::run_hosted();
+                            self.selftest_text = selftest::last_report();
+                            self.selftest_open = true;
+                        }
+                        let busy = UPDATE_RUNNING.load(Ordering::Relaxed);
+                        if ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(if busy { "检查中…" } else { "检查更新" }),
+                            )
+                            .clicked()
+                        {
+                            thread::spawn(|| {
+                                let _ = run_self_update();
+                            });
+                        }
+                        if ui.button("打开配置目录").clicked() {
+                            if let Some(dir) = get_config_path().parent() {
+                                let _ = std::process::Command::new("explorer")
+                                    .arg(dir.as_os_str())
+                                    .spawn();
+                            }
+                        }
+                    });
+                });
+            self.settings_open = open;
+        }
         if self.selftest_open {
             let mut open = self.selftest_open;
             egui::Window::new("自检报告")
