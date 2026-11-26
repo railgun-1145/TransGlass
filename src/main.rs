@@ -2315,6 +2315,25 @@ impl eframe::App for TransGlassApp {
                         );
                         ui.add_space(12.0);
                         ui.label(egui::RichText::new("窗口").strong().color(TEXT_SECONDARY));
+                        let mut choose_skin = self.ui_state.skin.clone();
+                        let skins = list_skins();
+                        egui::ComboBox::from_label("皮肤")
+                            .selected_text(choose_skin.clone().unwrap_or_else(|| "skin.png".into()))
+                            .show_ui(ui, |ui| {
+                                for name in &skins {
+                                    let selected = choose_skin.as_deref() == Some(name.as_str());
+                                    if ui.selectable_label(selected, name).clicked() {
+                                        choose_skin = Some(name.clone());
+                                    }
+                                }
+                            });
+                        if choose_skin != self.ui_state.skin {
+                            self.ui_state.skin = choose_skin.clone();
+                            save_ui_state(&self.ui_state);
+                            load_ball_skin(choose_skin.as_deref());
+                            unsafe { ball_render() };
+                        }
+                        ui.add_space(6.0);
                         let mut bsc = f32::from_bits(BALL_SCALE.load(Ordering::Relaxed));
                         if bsc <= 0.1 {
                             bsc = 2.1;
@@ -2703,7 +2722,7 @@ fn main() -> Result<(), eframe::Error> {
     PERF_ON.store(std::env::var_os("TRANSGLASS_DEBUG_PERF").is_some(), Ordering::Relaxed);
     spawn_quit_listener();
     load_ball_tex();
-    load_ball_skin();
+    load_ball_skin(load_ui_state().skin.as_deref());
     if let Some(sc) = load_ui_state().ball_scale {
         BALL_SCALE.store(sc.to_bits(), Ordering::Relaxed);
     }
@@ -3064,6 +3083,7 @@ struct UiState {
     /// 预览帧率（0 = 关闭）
     preview_fps: Option<u32>,
     ball_scale: Option<f32>,
+    skin: Option<String>,
     view_mode: Option<u8>,
     /// 兼容旧配置
     preview_rate: Option<u8>,
@@ -4118,7 +4138,8 @@ unsafe fn ball_render() {
     }
 
     // 中间方块：MC 纸娃娃（基岩版风格，正面 UV 拼装）
-    if let Some(skin) = BALL_SKIN.get() {
+    let skin_guard = BALL_SKIN.read().ok();
+    if let Some(skin) = skin_guard.as_ref().and_then(|g| g.as_ref()) {
         let stored = f32::from_bits(BALL_SCALE.load(Ordering::Relaxed));
         let unit = if stored > 0.1 { stored } else { 2.1 };
         // 鼠标追踪：头/身体朝光标方向轻微偏移
@@ -4132,7 +4153,14 @@ unsafe fn ball_render() {
             gx = ((cp.x as f32 - cx) / 45.0).clamp(-2.0, 2.0);
             gy = ((cp.y as f32 - cy) / 45.0).clamp(-2.0, 2.0);
         }
-        let top = by as f32 - 32.0 * unit * 0.5 + 3.0;
+        let bob = {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as f32)
+                .unwrap_or(0.0);
+            ((ms / 900.0) * std::f32::consts::TAU).sin() * 1.4
+        };
+        let top = by as f32 - 32.0 * unit * 0.5 + 3.0 + bob;
         let left = bx as f32 - 8.0 * unit;
         let mut part = |u0: u32, v0: u32, pw: u32, ph: u32, ox: f32, oy: f32| -> () {
             let x0 = (left + ox * unit) as i32;
@@ -4207,7 +4235,7 @@ unsafe fn ball_render() {
     let old_font = SelectObject(mem, HGDIOBJ(font_ball.0));
     let mut label: Vec<u16> = if t > 0.5 { "×" } else { "T" }.encode_utf16().collect();
     let mut lr = RECT { left: bx - 12, top: by - 12, right: bx + 16, bottom: by + 14 };
-    if BALL_SKIN.get().is_none() {
+    if BALL_SKIN.read().map(|g| g.is_none()).unwrap_or(true) {
         let _ = DrawTextW(mem, &mut label, &mut lr, windows::Win32::Graphics::Gdi::DT_LEFT);
     }
 
@@ -4582,15 +4610,54 @@ fn sq_coverage(dx: i32, dy: i32, half: f32, rad: f32) -> (f32, f32) {
 }
 
 
-static BALL_SKIN: std::sync::OnceLock<image::RgbaImage> = std::sync::OnceLock::new();
+static BALL_SKIN: std::sync::RwLock<Option<image::RgbaImage>> = std::sync::RwLock::new(None);
 
-fn load_ball_skin() {
-    let p = std::env::current_exe()
+fn skin_dir() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
         .ok()
-        .and_then(|e| e.parent().map(|d| d.join("skin.png")));
-    if let Some(p) = p {
-        if let Ok(img) = image::open(&p) {
-            let _ = BALL_SKIN.set(img.to_rgba8());
+        .and_then(|e| e.parent().map(|d| d.join("skins")))
+}
+
+fn list_skins() -> Vec<String> {
+    let mut out = Vec::new();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.to_path_buf()));
+    if let Some(dir) = exe_dir {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.to_lowercase().ends_with(".png") {
+                    out.push(name);
+                }
+            }
+        }
+        if let Ok(rd) = std::fs::read_dir(dir.join("skins")) {
+            for e in rd.flatten() {
+                let name = format!("skins/{}", e.file_name().to_string_lossy());
+                if name.to_lowercase().ends_with(".png") {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn load_ball_skin(name: Option<&str>) {
+    let exe_dir = match std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+    {
+        Some(d) => d,
+        None => return,
+    };
+    let rel = name.unwrap_or("skin.png");
+    let path = exe_dir.join(rel);
+    if let Ok(img) = image::open(&path) {
+        if let Ok(mut g) = BALL_SKIN.write() {
+            *g = Some(img.to_rgba8());
         }
     }
 }
