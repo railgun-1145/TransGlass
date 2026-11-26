@@ -20,7 +20,7 @@ use windows::core::PCWSTR;
 use windows::core::w;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Threading::*;
-use windows::Win32::UI::Input::{GetCurrentInputMessageSource, INPUT_MESSAGE_SOURCE, IMDT_PEN};
+use windows::Win32::UI::Input::{GetCurrentInputMessageSource, IMDT_MOUSE, IMDT_PEN, IMDT_UNAVAILABLE, INPUT_MESSAGE_SOURCE};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -60,6 +60,10 @@ static ROOT_HWND: AtomicIsize = AtomicIsize::new(0);
 static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
 static HOTKEY_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static INPUT_MODE: AtomicI32 = AtomicI32::new(0);
+/// 最近一次识别到的输入设备：-1 未知、0 鼠标、1 笔（面板上显示，也用来避免反复改样式）
+static LAST_INPUT_IS_PEN: AtomicI32 = AtomicI32::new(-1);
+static LAST_DEVICE: AtomicI32 = AtomicI32::new(-1);
+static LAST_DEVICE_HWND: AtomicIsize = AtomicIsize::new(0);
 const TRANSG_GLASS_INJECT_EXTRA_INFO: usize = 0x5452474Cu64 as usize;
 const WM_RELOAD_HOTKEYS: u32 = WM_APP + 77;
 
@@ -453,10 +457,21 @@ unsafe fn set_hwnd_mouse_transparent(hwnd: HWND, enabled: bool) {
 }
 
 unsafe fn is_pen_input(info: &MSLLHOOKSTRUCT) -> bool {
+    // 注意：钩子线程里没有"当前输入消息"，GetCurrentInputMessageSource 通常返回 IMDT_UNAVAILABLE。
+    // 旧写法只要它 Ok 就直接 return false，等于永远不认笔；这里只在拿到明确设备类型时才采信。
     let mut src = INPUT_MESSAGE_SOURCE::default();
     if GetCurrentInputMessageSource(&mut src).is_ok() {
-        return src.deviceType == IMDT_PEN;
+        if src.deviceType == IMDT_PEN {
+            return true;
+        }
+        if src.deviceType == IMDT_MOUSE {
+            return false;
+        }
+        if src.deviceType == IMDT_UNAVAILABLE {
+            // 落到下面的 ExtraInfo 启发式
+        }
     }
+    // Windows 把笔/触摸提升为鼠标消息时会带上这个标记（0xFF515700 | cursorId）
     (info.dwExtraInfo & 0xFFFFFF00) == 0xFF515700
 }
 
@@ -587,18 +602,31 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 
             let root_val = root.0 as isize;
             if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
+                // 只要指针落在受管窗口上就记录一次设备类型，面板状态行才有东西显示
+                let is_pen = match get_input_mode() {
+                    InputMode::Auto => is_pen_input(&info),
+                    InputMode::ForceMouse => false,
+                    InputMode::ForcePen => true,
+                };
+                let dev = if is_pen { 1 } else { 0 };
+                if LAST_INPUT_IS_PEN.swap(dev, Ordering::Relaxed) != dev {
+                    // 设备类型变了才刷新面板，避免状态行停在旧值
+                    request_ui_repaint();
+                }
                 if state.mouse_passthrough != state.pen_passthrough {
-                    let is_pen = match get_input_mode() {
-                        InputMode::Auto => is_pen_input(&info),
-                        InputMode::ForceMouse => false,
-                        InputMode::ForcePen => true,
-                    };
                     let passthrough = if is_pen {
                         state.pen_passthrough
                     } else {
                         state.mouse_passthrough
                     };
-                    set_hwnd_mouse_transparent(root, passthrough);
+                    // 只有"设备或窗口变了"才改扩展样式：以前每个鼠标移动都改一次，笔悬停时会疯狂抖动
+                    let same = LAST_DEVICE.load(Ordering::Relaxed) == dev
+                        && LAST_DEVICE_HWND.load(Ordering::Relaxed) == root_val;
+                    if !same {
+                        LAST_DEVICE.store(dev, Ordering::Relaxed);
+                        LAST_DEVICE_HWND.store(root_val, Ordering::Relaxed);
+                        set_hwnd_mouse_transparent(root, passthrough);
+                    }
                 }
             }
         }
@@ -1288,6 +1316,7 @@ impl eframe::App for TransGlassApp {
                 if mode_btn.clicked() {
                     cycle_input_mode();
                 }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(" 🗙 隐藏 ").clicked() {
                         hide_root_window();
@@ -1390,6 +1419,24 @@ impl eframe::App for TransGlassApp {
             }
             ui.add_space(6.0);
 
+            // 状态行：最近输入设备 + 已管理窗口数（数位板用户最关心设备判型）
+            let dev_label = match LAST_INPUT_IS_PEN.load(Ordering::Relaxed) {
+                1 => "最近输入：笔",
+                0 => "最近输入：鼠标",
+                _ => "最近输入：—",
+            };
+            ui.label(
+                egui::RichText::new(format!("{dev_label} ｜ 已管理 {} 个窗口", GLOBAL_REGISTRY.len()))
+                    .small()
+                    .weak(),
+            )
+            .on_hover_text(
+                "自动模式靠 Windows 的注入标记判断笔；\n\
+                 多数 WinTab 驱动（Wacom/Huion）会把笔当普通鼠标发事件，\n\
+                 这时点上面的「输入模式」切到「强制笔」即可。",
+            );
+            ui.add_space(6.0);
+
             // 正在管理的窗口
             ui.label(egui::RichText::new("已调节的窗口").strong().color(egui::Color32::LIGHT_GRAY));
             ui.add_space(5.0);
@@ -1423,7 +1470,7 @@ impl eframe::App for TransGlassApp {
                         }
 
                         ui.add_space(4.0);
-                        ui.group(|ui| {
+                        card(ui, |ui| {
                             ui.vertical(|ui| {
                                 ui.horizontal(|ui| {
                                     ui.add(egui::Label::new(egui::RichText::new(&state.title).strong().size(14.0)).truncate());
@@ -2693,4 +2740,15 @@ fn hotkey_key_ui(ui: &mut egui::Ui, key: &mut String, salt: &str) -> bool {
             }
         });
     changed
+}
+
+/// 统一卡片外观：圆角 10、细描边、内边距，和 DSH 面板的卡片风格保持一致。
+fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(30, 30, 34))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 58, 66)))
+        .rounding(egui::Rounding::same(10.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .show(ui, |ui| add(ui))
+        .inner
 }
