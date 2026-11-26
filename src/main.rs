@@ -4081,7 +4081,6 @@ unsafe fn ball_render() {
         }
     };
 
-    draw_block(bx, by, 27.0, true);
     if t > 0.02 {
         for (sx, sy) in ball_satellites(t) {
             let sr = 21.0 * (0.6 + 0.4 * t);
@@ -4092,7 +4091,7 @@ unsafe fn ball_render() {
 
     // 中间方块：MC 纸娃娃（基岩版风格，正面 UV 拼装）
     if let Some(skin) = BALL_SKIN.get() {
-        let unit = 1.3f32;
+        let unit = 2.1f32;
         let top = by as f32 - 32.0 * unit * 0.5 + 3.0;
         let left = bx as f32 - 8.0 * unit;
         let mut part = |u0: u32, v0: u32, pw: u32, ph: u32, ox: f32, oy: f32| -> () {
@@ -4132,6 +4131,32 @@ unsafe fn ball_render() {
         part(20, 52, 4, 12, 8.0, 20.0);  // 左腿
     }
 
+    // 给纸娃娃加 1px 深色描边（无方块时靠它从桌面里跳出来）
+    {
+        let snapshot = buf.to_vec();
+        for yy in 1..(h - 1) {
+            for xx in 1..(w - 1) {
+                let o = ((yy * w + xx) * 4) as usize;
+                if snapshot[o + 3] != 0 {
+                    continue;
+                }
+                let mut hit = false;
+                for (nx, ny) in [(xx - 1, yy), (xx + 1, yy), (xx, yy - 1), (xx, yy + 1)] {
+                    let ni = ((ny * w + nx) * 4) as usize;
+                    if snapshot[ni + 3] > 120 {
+                        hit = true;
+                    }
+                }
+                if hit {
+                    buf[o] = 8;
+                    buf[o + 1] = 10;
+                    buf[o + 2] = 14;
+                    buf[o + 3] = 190;
+                }
+            }
+        }
+    }
+
     // 文字（GDI 只写 RGB，最后统一补 alpha）
     let _ = SetBkMode(mem, TRANSPARENT);
     let _ = SetTextColor(mem, COLORREF(0x00FF_FFFF));
@@ -4142,7 +4167,9 @@ unsafe fn ball_render() {
     let old_font = SelectObject(mem, HGDIOBJ(font_ball.0));
     let mut label: Vec<u16> = if t > 0.5 { "×" } else { "T" }.encode_utf16().collect();
     let mut lr = RECT { left: bx - 12, top: by - 12, right: bx + 16, bottom: by + 14 };
-    let _ = DrawTextW(mem, &mut label, &mut lr, windows::Win32::Graphics::Gdi::DT_LEFT);
+    if BALL_SKIN.get().is_none() {
+        let _ = DrawTextW(mem, &mut label, &mut lr, windows::Win32::Graphics::Gdi::DT_LEFT);
+    }
 
     if t > 0.02 {
         let _ = SetTextColor(mem, COLORREF(0x00F0_F6FA));
