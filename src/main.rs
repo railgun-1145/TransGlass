@@ -938,6 +938,10 @@ struct TransGlassApp {
     hotkey_message: Option<String>,
     hotkey_capture: Option<HotkeyCaptureTarget>,
     hotkey_priority_ui: bool,
+    ui_state: UiState,
+    always_on_top: bool,
+    last_geo: Option<[f32; 4]>,
+    geo_changed_at: Option<std::time::Instant>,
 }
 
 impl TransGlassApp {
@@ -995,6 +999,8 @@ impl TransGlassApp {
             }
         }
 
+        let ui_state = load_ui_state();
+        let always_on_top = ui_state.always_on_top.unwrap_or(false);
         Self {
             should_exit: false,
             hotkey_editor_open: false,
@@ -1002,6 +1008,10 @@ impl TransGlassApp {
             hotkey_message: None,
             hotkey_capture: None,
             hotkey_priority_ui: current_priority_flag(),
+            ui_state,
+            always_on_top,
+            last_geo: None,
+            geo_changed_at: None,
         }
     }
 
@@ -1192,6 +1202,48 @@ impl eframe::App for TransGlassApp {
             WINDOW_VISIBLE.store(false, Ordering::Relaxed);
         }
 
+        // 记住面板位置/大小：拖动或缩放后停顿约 0.8 秒再落盘。
+        // 位置用 outer_rect（窗口外框），尺寸用 inner_rect（客户区），两者配对才不会每次启动漂移。
+        {
+            // ViewportInfo 的生命周期绑在 input 闭包里，所以在闭包内就把需要的数值取出来
+            let (pos, size) = ctx.input(|i| {
+                let vp = i.viewport();
+                (
+                    vp.outer_rect.map(|r| [r.min.x, r.min.y]),
+                    vp.inner_rect.map(|r| [r.width(), r.height()]),
+                )
+            });
+            if let (Some(pos), Some(size)) = (pos, size) {
+                let geo = [pos[0], pos[1], size[0], size[1]];
+                let changed = match self.last_geo {
+                    Some(prev) => (prev[0] - geo[0]).abs() > 1.0
+                        || (prev[1] - geo[1]).abs() > 1.0
+                        || (prev[2] - geo[2]).abs() > 1.0
+                        || (prev[3] - geo[3]).abs() > 1.0,
+                    None => false,
+                };
+                if self.last_geo.is_none() {
+                    self.last_geo = Some(geo);
+                } else if changed {
+                    self.last_geo = Some(geo);
+                    self.geo_changed_at = Some(std::time::Instant::now());
+                    // 关键：拖完窗口后 egui 不再重绘，必须主动排一帧来做去抖落盘
+                    ctx.request_repaint_after(std::time::Duration::from_millis(900));
+                }
+                if let Some(since) = self.geo_changed_at {
+                    if since.elapsed().as_millis() > 800 {
+                        self.geo_changed_at = None;
+                        self.ui_state.x = Some(geo[0]);
+                        self.ui_state.y = Some(geo[1]);
+                        self.ui_state.w = Some(geo[2]);
+                        self.ui_state.h = Some(geo[3]);
+                        self.ui_state.always_on_top = Some(self.always_on_top);
+                        save_ui_state(&self.ui_state);
+                    }
+                }
+            }
+        }
+
         if self.hotkey_capture.is_some() {
             let mut captured: Option<(String, String)> = None;
             ctx.input(|i| {
@@ -1220,10 +1272,43 @@ impl eframe::App for TransGlassApp {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.heading(egui::RichText::new("TransGlass").color(egui::Color32::from_rgb(0, 150, 255)).strong().size(22.0));
-                ui.label(egui::RichText::new(format!("输入模式：{}", input_mode_label())).small().weak());
+                // 输入模式做成可点的：以前只能靠热键盲切
+                let mode_btn = ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(format!("输入模式：{}", input_mode_label())).small(),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text("点击切换输入模式（也可以按 Alt+Shift+M）");
+                if mode_btn.clicked() {
+                    cycle_input_mode();
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(" 🗙 隐藏 ").clicked() {
                         hide_root_window();
+                    }
+                    let pin = ui
+                        .add(
+                            egui::Button::new(if self.always_on_top { "📌" } else { "📍" })
+                                .frame(false),
+                        )
+                        .on_hover_text(if self.always_on_top {
+                            "面板已置顶，点击取消"
+                        } else {
+                            "点击让面板置顶（调参时不被目标窗口遮住）"
+                        });
+                    if pin.clicked() {
+                        self.always_on_top = !self.always_on_top;
+                        self.ui_state.always_on_top = Some(self.always_on_top);
+                        save_ui_state(&self.ui_state);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                            if self.always_on_top {
+                                egui::WindowLevel::AlwaysOnTop
+                            } else {
+                                egui::WindowLevel::Normal
+                            },
+                        ));
                     }
                     ui.menu_button(" ☰ ", |ui| {
                         ui.menu_button("设置", |ui| {
@@ -1340,13 +1425,40 @@ impl eframe::App for TransGlassApp {
                                 });
 
                                 ui.add_space(6.0);
+                                // 行 2：透明度滑杆 + 百分比 + 预设（原来滑杆不显数值，也看不到具体百分比）
                                 ui.horizontal(|ui| {
-                                    ui.label("透明度:");
+                                    ui.label("透明度");
                                     let mut alpha_f32 = state.current_alpha as f32;
                                     let slider = egui::Slider::new(&mut alpha_f32, 30.0..=255.0)
                                         .show_value(false)
                                         .trailing_fill(true);
-                                    if ui.add(slider).changed() {
+                                    let resp = ui.add(slider);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{}%",
+                                            (alpha_f32 / 255.0 * 100.0).round() as i32
+                                        ))
+                                        .small(),
+                                    );
+                                    ui.menu_button("预设", |ui| {
+                                        for pct in [25u32, 50, 75, 100] {
+                                            if ui.button(format!("{pct}%")).clicked() {
+                                                let alpha = ((pct as f32 / 100.0) * 255.0)
+                                                    .round()
+                                                    .clamp(30.0, 255.0)
+                                                    as u8;
+                                                changes.push(PendingChange {
+                                                    hwnd_val,
+                                                    alpha: Some(alpha),
+                                                    topmost: None,
+                                                    mouse_passthrough: None,
+                                                    pen_passthrough: None,
+                                                });
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    });
+                                    if resp.changed() {
                                         changes.push(PendingChange {
                                             hwnd_val,
                                             alpha: Some(alpha_f32 as u8),
@@ -1355,7 +1467,10 @@ impl eframe::App for TransGlassApp {
                                             pen_passthrough: None,
                                         });
                                     }
-                                    ui.add_space(10.0);
+                                });
+                                ui.add_space(2.0);
+                                // 行 3：三个开关单独一行，避免挤出行外
+                                ui.horizontal(|ui| {
                                     let mut topmost = state.user_pref_topmost;
                                     if ui.checkbox(&mut topmost, "置顶").changed() {
                                         changes.push(PendingChange {
@@ -1366,7 +1481,7 @@ impl eframe::App for TransGlassApp {
                                             pen_passthrough: None,
                                         });
                                     }
-                                    ui.add_space(10.0);
+                                    ui.add_space(8.0);
                                     let mut mouse_passthrough = state.mouse_passthrough;
                                     if ui.checkbox(&mut mouse_passthrough, "鼠标点透").changed() {
                                         changes.push(PendingChange {
@@ -1377,7 +1492,7 @@ impl eframe::App for TransGlassApp {
                                             pen_passthrough: None,
                                         });
                                     }
-                                    ui.add_space(10.0);
+                                    ui.add_space(8.0);
                                     let mut pen_passthrough = state.pen_passthrough;
                                     if ui.checkbox(&mut pen_passthrough, "笔点透").changed() {
                                         changes.push(PendingChange {
@@ -1444,13 +1559,46 @@ impl eframe::App for TransGlassApp {
                 });
             });
 
-            ui.add_space(12.0);
-            ui.group(|ui| {
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("快捷键提示").strong().size(12.0));
-                    ui.label(egui::RichText::new("快捷键可在  ☰  → 设置 → 快捷键  中修改").small().weak());
+            ui.add_space(10.0);
+            // 键位总览：以前这里只有一句"去设置里改"，用户根本看不到当前绑了什么
+            let overview = snapshot_hotkey_overview();
+            let header = egui::RichText::new(format!("当前快捷键（{} 项）", overview.len()))
+                .strong()
+                .size(13.0);
+            egui::CollapsingHeader::new(header)
+                .default_open(true)
+                .show(ui, |ui| {
+                    if overview.is_empty() {
+                        ui.label(
+                            egui::RichText::new("尚未加载键位（热键线程启动后出现）")
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    // 键位多时内部滚动；高度按剩余空间算，避免把底部按钮顶出可视区
+                    let room = (ui.available_height() - 36.0).max(60.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(room)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for (name, combo, ok) in &overview {
+                                ui.horizontal(|ui| {
+                                    let mark = if *ok { "✅" } else { "⚠" };
+                                    ui.label(egui::RichText::new(format!("{mark} {name}")).small());
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(egui::RichText::new(combo).small().strong());
+                                        },
+                                    );
+                                });
+                            }
+                        });
+                    ui.add_space(4.0);
+                    if ui.button("打开快捷键设置").clicked() {
+                        self.open_hotkey_editor();
+                    }
                 });
-            });
         });
 
         if self.hotkey_editor_open {
@@ -1948,11 +2096,23 @@ fn main() -> Result<(), eframe::Error> {
         restore_all_windows();
     });
 
+    // 复用上次的面板位置/大小/置顶状态；没有记录时给一个放得下新布局的默认尺寸
+    let ui_state = load_ui_state();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([
+            ui_state.w.unwrap_or(360.0),
+            ui_state.h.unwrap_or(560.0),
+        ])
+        .with_title("TransGlass 控制面板")
+        .with_visible(true);
+    if let (Some(x), Some(y)) = (ui_state.x, ui_state.y) {
+        viewport = viewport.with_position([x, y]);
+    }
+    if ui_state.always_on_top.unwrap_or(false) {
+        viewport = viewport.with_window_level(egui::WindowLevel::AlwaysOnTop);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([320.0, 450.0])
-            .with_title("TransGlass 控制面板")
-            .with_visible(true),
+        viewport,
         // 必须是 true：false 时 eframe 会在关闭后直接 std::process::exit，
         // main 里的局部变量（尤其是 TrayIcon）不会 drop，托盘图标就会变成 ghost
         run_and_return: true,
@@ -2165,6 +2325,50 @@ pub(crate) fn clear_issues() {
     }
 }
 
+/// 最近一次热键绑定的结果：(功能名, 组合键文本, 是否注册成功)。
+/// 面板底部用它显示"我现在能用哪些键"，不用再去编辑器里翻。
+static HOTKEY_OVERVIEW: RwLock<Vec<(String, String, bool)>> = RwLock::new(Vec::new());
+
+pub(crate) fn set_hotkey_overview(rows: Vec<(String, String, bool)>) {
+    if let Ok(mut slot) = HOTKEY_OVERVIEW.write() {
+        *slot = rows;
+    }
+}
+
+pub(crate) fn snapshot_hotkey_overview() -> Vec<(String, String, bool)> {
+    HOTKEY_OVERVIEW
+        .read()
+        .map(|rows| rows.clone())
+        .unwrap_or_default()
+}
+
+/// 面板自身的界面状态（位置/大小/是否置顶），单独存一个文件，不动热键配置的结构。
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct UiState {
+    x: Option<f32>,
+    y: Option<f32>,
+    w: Option<f32>,
+    h: Option<f32>,
+    always_on_top: Option<bool>,
+}
+
+fn ui_state_path() -> PathBuf {
+    get_config_path().with_file_name("transglass_ui.json")
+}
+
+fn load_ui_state() -> UiState {
+    match fs::read_to_string(ui_state_path()) {
+        Ok(text) => serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap_or_default(),
+        Err(_) => UiState::default(),
+    }
+}
+
+fn save_ui_state(state: &UiState) {
+    if let Ok(text) = serde_json::to_string_pretty(state) {
+        let _ = fs::write(ui_state_path(), text);
+    }
+}
+
 /// 所有热键槽位的 id 分配。新增功能必须在这里登记，否则重载时会漏注销。
 pub(crate) const HOTKEY_IDS: [i32; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
@@ -2263,9 +2467,39 @@ pub(crate) fn hotkey_slots(cfg: &HotkeyConfig) -> Vec<(i32, &'static str, Hotkey
 }
 
 unsafe fn bind_hotkeys(cfg: &HotkeyConfig) {
+    let mut rows = Vec::new();
     for (id, name, spec) in hotkey_slots(cfg) {
-        try_register_hotkey(id, &spec, name);
+        let ok = try_register_hotkey(id, &spec, name);
+        rows.push((
+            name.to_string(),
+            format!(
+                "{}+{}",
+                spec.modifiers.trim().to_uppercase(),
+                spec.key.trim().to_uppercase()
+            ),
+            ok,
+        ));
     }
+    set_hotkey_overview(rows);
+}
+
+/// 优先模式下热键由键盘钩子接管，这里只把键位列表填出来（全部视为可用）。
+fn refresh_priority_overview(cfg: &HotkeyConfig) {
+    let rows = hotkey_slots(cfg)
+        .into_iter()
+        .map(|(_, name, spec)| {
+            (
+                name.to_string(),
+                format!(
+                    "{}+{}",
+                    spec.modifiers.trim().to_uppercase(),
+                    spec.key.trim().to_uppercase()
+                ),
+                true,
+            )
+        })
+        .collect();
+    set_hotkey_overview(rows);
 }
 
 unsafe fn unregister_all_hotkeys() {
@@ -2293,6 +2527,8 @@ unsafe fn reload_hotkeys_and_mouse() {
         if !install_keyboard_priority_hook() {
             PRIORITY_MODE.store(false, Ordering::SeqCst);
             bind_hotkeys(&cfg);
+        } else {
+            refresh_priority_overview(&cfg);
         }
     } else {
         uninstall_keyboard_priority_hook();
