@@ -8,7 +8,7 @@ use self_update::backends::github::Update;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::thread;
@@ -4078,6 +4078,10 @@ static BALL_POS_Y: AtomicI32 = AtomicI32::new(380);
 static BALL_DRAGGING: AtomicBool = AtomicBool::new(false);
 static BALL_DOWN_POS: AtomicU64 = AtomicU64::new(0);
 static BALL_MOVED: AtomicBool = AtomicBool::new(false);
+/// 悬停的面板元素：0 无，1..4 按钮，5 透明度滑条
+static BALL_HOVER: AtomicU8 = AtomicU8::new(0);
+/// 正在拖透明度滑条
+static BALL_SLIDER_DRAG: AtomicBool = AtomicBool::new(false);
 
 fn ball_expand_target() -> bool {
     BALL_EXPANDED.load(Ordering::Relaxed)
@@ -4087,19 +4091,175 @@ unsafe fn ball_center() -> (i32, i32) {
     (BALL_W - 42, BALL_H / 2)
 }
 
-unsafe fn ball_satellites(t: f32) -> [(i32, i32); 6] {
-    let (bx, by) = ball_center();
-    let mut out = [(0, 0); 6];
-    let angles = [112.0f32, 138.5, 165.0, 195.0, 221.5, 248.0];
-    for (i, a) in angles.iter().enumerate() {
-        let rad = a.to_radians();
-        let r = 40.0 + 58.0 * t;
-        out[i] = (
-            bx + (rad.cos() * r) as i32,
-            by + (rad.sin() * r) as i32,
-        );
+// ---- 展开面板：MC 背包 / 设置界面风格（GUI scale ≈2） ----
+// 取色参考 MC Java 的 GUI 贴图：背景 #C6C6C6、黑框 + 上左白下右深灰的斜面、
+// 按钮 #8B8B8B，滑条用手动把里的进度条样式（凹槽 + 按钮式滑块）。
+const MC_BG: (u8, u8, u8) = (198, 198, 198);
+const MC_BLACK: (u8, u8, u8) = (0, 0, 0);
+const MC_WHITE: (u8, u8, u8) = (255, 255, 255);
+const MC_SHADOW: (u8, u8, u8) = (85, 85, 85);
+const MC_BTN: (u8, u8, u8) = (139, 139, 139);
+const MC_BTN_HL: (u8, u8, u8) = (200, 200, 200);
+const MC_BTN_SH: (u8, u8, u8) = (65, 65, 65);
+const MC_GROOVE: (u8, u8, u8) = (55, 55, 55);
+
+struct BallPanel {
+    panel: (i32, i32, i32, i32),
+    buttons: [(i32, i32, i32, i32); 4],
+    slider: (i32, i32, i32, i32),
+}
+
+/// 展开布局：左边竖着 4 个 MC 按钮（置顶 / 穿透 / 模式 / 还原），底部一条透明度滑条。
+/// t = 0..1 弹出动画，面板从右侧滑进来。
+fn ball_panel(t: f32) -> BallPanel {
+    let off = ((1.0 - t.clamp(0.0, 1.0)) * 22.0).round() as i32;
+    let px0 = 24 + off;
+    let panel = (px0, 28, px0 + 218, 244);
+    let bx = px0 + 12;
+    let bw = 124;
+    let mut buttons = [(0, 0, 0, 0); 4];
+    for (i, y) in [40i32, 72, 104, 136].iter().enumerate() {
+        buttons[i] = (bx, *y, bx + bw, *y + 26);
     }
-    out
+    let slider = (bx, 196, px0 + 206, 222);
+    BallPanel { panel, buttons, slider }
+}
+
+fn mc_fill(buf: &mut [u8], w: i32, h: i32, x0: i32, y0: i32, x1: i32, y1: i32, c: (u8, u8, u8)) {
+    for y in y0.max(0)..y1.min(h) {
+        for x in x0.max(0)..x1.min(w) {
+            let o = ((y * w + x) * 4) as usize;
+            buf[o] = c.2;
+            buf[o + 1] = c.1;
+            buf[o + 2] = c.0;
+            buf[o + 3] = 255;
+        }
+    }
+}
+
+fn mc_frame(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32), c: (u8, u8, u8), t: i32) {
+    let (x0, y0, x1, y1) = r;
+    mc_fill(buf, w, h, x0, y0, x1, y0 + t, c);
+    mc_fill(buf, w, h, x0, y1 - t, x1, y1, c);
+    mc_fill(buf, w, h, x0, y0, x0 + t, y1, c);
+    mc_fill(buf, w, h, x1 - t, y0, x1, y1, c);
+}
+
+fn draw_mc_panel(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32)) {
+    let (x0, y0, x1, y1) = r;
+    mc_fill(buf, w, h, x0, y0, x1, y1, MC_BG);
+    mc_frame(buf, w, h, r, MC_BLACK, 2);
+    // 内侧斜面：上/左白，下/右深灰
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x1 - 2, y0 + 3, MC_WHITE);
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x0 + 3, y1 - 2, MC_WHITE);
+    mc_fill(buf, w, h, x0 + 2, y1 - 3, x1 - 2, y1 - 2, MC_SHADOW);
+    mc_fill(buf, w, h, x1 - 3, y0 + 2, x1 - 2, y1 - 2, MC_SHADOW);
+}
+
+fn draw_mc_button(
+    buf: &mut [u8],
+    w: i32,
+    h: i32,
+    r: (i32, i32, i32, i32),
+    hover: bool,
+    pressed: bool,
+) {
+    let (x0, y0, x1, y1) = r;
+    let body = if pressed {
+        (110, 110, 110)
+    } else if hover {
+        (160, 160, 160)
+    } else {
+        MC_BTN
+    };
+    mc_fill(buf, w, h, x0, y0, x1, y1, body);
+    mc_frame(buf, w, h, r, MC_BLACK, 2);
+    let hl = if pressed { (128, 128, 128) } else { MC_BTN_HL };
+    let sh = if pressed { (150, 150, 150) } else { MC_BTN_SH };
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x1 - 2, y0 + 4, hl);
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x0 + 4, y1 - 2, hl);
+    mc_fill(buf, w, h, x0 + 2, y1 - 4, x1 - 2, y1 - 2, sh);
+    mc_fill(buf, w, h, x1 - 4, y0 + 2, x1 - 2, y1 - 2, sh);
+}
+
+/// 滑条可走行程（滑块宽 20，两端各留 6）
+fn slider_travel(r: (i32, i32, i32, i32)) -> f32 {
+    ((r.2 - r.0) - 32).max(1) as f32
+}
+
+/// t=0 → 最不透明（滑块在最左），t=1 → 最透明（滑块在最右）
+fn draw_mc_slider(buf: &mut [u8], w: i32, h: i32, r: (i32, i32, i32, i32), t: f32) {
+    let (x0, y0, x1, y1) = r;
+    mc_fill(buf, w, h, x0, y0, x1, y1, MC_GROOVE);
+    mc_frame(buf, w, h, r, MC_BLACK, 2);
+    // 凹槽的内斜面：上/左更暗，下/右稍亮
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x1 - 2, y0 + 4, (28, 28, 28));
+    mc_fill(buf, w, h, x0 + 2, y0 + 2, x0 + 4, y1 - 2, (28, 28, 28));
+    mc_fill(buf, w, h, x0 + 2, y1 - 4, x1 - 2, y1 - 2, (110, 110, 110));
+    mc_fill(buf, w, h, x1 - 4, y0 + 2, x1 - 2, y1 - 2, (110, 110, 110));
+    let hx = x0 + 6 + (slider_travel(r) * t.clamp(0.0, 1.0)) as i32;
+    draw_mc_button(buf, w, h, (hx, y0 - 2, hx + 20, y1 + 2), false, false);
+}
+
+/// 当前的遥控目标：跳过自身/系统窗口（记录值失效时退回前台窗口）
+unsafe fn ball_target() -> HWND {
+    let stored = TARGET_HWND.load(Ordering::Relaxed);
+    if stored != 0 {
+        let h = HWND(stored as *mut _);
+        if !is_own_hwnd(h) && !is_shell_hwnd(h) {
+            return h;
+        }
+    }
+    let fg = GetForegroundWindow();
+    if !fg.0.is_null() && !is_own_hwnd(fg) && !is_shell_hwnd(fg) {
+        return fg;
+    }
+    HWND::default()
+}
+
+/// 当前遥控目标的透明度（没有可用目标就是 255 = 不透明）
+fn target_alpha_now() -> u8 {
+    unsafe {
+        let h = ball_target();
+        if !h.0.is_null() {
+            if let Some(st) = GLOBAL_REGISTRY.get(&(h.0 as isize)) {
+                return st.current_alpha;
+            }
+        }
+    }
+    255
+}
+
+/// MC 风文字：1px 深灰阴影 + 正文，居中画在矩形里。
+/// 阴影用 #3F3F3F 而不是纯黑：后面"补 alpha"那一步只认 rgb 非零的像素。
+unsafe fn draw_mc_label(
+    mem: windows::Win32::Graphics::Gdi::HDC,
+    text: &str,
+    r: (i32, i32, i32, i32),
+    color: (u8, u8, u8),
+) {
+    use windows::Win32::Graphics::Gdi::{
+        DrawTextW, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
+    };
+    let flags = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
+    let mut v: Vec<u16> = text.encode_utf16().collect();
+    let _ = SetTextColor(mem, COLORREF(0x003F_3F3F));
+    let mut sr = RECT {
+        left: r.0 + 1,
+        top: r.1 + 1,
+        right: r.2 + 1,
+        bottom: r.3 + 1,
+    };
+    let _ = DrawTextW(mem, &mut v, &mut sr, flags);
+    let c = (color.0 as u32) | ((color.1 as u32) << 8) | ((color.2 as u32) << 16);
+    let _ = SetTextColor(mem, COLORREF(c));
+    let mut tr = RECT {
+        left: r.0,
+        top: r.1,
+        right: r.2,
+        bottom: r.3,
+    };
+    let _ = DrawTextW(mem, &mut v, &mut tr, flags);
 }
 
 /// 单调动画时钟（秒）。不能用 SystemTime 毫秒直接转 f32：数值太大精度只剩分钟级。
@@ -4175,6 +4335,7 @@ fn update_doll_pose() -> (f32, f32) {
 fn spawn_doll_ticker() {
     thread::spawn(|| {
         let mut last_render = f32::NEG_INFINITY;
+        let mut last_hover = 0u8;
         loop {
             thread::sleep(std::time::Duration::from_millis(33));
             if APP_EXIT_REQUESTED.load(Ordering::Relaxed) {
@@ -4202,11 +4363,25 @@ fn spawn_doll_ticker() {
                 BALL_LAST_ACTIVE.store(anim_secs().to_bits(), Ordering::Relaxed);
             }
             let (rest_body, rest_head) = update_doll_pose();
+            // 悬停高亮：直接用光标位置算，不依赖 WM_MOUSEMOVE（分层窗口下不一定收得到）
+            unsafe {
+                let (wx, wy) = (
+                    cp.x - BALL_POS_X.load(Ordering::Relaxed),
+                    cp.y - BALL_POS_Y.load(Ordering::Relaxed),
+                );
+                let h = ball_hit(wx, wy);
+                BALL_HOVER.store(if (1..=5).contains(&h) { h } else { 0 }, Ordering::Relaxed);
+            }
             let t = anim_secs();
             let last_active = f32::from_bits(BALL_LAST_ACTIVE.load(Ordering::Relaxed));
             let moving = rest_body > 0.004 || rest_head > 0.004;
             let active = last_active > 0.0 && (t - last_active) < 0.5;
-            if moving || active || (t - last_render) >= 0.14 {
+            let hover = BALL_HOVER.load(Ordering::Relaxed);
+            let hover_changed = hover != last_hover;
+            if hover_changed {
+                last_hover = hover;
+            }
+            if moving || active || hover_changed || (t - last_render) >= 0.14 {
                 last_render = t;
                 unsafe { ball_render() };
             }
@@ -4251,54 +4426,17 @@ unsafe fn ball_render() {
     let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
     let (bx, by) = ball_center();
 
-    // 卫星：统一的圆角玻璃块（抗锯齿）
-    {
-    let mut draw_block = |cx: i32, cy: i32, half: f32, is_main: bool| {
-        let span = (half + 2.0).ceil() as i32;
-        for yy in (cy - span)..=(cy + span) {
-            for xx in (cx - span)..=(cx + span) {
-                if xx < 0 || yy < 0 || xx >= w || yy >= h {
-                    continue;
-                }
-                let dx = xx - cx;
-                let dy = yy - cy;
-                let (cov, d) = sq_coverage(dx, dy, half, if is_main { 3.0 } else { 5.0 });
-                if cov <= 0.01 {
-                    continue;
-                }
-                let frame = d > -2.2;
-                let (cr, cg, cb, base) = if frame {
-                    (238u8, 245u8, 249u8, 240u8)
-                } else if is_main {
-                    let (tr, tg, tb, ta) = ball_tex_sample(dx, dy, half as i32);
-                    (tr, tg, tb, ta.max(196))
-                } else {
-                    let (tr, tg, tb, ta) = ball_tex_sample(dx, dy, half as i32);
-                    (tr, tg, tb, (ta.max(200) as f32 * 0.92) as u8)
-                };
-                let a = (base as f32 * cov) as u8;
-                let o = ((yy * w + xx) * 4) as usize;
-                // 与已有像素做 alpha 合成（文字/球与卫星可能重叠）
-                let sa = a as f32 / 255.0;
-                let da = buf[o + 3] as f32 / 255.0;
-                let out_a = sa + da * (1.0 - sa);
-                if out_a <= 0.002 {
-                    continue;
-                }
-                buf[o] = ((cb as f32 * sa + buf[o] as f32 * da * (1.0 - sa)) / out_a) as u8;
-                buf[o + 1] = ((cg as f32 * sa + buf[o + 1] as f32 * da * (1.0 - sa)) / out_a) as u8;
-                buf[o + 2] = ((cr as f32 * sa + buf[o + 2] as f32 * da * (1.0 - sa)) / out_a) as u8;
-                buf[o + 3] = (out_a * 255.0) as u8;
-            }
-        }
-    };
-
+    // 展开面板：MC 背包风格（4 个按钮 + 底部透明度条）
     if t > 0.02 {
-        for (sx, sy) in ball_satellites(t) {
-            let sr = 21.0 * (0.6 + 0.4 * t);
-            draw_block(sx, sy, sr, false);
+        let p = ball_panel(t);
+        let hover = BALL_HOVER.load(Ordering::Relaxed);
+        draw_mc_panel(buf, w, h, p.panel);
+        for (i, r) in p.buttons.iter().enumerate() {
+            draw_mc_button(buf, w, h, *r, hover == (i as u8 + 1), false);
         }
-    }
+        let cur = target_alpha_now();
+        let sv = ((255.0 - cur as f32) / 215.0).clamp(0.0, 1.0);
+        draw_mc_slider(buf, w, h, p.slider, sv);
     }
 
     // 中间：MC 3D 纸娃娃（基岩版左上角纸娃娃观感，随光标连续转向）
@@ -4380,33 +4518,26 @@ unsafe fn ball_render() {
     }
 
     if t > 0.02 {
-        let _ = SetTextColor(mem, COLORREF(0x00F0_F6FA));
-        let font_sat = CreateFontW(
-            15, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0,
+        let p = ball_panel(t);
+        let font = CreateFontW(
+            15, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 3,
             windows::core::w!("Microsoft YaHei"),
         );
-        let old_sat = SelectObject(mem, HGDIOBJ(font_sat.0));
-        let labels = ["透-", "透+", "置顶", "穿透", "模式", "还原"];
-        for (i, (sx, sy)) in ball_satellites(t).iter().enumerate() {
-            let sr = (21.0 * (0.6 + 0.4 * t)) as i32;
-            let mut txt: Vec<u16> = labels[i].encode_utf16().collect();
-            let mut tr = RECT {
-                left: sx - sr,
-                top: sy - sr,
-                right: sx + sr,
-                bottom: sy + sr,
-            };
-            let _ = DrawTextW(
-                mem,
-                &mut txt,
-                &mut tr,
-                windows::Win32::Graphics::Gdi::DT_CENTER
-                    | windows::Win32::Graphics::Gdi::DT_VCENTER
-                    | windows::Win32::Graphics::Gdi::DT_SINGLELINE,
-            );
+        let old_sat = SelectObject(mem, HGDIOBJ(font.0));
+        let labels = ["置顶", "穿透", "模式", "还原"];
+        for (i, r) in p.buttons.iter().enumerate() {
+            draw_mc_label(mem, labels[i], *r, (255, 255, 255));
         }
+        let cur = target_alpha_now();
+        let sv = ((255.0 - cur as f32) / 215.0).clamp(0.0, 1.0);
+        draw_mc_label(
+            mem,
+            &format!("透明度 {}%", (sv * 100.0).round() as i32),
+            p.slider,
+            (255, 255, 255),
+        );
         SelectObject(mem, old_sat);
-        let _ = DeleteObject(HGDIOBJ(font_sat.0));
+        let _ = DeleteObject(HGDIOBJ(font.0));
     }
 
     // 文字像素 alpha 补齐（GDI 不写 alpha）
@@ -4470,21 +4601,41 @@ unsafe fn ball_hit(x: i32, y: i32) -> u8 {
     let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
     let (bx, by) = ball_center();
     if ((x - bx).pow(2) + (y - by).pow(2)) <= 34 * 34 {
-        return 9; // 球本身
+        return 9; // 纸娃娃/球本身
     }
     if let Some((rx0, ry0, rx1, ry1)) = unpack_rect(BALL_DOLL_RECT.load(Ordering::Relaxed)) {
         if x >= rx0 && y >= ry0 && x < rx1 && y < ry1 {
-            return 9; // 纸娃娃（头/腿伸出球的区域也能拖）
+            return 9;
         }
     }
     if t > 0.5 {
-        for (i, (sx, sy)) in ball_satellites(t).iter().enumerate() {
-            if ((x - sx).pow(2) + (y - sy).pow(2)) <= 23 * 23 {
+        let p = ball_panel(t);
+        for (i, r) in p.buttons.iter().enumerate() {
+            if x >= r.0 && y >= r.1 && x < r.2 && y < r.3 {
                 return (i + 1) as u8;
             }
         }
+        let s = p.slider;
+        if x >= s.0 && y >= s.1 && x < s.2 && y < s.3 {
+            return 5; // 透明度滑条
+        }
     }
     0
+}
+
+/// 根据滑条上的 x 设置遥控窗口的透明度（拖到底 = 最透明）
+unsafe fn slider_apply(x: i32) {
+    let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
+    let p = ball_panel(t);
+    let (x0, _, x1, _) = p.slider;
+    let travel = slider_travel(p.slider);
+    let v = ((x - x0 - 16) as f32 / travel).clamp(0.0, 1.0);
+    let alpha = (255.0 - v * 215.0).round().clamp(40.0, 255.0) as u8;
+    let target = ball_target();
+    if target.0.is_null() {
+        return;
+    }
+    ball_apply(target, BallAction::SetAlpha(alpha));
 }
 
 unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -4492,7 +4643,8 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
         WM_LBUTTONDOWN => {
             let x = (l.0 & 0xFFFF) as i32;
             let y = ((l.0 >> 16) & 0xFFFF) as i32;
-            if ball_hit(x, y) == 9 {
+            let hit = ball_hit(x, y);
+            if hit == 9 {
                 BALL_DRAGGING.store(true, Ordering::Relaxed);
                 BALL_MOVED.store(false, Ordering::Relaxed);
                 let mut p = POINT::default();
@@ -4504,9 +4656,23 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 let _ = SetCapture(hwnd);
                 return LRESULT(0);
             }
+            if hit == 5 {
+                // 透明度滑条：按下即生效，拖动持续更新
+                BALL_SLIDER_DRAG.store(true, Ordering::Relaxed);
+                let _ = SetCapture(hwnd);
+                slider_apply(x);
+                ball_render();
+                return LRESULT(0);
+            }
             DefWindowProcW(hwnd, msg, w, l)
         }
         WM_MOUSEMOVE => {
+            if BALL_SLIDER_DRAG.load(Ordering::Relaxed) {
+                let x = (l.0 & 0xFFFF) as i32;
+                slider_apply(x);
+                ball_render();
+                return LRESULT(0);
+            }
             if BALL_DRAGGING.load(Ordering::Relaxed) {
                 let mut p = POINT::default();
                 let _ = GetCursorPos(&mut p);
@@ -4537,9 +4703,15 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 }
                 return LRESULT(0);
             }
+            // 悬停高亮由 ticker 统一算，这里不再处理
             DefWindowProcW(hwnd, msg, w, l)
         }
         WM_LBUTTONUP => {
+            if BALL_SLIDER_DRAG.swap(false, Ordering::Relaxed) {
+                let _ = ReleaseCapture();
+                ball_render();
+                return LRESULT(0);
+            }
             let dragged = BALL_DRAGGING.swap(false, Ordering::Relaxed)
                 && BALL_MOVED.swap(false, Ordering::Relaxed);
             let _ = ReleaseCapture();
@@ -4561,22 +4733,16 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         std::thread::sleep(std::time::Duration::from_millis(14));
                     }
                 }
-                1..=6 => {
-                    let target = {
-                        let t = TARGET_HWND.load(Ordering::Relaxed);
-                        if t != 0 {
-                            HWND(t as *mut _)
-                        } else {
-                            GetForegroundWindow()
-                        }
-                    };
+                1..=4 => {
+                    let target = ball_target();
+                    if target.0.is_null() {
+                        return LRESULT(0);
+                    }
                     match ball_hit(x, y) {
-                        1 => ball_apply(target, BallAction::AlphaDown),
-                        2 => ball_apply(target, BallAction::AlphaUp),
-                        3 => ball_apply(target, BallAction::Topmost),
-                        4 => ball_apply(target, BallAction::Passthrough),
-                        5 => ball_apply(target, BallAction::CycleMode),
-                        6 => ball_apply(target, BallAction::Restore),
+                        1 => ball_apply(target, BallAction::Topmost),
+                        2 => ball_apply(target, BallAction::Passthrough),
+                        3 => ball_apply(target, BallAction::CycleMode),
+                        4 => ball_apply(target, BallAction::Restore),
                         _ => {}
                     }
                     ball_render();
@@ -4668,6 +4834,8 @@ unsafe fn set_all_passthrough(on: bool) {
 enum BallAction {
     AlphaDown,
     AlphaUp,
+    /// 直接设成指定透明度（滑条用）
+    SetAlpha(u8),
     Topmost,
     Passthrough,
     CycleMode,
@@ -4704,6 +4872,22 @@ unsafe fn ball_apply(target: HWND, action: BallAction) {
                 st.pen_passthrough = on;
             }
             let _ = apply_transparency_to_hwnd(target, alpha, top, on, on);
+        }
+        BallAction::SetAlpha(want) => {
+            ensure_managed(target);
+            let v = target.0 as isize;
+            let (top, mouse, pen) = {
+                let mut out = (false, false, false);
+                if let Some(st) = GLOBAL_REGISTRY.get(&v) {
+                    out = (st.user_pref_topmost, st.mouse_passthrough, st.pen_passthrough);
+                }
+                out
+            };
+            let next = want.clamp(40, 255);
+            if let Some(mut st) = GLOBAL_REGISTRY.get_mut(&v) {
+                st.current_alpha = next;
+            }
+            let _ = apply_transparency_to_hwnd(target, next, top, mouse, pen);
         }
         BallAction::AlphaDown | BallAction::AlphaUp => {
             ensure_managed(target);
