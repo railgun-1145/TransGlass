@@ -2201,11 +2201,17 @@ impl TransGlassApp {
                         }
                         ui.add_space(6.0);
                         ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(title)
+                            egui::Label::new({
+                                let app = unsafe { app_short_name(HWND(hwnd as *mut _)) };
+                                let text = if app.is_empty() {
+                                    title.to_string()
+                                } else {
+                                    format!("{app} · {title}")
+                                };
+                                egui::RichText::new(text)
                                     .font(font_title(14.0))
-                                    .color(TEXT_PRIMARY),
-                            )
+                                    .color(TEXT_PRIMARY)
+                            })
                             .truncate(),
                         );
                         let mut badges = String::new();
@@ -2498,6 +2504,95 @@ fn set_autostart(on: bool) -> Result<(), String> {
 
 fn wide_reg(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 窗口所属进程的 exe 名（小写，不含路径）
+unsafe fn process_exe_name(hwnd: HWND) -> Option<String> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == 0 {
+        return None;
+    }
+    let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    let ok = QueryFullProcessImageNameW(
+        h,
+        PROCESS_NAME_WIN32,
+        windows::core::PWSTR(buf.as_mut_ptr()),
+        &mut len,
+    )
+    .is_ok();
+    let _ = windows::Win32::Foundation::CloseHandle(h);
+    if !ok || len == 0 {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    Some(path.rsplit('\\').next().unwrap_or("").to_lowercase())
+}
+
+/// 给界面用的软件短名（Photoshop / Lightroom / AE …）
+pub(crate) unsafe fn app_short_name(hwnd: HWND) -> String {
+    let Some(exe) = process_exe_name(hwnd) else {
+        return String::new();
+    };
+    let stem = exe.trim_end_matches(".exe");
+    let name = if stem.contains("photoshop") {
+        "Photoshop"
+    } else if stem.contains("lightroom") {
+        "Lightroom"
+    } else if stem.contains("aftereffects") {
+        "AE"
+    } else if stem.contains("illustrator") {
+        "AI"
+    } else if stem.contains("premiere") {
+        "PR"
+    } else if stem.contains("indesign") {
+        "ID"
+    } else if stem.contains("huashijie") || stem.contains("artworld") || stem.contains("画世界") {
+        "画世界"
+    } else if stem.contains("chrome") {
+        "Chrome"
+    } else if stem.contains("msedge") {
+        "Edge"
+    } else if stem.contains("firefox") {
+        "Firefox"
+    } else if stem.contains("code") {
+        "VS Code"
+    } else if stem.contains("explorer") {
+        "资源管理器"
+    } else if stem.contains("transglass") {
+        "TransGlass"
+    } else if stem.contains("qqmusic") || stem.contains("cloudmusic") {
+        "QQ音乐"
+    } else if stem.contains("sakuracat") {
+        "SakuraCat"
+    } else if stem.contains("wechat") {
+        "微信"
+    } else if stem.contains("notepad") {
+        "记事本"
+    } else {
+        // 未知的：按空格/连字符切词，每段首字母大写，读起来像软件名
+        let mut out = String::new();
+        let mut upper = true;
+        for ch in stem.chars() {
+            if ch == ' ' || ch == '-' || ch == '_' {
+                out.push(' ');
+                upper = true;
+            } else if upper {
+                out.extend(ch.to_uppercase());
+                upper = false;
+            } else {
+                out.push(ch);
+            }
+        }
+        return out;
+    };
+    name.to_string()
 }
 
 /// 需要兼容处理的重型应用（PS 家族、画世界等）
@@ -4805,6 +4900,8 @@ static DOLL_DBLCLICK: AtomicBool = AtomicBool::new(true);
 /// 上次点纸娃娃的时间/位置（判断双击）
 static DOLL_LAST_CLICK: AtomicU32 = AtomicU32::new(0);
 static DOLL_LAST_POS: AtomicU32 = AtomicU32::new(0);
+/// 纸娃娃垂直居中的偏移（f32 bits），做阻尼平滑，避免逐帧 ±1px 抖动
+static DOLL_OFF_Y: AtomicU32 = AtomicU32::new(0);
 
 fn ball_expand_target() -> bool {
     BALL_EXPANDED.load(Ordering::Relaxed)
@@ -5337,8 +5434,19 @@ unsafe fn ball_render() {
                 }
                 let bw = x1 - x0;
                 let bh = y1 - y0;
-                let dx = cx - bw / 2 - x0;
-                let dy = cy - bh / 2 - y0;
+                // 水平：只按"舞台中心 - 球心"平移，不跟 bbox 走。
+                // 转视角时轮廓宽度一直在变，用 bbox 居中会让整个人左右抖一下（原地抽畜）。
+                let dx = cx - bx;
+                // 垂直：按包围盒居中，但做阻尼平滑，头和手臂的摆动不会变成逐帧跳动
+                let target_dy = (cy - (y0 + y1) / 2) as f32;
+                let prev_dy = f32::from_bits(DOLL_OFF_Y.load(Ordering::Relaxed));
+                let dy_f = if prev_dy.abs() < 0.01 {
+                    target_dy
+                } else {
+                    prev_dy + (target_dy - prev_dy) * 0.35
+                };
+                DOLL_OFF_Y.store(dy_f.to_bits(), Ordering::Relaxed);
+                let dy = dy_f.round() as i32;
                 for yy in 0..bh {
                     for xx in 0..bw {
                         let sx = x0 + xx;
@@ -5439,17 +5547,23 @@ unsafe fn ball_render() {
             if h.0.is_null() {
                 "未选中窗口".to_string()
             } else {
-                let mut t: Vec<u16> = vec![0; 260];
-                let n = GetWindowTextW(h, &mut t);
-                let s = String::from_utf16_lossy(&t[..n as usize]);
-                let s = s.trim();
-                if s.is_empty() {
-                    "未选中窗口".to_string()
-                } else if s.chars().count() > 11 {
-                    let cut: String = s.chars().take(11).collect();
-                    format!("{cut}…")
+                // 先写"是什么软件"，再写"在干什么"（透明度/置顶状态）
+                let app = app_short_name(h);
+                let alpha = target_alpha_now();
+                let pct = ((alpha as f32 / 255.0) * 100.0).round() as i32;
+                let doing = if GLOBAL_REGISTRY
+                    .get(&(h.0 as isize))
+                    .map(|s| s.user_pref_topmost)
+                    .unwrap_or(false)
+                {
+                    format!("{pct}% 置顶")
                 } else {
-                    s.to_string()
+                    format!("{pct}%")
+                };
+                if app.is_empty() {
+                    doing
+                } else {
+                    format!("{app} {doing}")
                 }
             }
         };
