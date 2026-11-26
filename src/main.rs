@@ -942,6 +942,8 @@ struct TransGlassApp {
     always_on_top: bool,
     last_geo: Option<[f32; 4]>,
     geo_changed_at: Option<std::time::Instant>,
+    selftest_open: bool,
+    selftest_text: String,
 }
 
 impl TransGlassApp {
@@ -1012,6 +1014,8 @@ impl TransGlassApp {
             always_on_top,
             last_geo: None,
             geo_changed_at: None,
+            selftest_open: false,
+            selftest_text: String::new(),
         }
     }
 
@@ -1317,6 +1321,12 @@ impl eframe::App for TransGlassApp {
                                 ui.close_menu();
                             }
                         });
+                        if ui.button("运行自检").clicked() {
+                            let _ = selftest::run_hosted();
+                            self.selftest_text = selftest::last_report();
+                            self.selftest_open = true;
+                            ui.close_menu();
+                        }
                     });
                 });
             });
@@ -1553,11 +1563,22 @@ impl eframe::App for TransGlassApp {
                     unsafe { restore_all_windows(); }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🚀 检查更新").clicked() {
+                    let busy = UPDATE_RUNNING.load(Ordering::Relaxed);
+                    let label = if busy { "检查中…" } else { "🚀 检查更新" };
+                    if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
                         thread::spawn(|| { let _ = run_self_update(); });
+                    }
+                    if busy {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(400));
                     }
                 });
             });
+            if let Ok(msg) = UPDATE_MSG.read() {
+                if let Some(msg) = msg.as_ref() {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(msg).small().weak());
+                }
+            }
 
             ui.add_space(10.0);
             // 键位总览：以前这里只有一句"去设置里改"，用户根本看不到当前绑了什么
@@ -1600,6 +1621,40 @@ impl eframe::App for TransGlassApp {
                     }
                 });
         });
+
+        if self.selftest_open {
+            let mut open = self.selftest_open;
+            egui::Window::new("自检报告")
+                .open(&mut open)
+                .collapsible(false)
+                .default_width(520.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(380.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&self.selftest_text)
+                                        .monospace()
+                                        .size(11.0),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("复制报告").clicked() {
+                            ctx.copy_text(self.selftest_text.clone());
+                        }
+                        if ui.button("重新运行").clicked() {
+                            let _ = selftest::run_hosted();
+                            self.selftest_text = selftest::last_report();
+                        }
+                    });
+                });
+            self.selftest_open = open;
+        }
 
         if self.hotkey_editor_open {
             let defaults = default_config();
@@ -2131,17 +2186,39 @@ fn main() -> Result<(), eframe::Error> {
     result
 }
 
+static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
+static UPDATE_MSG: RwLock<Option<String>> = RwLock::new(None);
+
 fn run_self_update() -> Result<(), Box<dyn std::error::Error>> {
-    let current = env!("CARGO_PKG_VERSION");
-    let _ = Update::configure()
-        .repo_owner("railgun-1145")
-        .repo_name("TransGlass")
-        .bin_name("transglass")
-        .show_download_progress(true)
-        .current_version(current)
-        .build()?
-        .update()?;
-    Ok(())
+    UPDATE_RUNNING.store(true, Ordering::SeqCst);
+    if let Ok(mut m) = UPDATE_MSG.write() {
+        *m = None;
+    }
+    let outcome = (|| -> Result<String, Box<dyn std::error::Error>> {
+        let current = env!("CARGO_PKG_VERSION");
+        let status = Update::configure()
+            .repo_owner("railgun-1145")
+            .repo_name("TransGlass")
+            .bin_name("transglass")
+            .show_download_progress(true)
+            .current_version(current)
+            .build()?
+            .update()?;
+        Ok(if status.updated() {
+            format!("已更新到 v{}，重启程序后生效", status.version())
+        } else {
+            format!("已是最新版本 v{current}")
+        })
+    })();
+    let text = match &outcome {
+        Ok(s) => s.clone(),
+        Err(e) => format!("检查更新失败：{e}"),
+    };
+    if let Ok(mut m) = UPDATE_MSG.write() {
+        *m = Some(text);
+    }
+    UPDATE_RUNNING.store(false, Ordering::SeqCst);
+    outcome.map(|_| ())
 }
 
 #[derive(Deserialize, Serialize, Clone)]

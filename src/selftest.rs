@@ -14,6 +14,17 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::RwLock;
+
+/// 最近一次自检的文本报告，供面板内「运行自检」直接展示。
+static LAST_REPORT: RwLock<String> = RwLock::new(String::new());
+
+pub fn last_report() -> String {
+    LAST_REPORT
+        .read()
+        .map(|s| s.clone())
+        .unwrap_or_default()
+}
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Security::{
@@ -152,7 +163,7 @@ fn log_targets(cfg_path: &std::path::Path) -> Vec<PathBuf> {
     out
 }
 
-pub fn run(strict: bool) -> i32 {
+fn execute(strict: bool, hosting: bool) -> i32 {
     let mut rep = Report::new();
 
     let exe = std::env::current_exe()
@@ -164,21 +175,28 @@ pub fn run(strict: bool) -> i32 {
 
     // ---------- 1. 单实例（必须最先，否则会污染热键探测） ----------
     rep.section("单实例");
-    let instance_running = unsafe {
-        SetLastError(ERROR_SUCCESS);
-        match CreateMutexW(None, true, SINGLE_INSTANCE_NAME) {
-            Ok(handle) => {
-                let already = GetLastError() == ERROR_ALREADY_EXISTS;
-                let _ = CloseHandle(handle);
-                already
-            }
-            Err(e) => {
-                rep.fail("互斥体", format!("创建失败: {e}"));
-                false
+    // 面板内自检时，互斥体本来就被自己这个进程持有，不能再据此判定"已有实例"
+    let instance_running = if hosting {
+        false
+    } else {
+        unsafe {
+            SetLastError(ERROR_SUCCESS);
+            match CreateMutexW(None, true, SINGLE_INSTANCE_NAME) {
+                Ok(handle) => {
+                    let already = GetLastError() == ERROR_ALREADY_EXISTS;
+                    let _ = CloseHandle(handle);
+                    already
+                }
+                Err(e) => {
+                    rep.fail("互斥体", format!("创建失败: {e}"));
+                    false
+                }
             }
         }
     };
-    if instance_running {
+    if hosting {
+        rep.pass("互斥体", "由当前面板进程持有（面板内自检，跳过重复实例判定）");
+    } else if instance_running {
         rep.warn("互斥体", "已有另一个 TransGlass 在运行（热键注册探测将被跳过）");
     } else {
         rep.pass("互斥体", "当前没有其它实例占用");
@@ -271,7 +289,9 @@ pub fn run(strict: bool) -> i32 {
     if used_default {
         rep.warn("基准", "以下注册结果基于内置默认键位，不是你配置文件里的键位");
     }
-    if instance_running {
+    if hosting {
+        rep.warn("跳过", "面板内自检：当前进程占着热键，注册探测无意义（用命令行 --self-test 才测）");
+    } else if instance_running {
         rep.warn("跳过", "已有实例在运行，它占着全部热键，注册探测无意义");
     } else if probe_items.is_empty() {
         rep.warn("跳过", "没有键名合法的槽位可测");
@@ -440,5 +460,18 @@ pub fn run(strict: bool) -> i32 {
         }
     }
 
+    if let Ok(mut slot) = LAST_REPORT.write() {
+        *slot = rep.out.clone();
+    }
     code
+}
+
+/// 命令行入口：`transglass.exe --self-test`
+pub fn run(strict: bool) -> i32 {
+    execute(strict, false)
+}
+
+/// 面板内入口：跳过单实例/热键注册探测，避免把"自己占用"判成"别人占用"
+pub fn run_hosted() -> i32 {
+    execute(false, true)
 }
