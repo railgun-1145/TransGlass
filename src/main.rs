@@ -1076,6 +1076,9 @@ struct TransGlassApp {
     geo_changed_at: Option<std::time::Instant>,
     selftest_open: bool,
     selftest_text: String,
+    wins: Vec<WinInfo>,
+    wins_at: Option<std::time::Instant>,
+    selected: Option<isize>,
     issues_ver: u32,
     issues_cache: Vec<String>,
     overview_ver: u32,
@@ -1145,6 +1148,9 @@ impl TransGlassApp {
             geo_changed_at: None,
             selftest_open: false,
             selftest_text: String::new(),
+            wins: Vec::new(),
+            wins_at: None,
+            selected: None,
             issues_ver: u32::MAX,
             issues_cache: Vec::new(),
             overview_ver: u32::MAX,
@@ -1152,6 +1158,192 @@ impl TransGlassApp {
         }
     }
 
+    fn refresh_window_list(&mut self, force: bool) {
+        let due = self
+            .wins_at
+            .map(|t| t.elapsed().as_millis() > 1500)
+            .unwrap_or(true);
+        if !force && !due {
+            return;
+        }
+        self.wins_at = Some(std::time::Instant::now());
+        self.wins = enumerate_windows();
+        if let Some(sel) = self.selected {
+            if !self.wins.iter().any(|w| w.hwnd == sel) {
+                self.selected = None;
+            }
+        }
+    }
+
+    fn nav_windows(&mut self, ui: &mut egui::Ui) {
+        let list: Vec<(isize, String, String)> = self
+            .wins
+            .iter()
+            .map(|w| (w.hwnd, w.title.clone(), w.desktop.clone()))
+            .collect();
+        if list.is_empty() {
+            ui.label(egui::RichText::new("没有可见窗口").small().weak());
+            return;
+        }
+        let mut order: Vec<String> = Vec::new();
+        for (_, _, d) in &list {
+            if !order.contains(d) {
+                order.push(d.clone());
+            }
+        }
+        let cur_sel = self.selected;
+        let mut select: Option<isize> = None;
+        let mut restore_now: Option<isize> = None;
+        for desk in order {
+            let items: Vec<&(isize, String, String)> =
+                list.iter().filter(|(_, _, d)| *d == desk).collect();
+            let managed_in = items
+                .iter()
+                .filter(|(h, _, _)| GLOBAL_REGISTRY.contains_key(h))
+                .count();
+            let header = if managed_in > 0 {
+                format!("{desk} · {managed_in} 个已管理")
+            } else {
+                desk.clone()
+            };
+            egui::CollapsingHeader::new(egui::RichText::new(header).small().strong())
+                .default_open(true)
+                .id_source(desk.clone())
+                .show(ui, |ui| {
+                    for (hwnd, title, _) in &items {
+                        let managed = GLOBAL_REGISTRY.contains_key(hwnd);
+                        let mark = if managed { "●" } else { "○" };
+                        let mut text = egui::RichText::new(format!("{mark} {title}")).small();
+                        if !managed {
+                            text = text.weak();
+                        }
+                        let resp = ui.selectable_label(cur_sel == Some(*hwnd), text);
+                        if resp.clicked() {
+                            select = Some(*hwnd);
+                        }
+                        resp.context_menu(|ui| {
+                            ui.label(egui::RichText::new(title.as_str()).strong().small());
+                            ui.separator();
+                            match GLOBAL_REGISTRY.get(hwnd) {
+                                Some(st) => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "透明度 {}%",
+                                            (st.current_alpha as f32 / 255.0 * 100.0).round() as i32
+                                        ))
+                                        .small(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "置顶：{}",
+                                            if st.user_pref_topmost { "是" } else { "否" }
+                                        ))
+                                        .small(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "鼠标点透：{}",
+                                            if st.mouse_passthrough { "开" } else { "关" }
+                                        ))
+                                        .small(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "笔点透：{}",
+                                            if st.pen_passthrough { "开" } else { "关" }
+                                        ))
+                                        .small(),
+                                    );
+                                    ui.separator();
+                                    if ui.button("还原这个窗口").clicked() {
+                                        restore_now = Some(*hwnd);
+                                    }
+                                }
+                                None => {
+                                    ui.label(egui::RichText::new("未管理").small().weak());
+                                }
+                            }
+                        });
+                    }
+                });
+        }
+        if let Some(h) = select {
+            self.selected = Some(h);
+        }
+        if let Some(h) = restore_now {
+            unsafe { restore_window(HWND(h as *mut _)) };
+            self.refresh_window_list(true);
+        }
+    }
+
+    fn detail_pane(&mut self, ui: &mut egui::Ui) {
+        let Some(sel) = self.selected else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(140.0);
+                ui.label(egui::RichText::new("从左侧选择一个窗口").size(14.0).weak());
+            });
+            return;
+        };
+        let info = self.wins.iter().find(|w| w.hwnd == sel).cloned();
+        let title = info
+            .as_ref()
+            .map(|w| w.title.clone())
+            .unwrap_or_else(|| format!("HWND {sel:#x}"));
+        let desktop = info.as_ref().map(|w| w.desktop.clone()).unwrap_or_default();
+        let st = GLOBAL_REGISTRY
+            .get(&sel)
+            .map(|s| (s.current_alpha, s.user_pref_topmost, s.mouse_passthrough, s.pen_passthrough));
+        let (alpha, top, mouse, pen) = st.unwrap_or((255, false, false, false));
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(&title).strong().size(17.0));
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "{desktop} ｜ {} ｜ HWND {sel:#x}",
+                if st.is_some() { "已管理" } else { "未管理" }
+            ))
+            .small()
+            .weak(),
+        );
+        ui.add_space(12.0);
+        card(ui, |ui| {
+            ui.label(egui::RichText::new("透明度").small().color(TEXT_SECONDARY));
+            let mut a = alpha as f32;
+            let resp = ui.add(egui::Slider::new(&mut a, 30.0..=255.0).show_value(false));
+            ui.label(egui::RichText::new(format!("{}%", (a / 255.0 * 100.0).round() as i32)).small());
+            if resp.changed() {
+                unsafe {
+                    ensure_managed(HWND(sel as *mut _));
+                    set_window_alpha(HWND(sel as *mut _), a as u8);
+                }
+            }
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("状态").small().color(TEXT_SECONDARY));
+            ui.horizontal(|ui| {
+                if ui.selectable_label(top, "置顶").clicked() {
+                    unsafe { toggle_topmost(HWND(sel as *mut _)) };
+                }
+                ui.add_space(6.0);
+                if ui.selectable_label(mouse, "鼠标点透").clicked() {
+                    unsafe { toggle_mouse_passthrough(HWND(sel as *mut _)) };
+                }
+                ui.add_space(6.0);
+                if ui.selectable_label(pen, "笔点透").clicked() {
+                    unsafe { toggle_pen_passthrough(HWND(sel as *mut _)) };
+                }
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("♻ 还原这个窗口").clicked() {
+                    unsafe { restore_window(HWND(sel as *mut _)) };
+                    self.refresh_window_list(true);
+                }
+                if ui.button("⟳ 刷新列表").clicked() {
+                    self.refresh_window_list(true);
+                }
+            });
+        });
+    }
     fn open_hotkey_editor(&mut self) {
         self.hotkey_draft = load_or_create_hotkey_config();
         self.hotkey_message = None;
@@ -1405,389 +1597,138 @@ impl eframe::App for TransGlassApp {
         }
 
         // 3. UI 绘制 (更简洁现代的布局)
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("TransGlass").color(ACCENT).strong().size(19.0));
-                // 输入模式做成可点的：以前只能靠热键盲切
-                let mode_btn = ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new(format!("输入模式：{}", input_mode_label())).small(),
-                        )
-                        .frame(false),
-                    )
-                    .on_hover_text("点击切换输入模式（也可以按 Alt+Shift+M）");
-                if mode_btn.clicked() {
-                    cycle_input_mode();
-                }
+        // 3. 大界面：左侧导航（桌面分组 + 窗口），右侧详情
+        self.refresh_window_list(false);
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(" 🗙 隐藏 ").clicked() {
-                        hide_root_window();
-                    }
-                    let pin = ui
-                        .add(
-                            egui::Button::new(if self.always_on_top { "📌" } else { "📍" })
-                                .frame(false),
-                        )
-                        .on_hover_text(if self.always_on_top {
-                            "面板已置顶，点击取消"
-                        } else {
-                            "点击让面板置顶（调参时不被目标窗口遮住）"
-                        });
-                    if pin.clicked() {
-                        self.always_on_top = !self.always_on_top;
-                        self.ui_state.always_on_top = Some(self.always_on_top);
-                        save_ui_state(&self.ui_state);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                            if self.always_on_top {
-                                egui::WindowLevel::AlwaysOnTop
-                            } else {
-                                egui::WindowLevel::Normal
-                            },
-                        ));
-                    }
-                    ui.menu_button(" ☰ ", |ui| {
-                        ui.menu_button("设置", |ui| {
-                            if ui.button("快捷键").clicked() {
-                                self.open_hotkey_editor();
-                                ui.close_menu();
-                            }
-                        });
-                        if ui.button("运行自检").clicked() {
-                            let _ = selftest::run_hosted();
-                            self.selftest_text = selftest::last_report();
-                            self.selftest_open = true;
-                            ui.close_menu();
-                        }
-                    });
-                });
-            });
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(10.0);
-
-            // 配置/热键问题提示（以前这些错误是静默吞掉的）
-            let issue_ver = ISSUES_VERSION.load(Ordering::Relaxed);
-            if issue_ver != self.issues_ver {
-                self.issues_ver = issue_ver;
-                self.issues_cache = snapshot_issues();
-            }
-            let issues = &self.issues_cache;
-            if !issues.is_empty() {
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(255, 247, 237))
-                    .inner_margin(egui::Margin::same(6.0))
-                    .rounding(4.0)
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(format!("⚠ 有 {} 条配置/热键问题", issues.len()))
-                                .color(egui::Color32::from_rgb(180, 83, 9))
-                                .strong()
-                                .small(),
-                        );
-                        for msg in issues.iter().take(4) {
-                            ui.label(
-                                egui::RichText::new(format!("• {msg}"))
-                                    .color(egui::Color32::from_rgb(146, 64, 14))
-                                    .small(),
-                            );
-                        }
-                        if issues.len() > 4 {
-                            ui.label(
-                                egui::RichText::new(format!("…还有 {} 条，详见 --self-test 报告", issues.len() - 4))
-                                    .small()
-                                    .weak(),
-                            );
-                        }
-                    });
-                ui.add_space(8.0);
-            }
-
-            // 热键优先开关：开启后用低级键盘钩子强占组合键
-            let mut priority = self.hotkey_priority_ui;
-            let resp = ui
-                .checkbox(&mut priority, "快捷键优先（强占组合键）")
-                .on_hover_text(
-                    "开启：用低级键盘钩子抢在其它程序前面拦截已配置的组合键，\n\
-                     即使这个键被别的软件占用，TransGlass 也能收到。\n\
-                     关闭：使用系统热键注册，先到先得——被占用就没有反应。",
-                );
-            if resp.changed() {
-                self.hotkey_priority_ui = priority;
-                match save_priority_flag(priority) {
-                    Ok(()) => {
-                        self.hotkey_message = Some(if priority {
-                            "已开启快捷键优先（强占组合键）".to_string()
-                        } else {
-                            "已关闭快捷键优先，改用系统热键注册".to_string()
-                        })
-                    }
-                    Err(e) => push_issue(format!("保存快捷键优先设置失败: {e}")),
-                }
-            }
+        egui::TopBottomPanel::bottom("actions_bar").show(ctx, |ui| {
             ui.add_space(6.0);
-
-            // 状态行：最近输入设备 + 已管理窗口数（数位板用户最关心设备判型）
-            let dev_label = match LAST_INPUT_IS_PEN.load(Ordering::Relaxed) {
-                1 => "最近输入：笔",
-                0 => "最近输入：鼠标",
-                _ => "最近输入：—",
-            };
-            ui.label(
-                egui::RichText::new(format!("{dev_label} ｜ 已管理 {} 个窗口", GLOBAL_REGISTRY.len()))
-                    .small()
-                    .weak(),
-            )
-            .on_hover_text(
-                "自动模式靠 Windows 的注入标记判断笔；\n\
-                 多数 WinTab 驱动（Wacom/Huion）会把笔当普通鼠标发事件，\n\
-                 这时点上面的「输入模式」切到「强制笔」即可。",
-            );
-            ui.add_space(6.0);
-
-            // 正在管理的窗口
-            ui.label(egui::RichText::new("已调节的窗口").strong().size(12.0).color(TEXT_SECONDARY));
-            ui.add_space(5.0);
-
-            egui::ScrollArea::vertical()
-                .max_height(250.0)
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    if GLOBAL_REGISTRY.is_empty() {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(60.0);
-                            ui.label(egui::RichText::new("暂无管理记录\n使用热键开始管理").weak());
-                        });
-                    }
-
-                    let entries: Vec<(isize, WindowState)> = GLOBAL_REGISTRY
-                        .iter()
-                        .map(|kv| (*kv.key(), kv.value().clone()))
-                        .collect();
-
-                    let mut to_restore: Vec<isize> = Vec::new();
-                    let mut changes: Vec<PendingChange> = Vec::new();
-
-                    for (hwnd_val, state) in entries {
-                        if unsafe { is_own_hwnd(HWND(hwnd_val as *mut _)) } {
-                            continue;
-                        }
-                        if unsafe { is_shell_hwnd(HWND(hwnd_val as *mut _)) } {
-                            to_restore.push(hwnd_val);
-                            continue;
-                        }
-
-                        ui.add_space(4.0);
-                        card(ui, |ui| {
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.add(egui::Label::new(egui::RichText::new(&state.title).strong().size(14.0)).truncate());
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("还原").clicked() {
-                                            to_restore.push(hwnd_val);
-                                        }
-                                    });
-                                });
-
-                                ui.add_space(6.0);
-                                // 行 2：透明度滑杆 + 百分比 + 预设（原来滑杆不显数值，也看不到具体百分比）
-                                ui.horizontal(|ui| {
-                                    ui.label("透明度");
-                                    let mut alpha_f32 = state.current_alpha as f32;
-                                    let slider = egui::Slider::new(&mut alpha_f32, 30.0..=255.0)
-                                        .show_value(false)
-                                        .trailing_fill(true);
-                                    let resp = ui.add(slider);
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{}%",
-                                            (alpha_f32 / 255.0 * 100.0).round() as i32
-                                        ))
-                                        .small(),
-                                    );
-                                    ui.menu_button("预设", |ui| {
-                                        for pct in [25u32, 50, 75, 100] {
-                                            if ui.button(format!("{pct}%")).clicked() {
-                                                let alpha = ((pct as f32 / 100.0) * 255.0)
-                                                    .round()
-                                                    .clamp(30.0, 255.0)
-                                                    as u8;
-                                                changes.push(PendingChange {
-                                                    hwnd_val,
-                                                    alpha: Some(alpha),
-                                                    topmost: None,
-                                                    mouse_passthrough: None,
-                                                    pen_passthrough: None,
-                                                });
-                                                ui.close_menu();
-                                            }
-                                        }
-                                    });
-                                    if resp.changed() {
-                                        changes.push(PendingChange {
-                                            hwnd_val,
-                                            alpha: Some(alpha_f32 as u8),
-                                            topmost: None,
-                                            mouse_passthrough: None,
-                                            pen_passthrough: None,
-                                        });
-                                    }
-                                });
-                                ui.add_space(2.0);
-                                // 行 3：三个开关单独一行，避免挤出行外
-                                ui.horizontal(|ui| {
-                                    let mut topmost = state.user_pref_topmost;
-                                    if ui.checkbox(&mut topmost, "置顶").changed() {
-                                        changes.push(PendingChange {
-                                            hwnd_val,
-                                            alpha: None,
-                                            topmost: Some(topmost),
-                                            mouse_passthrough: None,
-                                            pen_passthrough: None,
-                                        });
-                                    }
-                                    ui.add_space(8.0);
-                                    let mut mouse_passthrough = state.mouse_passthrough;
-                                    if ui.checkbox(&mut mouse_passthrough, "鼠标点透").changed() {
-                                        changes.push(PendingChange {
-                                            hwnd_val,
-                                            alpha: None,
-                                            topmost: None,
-                                            mouse_passthrough: Some(mouse_passthrough),
-                                            pen_passthrough: None,
-                                        });
-                                    }
-                                    ui.add_space(8.0);
-                                    let mut pen_passthrough = state.pen_passthrough;
-                                    if ui.checkbox(&mut pen_passthrough, "笔点透").changed() {
-                                        changes.push(PendingChange {
-                                            hwnd_val,
-                                            alpha: None,
-                                            topmost: None,
-                                            mouse_passthrough: None,
-                                            pen_passthrough: Some(pen_passthrough),
-                                        });
-                                    }
-                                });
-                            });
-                        });
-                    }
-
-                    for hwnd_val in to_restore {
-                        unsafe { restore_window(HWND(hwnd_val as *mut _)); }
-                    }
-
-                    for c in changes {
-                        let mut apply_alpha: Option<u8> = None;
-                        let mut apply_top: Option<bool> = None;
-                        let mut apply_mouse: Option<bool> = None;
-                        let mut apply_pen: Option<bool> = None;
-                        if let Some(mut state) = GLOBAL_REGISTRY.get_mut(&c.hwnd_val) {
-                            if let Some(a) = c.alpha {
-                                state.current_alpha = a;
-                            }
-                            if let Some(t) = c.topmost {
-                                state.user_pref_topmost = t;
-                            }
-                            if let Some(m) = c.mouse_passthrough {
-                                state.mouse_passthrough = m;
-                            }
-                            if let Some(p) = c.pen_passthrough {
-                                state.pen_passthrough = p;
-                            }
-                            apply_alpha = Some(state.current_alpha);
-                            apply_top = Some(state.user_pref_topmost);
-                            apply_mouse = Some(state.mouse_passthrough);
-                            apply_pen = Some(state.pen_passthrough);
-                        }
-                        if let (Some(a), Some(t), Some(m), Some(p)) = (apply_alpha, apply_top, apply_mouse, apply_pen) {
-                            unsafe {
-                                let _ = apply_transparency_to_hwnd(HWND(c.hwnd_val as *mut _), a, t, m, p);
-                            }
-                        }
-                    }
-                });
-
-            ui.add_space(15.0);
-            ui.separator();
-            ui.add_space(10.0);
-
-            // 底部控制
             ui.horizontal(|ui| {
                 if ui.button("♻ 全部还原").clicked() {
-                    unsafe { restore_all_windows(); }
+                    unsafe { restore_all_windows() };
+                    self.refresh_window_list(true);
+                }
+                if ui.button("🛠 快捷键").clicked() {
+                    self.open_hotkey_editor();
+                }
+                if ui.button("🧪 自检").clicked() {
+                    let _ = selftest::run_hosted();
+                    self.selftest_text = selftest::last_report();
+                    self.selftest_open = true;
+                }
+                let busy = UPDATE_RUNNING.load(Ordering::Relaxed);
+                let label = if busy { "检查中…" } else { "🚀 检查更新" };
+                if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                    thread::spawn(|| {
+                        let _ = run_self_update();
+                    });
+                }
+                if busy {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(400));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let busy = UPDATE_RUNNING.load(Ordering::Relaxed);
-                    let label = if busy { "检查中…" } else { "🚀 检查更新" };
-                    if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
-                        thread::spawn(|| { let _ = run_self_update(); });
-                    }
-                    if busy {
-                        ctx.request_repaint_after(std::time::Duration::from_millis(400));
+                    let mut priority = self.hotkey_priority_ui;
+                    if ui.checkbox(&mut priority, "快捷键优先").changed() {
+                        self.hotkey_priority_ui = priority;
+                        if let Err(e) = save_priority_flag(priority) {
+                            push_issue(format!("保存快捷键优先设置失败: {e}"));
+                        }
                     }
                 });
             });
             if let Ok(msg) = UPDATE_MSG.read() {
                 if let Some(msg) = msg.as_ref() {
-                    ui.add_space(2.0);
                     ui.label(egui::RichText::new(msg).small().weak());
                 }
             }
+            ui.add_space(4.0);
+        });
 
-            ui.add_space(10.0);
-            // 键位总览：以前这里只有一句"去设置里改"，用户根本看不到当前绑了什么
-            let overview_ver = OVERVIEW_VERSION.load(Ordering::Relaxed);
-            if overview_ver != self.overview_ver {
-                self.overview_ver = overview_ver;
-                self.overview_cache = snapshot_hotkey_overview();
-            }
-            let overview = &self.overview_cache;
-            let mut want_editor = false;
-            let header = egui::RichText::new(format!("当前快捷键（{} 项）", overview.len()))
-                .strong()
-                .size(13.0);
-            egui::CollapsingHeader::new(header)
-                .default_open(true)
-                .show(ui, |ui| {
-                    if overview.is_empty() {
-                        ui.label(
-                            egui::RichText::new("尚未加载键位（热键线程启动后出现）")
-                                .small()
-                                .weak(),
-                        );
-                    }
-                    // 键位多时内部滚动；高度按剩余空间算，避免把底部按钮顶出可视区
-                    let room = (ui.available_height() - 56.0).max(48.0);
-                    egui::ScrollArea::vertical()
-                        .max_height(room)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for (name, combo, ok) in overview {
-                                ui.horizontal(|ui| {
-                                    let mark = if *ok { "✅" } else { "⚠" };
-                                    ui.label(egui::RichText::new(format!("{mark} {name}")).small());
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.label(egui::RichText::new(combo).small().strong());
-                                        },
-                                    );
-                                });
-                            }
-                        });
-                    ui.add_space(4.0);
-                    if ui.button("打开快捷键设置").clicked() {
-                        want_editor = true;
-                    }
+        egui::SidePanel::left("nav_panel")
+            .resizable(true)
+            .default_width(300.0)
+            .width_range(230.0..=460.0)
+            .show(ctx, |ui| {
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("TransGlass").color(ACCENT).strong().size(18.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let pin = ui
+                            .add(egui::Button::new(if self.always_on_top { "📌" } else { "📍" }).frame(false))
+                            .on_hover_text(if self.always_on_top { "面板已置顶，点击取消" } else { "点击让面板置顶" });
+                        if pin.clicked() {
+                            self.always_on_top = !self.always_on_top;
+                            self.ui_state.always_on_top = Some(self.always_on_top);
+                            save_ui_state(&self.ui_state);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                                if self.always_on_top {
+                                    egui::WindowLevel::AlwaysOnTop
+                                } else {
+                                    egui::WindowLevel::Normal
+                                },
+                            ));
+                        }
+                        if ui.button("🗙").on_hover_text("隐藏到托盘").clicked() {
+                            hide_root_window();
+                        }
+                    });
                 });
-            refresh_device_tracking();
-            // 借用结束之后再打开编辑器，避免同时可变借用 self
-            if want_editor {
-                self.open_hotkey_editor();
+                ui.add_space(6.0);
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new(format!("输入模式：{}", input_mode_label())).small(),
+                    ))
+                    .on_hover_text("点击切换（Alt+Shift+M）")
+                    .clicked()
+                {
+                    cycle_input_mode();
+                }
+                ui.add_space(4.0);
+                let dev = match LAST_INPUT_IS_PEN.load(Ordering::Relaxed) {
+                    1 => "笔",
+                    0 => "鼠标",
+                    _ => "—",
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "最近输入：{dev} ｜ 已管理 {} 个",
+                        GLOBAL_REGISTRY.len()
+                    ))
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                self.nav_windows(ui);
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(10.0);
+            let issues = snapshot_issues();
+            if !issues.is_empty() {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(255, 247, 237))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0xFD, 0xBA, 0x74)))
+                    .rounding(egui::Rounding::same(10.0))
+                    .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("⚠ {} 条配置/热键问题", issues.len()))
+                                .color(egui::Color32::from_rgb(180, 83, 9))
+                                .small()
+                                .strong(),
+                        );
+                        for msg in issues.iter().take(4) {
+                            ui.label(
+                                egui::RichText::new(format!("• {msg}"))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(146, 64, 14)),
+                            );
+                        }
+                    });
+                ui.add_space(10.0);
             }
+            self.detail_pane(ui);
         });
 
         if self.selftest_open {
@@ -2185,8 +2126,8 @@ fn main() -> Result<(), eframe::Error> {
     let ui_state = load_ui_state();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([
-            ui_state.w.unwrap_or(360.0),
-            ui_state.h.unwrap_or(560.0),
+            ui_state.w.filter(|w| *w >= 860.0).unwrap_or(1000.0),
+            ui_state.h.filter(|h| *h >= 560.0).unwrap_or(700.0),
         ])
         .with_title("TransGlass 控制面板")
         .with_visible(true);
@@ -2936,4 +2877,137 @@ fn apply_panel_theme(ctx: &egui::Context) {
     style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
     style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(11.0));
     ctx.set_style(style);
+}
+
+// ---------------------------------------------------------------------------
+// 窗口枚举 / 虚拟桌面分组（任务视图式大界面用）
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct WinInfo {
+    hwnd: isize,
+    title: String,
+    desktop: String,
+}
+
+struct VdmCache(Option<windows::Win32::UI::Shell::IVirtualDesktopManager>);
+unsafe impl Send for VdmCache {}
+unsafe impl Sync for VdmCache {}
+
+static VDM: OnceLock<VdmCache> = OnceLock::new();
+
+fn virtual_desktop_manager() -> Option<&'static windows::Win32::UI::Shell::IVirtualDesktopManager> {
+    VDM.get_or_init(|| unsafe {
+        use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // CLSID_VirtualDesktopManager = {AA509086-5CA9-4C25-8F95-589D3C07B48A}
+        let clsid = windows::core::GUID::from_u128(0xAA509086_5CA9_4C25_8F95_589D_3C07_B48A);
+        VdmCache(CoCreateInstance(&clsid, None, CLSCTX_ALL).ok())
+    })
+    .0
+    .as_ref()
+}
+
+fn window_desktop(hwnd: HWND) -> String {
+    let Some(manager) = virtual_desktop_manager() else {
+        return "未分组".to_string();
+    };
+    unsafe {
+        if let Ok(guid) = manager.GetWindowDesktopId(hwnd) {
+            let on_current = manager.IsWindowOnCurrentVirtualDesktop(hwnd).map(|b| b.as_bool()).unwrap_or(false);
+            let short = format!("{:08x}", guid.data1);
+            return if on_current {
+                format!("桌面 {short}（当前）")
+            } else {
+                format!("桌面 {short}")
+            };
+        }
+    }
+    "未分组".to_string()
+}
+
+unsafe extern "system" fn enum_win_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let out = &mut *(lparam.0 as *mut Vec<WinInfo>);
+    if IsWindowVisible(hwnd).as_bool() {
+        let mut buf: [u16; 256] = [0; 256];
+        let len = GetWindowTextW(hwnd, &mut buf);
+        if len > 0 && !is_shell_hwnd(hwnd) && !is_own_hwnd(hwnd) {
+            // 过滤工具窗/不可激活窗/过小窗（输入法皮肤、NVIDIA Overlay 之类）
+            let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            if (ex & WS_EX_TOOLWINDOW.0) != 0 || (ex & WS_EX_NOACTIVATE.0) != 0 {
+                return BOOL(1);
+            }
+            let mut rc = RECT::default();
+            if GetWindowRect(hwnd, &mut rc).is_ok()
+                && ((rc.right - rc.left) < 40 || (rc.bottom - rc.top) < 24)
+            {
+                return BOOL(1);
+            }
+            // DWM 隐身窗口（UWP 幽灵窗口）不算
+            let mut cloaked: u32 = 0;
+            let cloaked_h = windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+                hwnd,
+                windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
+                &mut cloaked as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+            .is_ok()
+                && cloaked != 0;
+            if !cloaked_h {
+                out.push(WinInfo {
+                    hwnd: hwnd.0 as isize,
+                    title: String::from_utf16_lossy(&buf[..len as usize]),
+                    desktop: window_desktop(hwnd),
+                });
+            }
+        }
+    }
+    BOOL(1)
+}
+
+fn enumerate_windows() -> Vec<WinInfo> {
+    let mut out: Vec<WinInfo> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(enum_win_proc), LPARAM(&mut out as *mut _ as isize));
+    }
+    out.sort_by(|a, b| a.desktop.cmp(&b.desktop).then_with(|| a.title.cmp(&b.title)));
+    out
+}
+
+/// 把一个窗口纳入管理（写入注册表并记录原始样式）
+unsafe fn ensure_managed(hwnd: HWND) {
+    let v = hwnd.0 as isize;
+    if GLOBAL_REGISTRY.get(&v).is_none() {
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let is_top = (ex & WS_EX_TOPMOST.0) != 0;
+        let title = get_window_title(hwnd);
+        GLOBAL_REGISTRY.insert(
+            v,
+            WindowState {
+                original_ex_style: ex,
+                current_alpha: 255,
+                original_is_topmost: is_top,
+                user_pref_topmost: is_top,
+                mouse_passthrough: false,
+                pen_passthrough: false,
+                title,
+            },
+        );
+    }
+}
+
+unsafe fn set_window_alpha(hwnd: HWND, alpha: u8) {
+    let v = hwnd.0 as isize;
+    let values = {
+        let mut out = None;
+        if let Some(mut st) = GLOBAL_REGISTRY.get_mut(&v) {
+            st.current_alpha = alpha;
+            out = Some((st.user_pref_topmost, st.mouse_passthrough, st.pen_passthrough));
+        }
+        out
+    };
+    if let Some((top, mouse, pen)) = values {
+        let _ = apply_transparency_to_hwnd(hwnd, alpha, top, mouse, pen);
+    }
+    request_ui_repaint();
 }

@@ -1,6 +1,6 @@
 ﻿[package]
 name = "transglass"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -15,7 +15,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_Accessibility",
     "Win32_UI_Shell",
     "Win32_UI_HiDpi",
-    "Win32_System_Console"
+    "Win32_System_Console",
+    "Win32_System_Com"
 ] }
 lazy_static = "1.4"
 dashmap = "5.5"
