@@ -2580,28 +2580,38 @@ fn create_tray_icon() -> TrayIcon {
 
     // 加载自定义图标
     let icon = load_custom_icon().unwrap_or_else(|| {
+        // 默认图标：我的世界玻璃方块（浅青玻璃 + 白边框 + 斜向高光）
         let mut rgba = Vec::with_capacity(32 * 32 * 4);
-        for y in 0..32 {
-            for x in 0..32 {
-                let dx = x as f32 - 15.5;
-                let dy = y as f32 - 15.5;
-                let dist = (dx * dx + dy * dy).sqrt();
-                if dist < 14.0 {
-                    if dist > 11.0 {
-                        // 外圈 (更深的蓝色)
-                        rgba.extend_from_slice(&[0, 120, 215, 255]);
-                    } else {
-                        // 内圈 (半透明蓝色，模仿玻璃)
-                        rgba.extend_from_slice(&[0, 150, 255, 128]);
-                    }
-                } else {
+        for y in 0..32i32 {
+            for x in 0..32i32 {
+                let inside = (5..=26).contains(&x) && (5..=26).contains(&y);
+                if !inside {
                     rgba.extend_from_slice(&[0, 0, 0, 0]);
+                    continue;
+                }
+                let edge = x == 5 || x == 26 || y == 5 || y == 26;
+                let inner_edge = x == 6 || x == 25 || y == 6 || y == 25;
+                if edge {
+                    rgba.extend_from_slice(&[236, 246, 250, 245]);
+                } else if inner_edge {
+                    rgba.extend_from_slice(&[210, 232, 240, 220]);
+                } else {
+                    // 斜向玻璃高光
+                    let d1 = (x - y).abs();
+                    let d2 = ((x - 5) + (y - 5) - 20).abs();
+                    let a = if d1 <= 1 || d2 <= 1 { 205 } else { 170 };
+                    let shade = ((x + y) as f32 / 52.0 * 18.0) as u8;
+                    rgba.extend_from_slice(&[
+                        205u8.saturating_sub(shade),
+                        228u8.saturating_sub(shade / 2),
+                        238u8.saturating_sub(shade / 3),
+                        a,
+                    ]);
                 }
             }
         }
         tray_icon::Icon::from_rgba(rgba, 32, 32).unwrap()
     });
-
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
         .with_tooltip("TransGlass - 运行中")
@@ -3480,7 +3490,7 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 // ---- 面板配色（取值来自 DSH 界面取样）----
-pub(crate) const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x41, 0x76, 0xE6);
+pub(crate) const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x4E, 0x8F, 0xA8);
 pub(crate) const SURFACE: egui::Color32 = egui::Color32::WHITE;
 pub(crate) const BG_BASE: egui::Color32 = egui::Color32::from_rgb(0xFA, 0xFA, 0xFA);
 pub(crate) const BG_SIDEBAR: egui::Color32 = egui::Color32::from_rgb(0xF9, 0xFA, 0xFB);
@@ -4026,7 +4036,7 @@ unsafe fn ball_render() {
     let _ = windows::Win32::Graphics::Gdi::FillRect(mem_big, &full, magenta);
 
     let t = f32::from_bits(BALL_ANIM.load(Ordering::Relaxed));
-    let accent = CreateSolidBrush(COLORREF(0x00E6_7641));
+    let accent = CreateSolidBrush(COLORREF(0x00A8_8F4E));
     let (bx, by) = ball_center();
     let (bx, by) = (bx * ss, by * ss);
     let white_pen = CreatePen(PS_SOLID, 2 * ss, COLORREF(0x00FF_FFFF));
@@ -4057,7 +4067,7 @@ unsafe fn ball_render() {
             windows::core::w!("Microsoft YaHei"),
         );
         let sat_old = SelectObject(mem_big, HGDIOBJ(sat_font.0));
-        let _ = SetTextColor(mem_big, COLORREF(0x00E6_7641));
+        let _ = SetTextColor(mem_big, COLORREF(0x00A8_8F4E));
         for (i, (sx, sy)) in sats.iter().enumerate() {
             let r = (17.0 * (0.6 + 0.4 * t)) as i32 * ss;
             let (sx, sy) = (sx * ss, sy * ss);
