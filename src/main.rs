@@ -917,6 +917,42 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
             );
         }
 
+        // 战争雷霆式绑定：鼠标键也能当热键（左/右/中/侧键1/2、滚轮上下）
+        let mouse_vk = match msg {
+            WM_LBUTTONDOWN => Some(0x01u32),
+            WM_RBUTTONDOWN => Some(0x02),
+            WM_MBUTTONDOWN => Some(0x04),
+            WM_XBUTTONDOWN => Some(if ((info.mouseData >> 16) & 0xffff) == 1 {
+                0x05
+            } else {
+                0x06
+            }),
+            WM_MOUSEWHEEL => Some(if (info.mouseData >> 16) as i16 > 0 {
+                0x20A
+            } else {
+                0x20B
+            }),
+            _ => None,
+        };
+        if let Some(vk) = mouse_vk {
+            let mods = current_hotkey_mods();
+            let hit = HOTKEY_MATCH.read().ok().and_then(|list| {
+                list.iter()
+                    .find(|(_, m, v)| *v == vk && *m == mods)
+                    .map(|(id, _, _)| *id)
+            });
+            if let Some(id) = hit {
+                let tid = HOTKEY_THREAD_ID.load(Ordering::Relaxed);
+                if tid != 0 {
+                    let _ = PostThreadMessageW(tid, WM_HOTKEY, WPARAM(id as usize), LPARAM(0));
+                }
+                // 侧键/中键吞掉；左/右键和滚轮放行，否则正常操作会坏
+                if matches!(vk, 0x04 | 0x05 | 0x06) {
+                    return LRESULT(1);
+                }
+            }
+        }
+
         if msg == WM_XBUTTONDOWN {
             let button = ((info.mouseData >> 16) & 0xffff) as u16;
             let action = if let Ok(r) = MOUSE_BINDINGS.read() {
@@ -1442,6 +1478,8 @@ struct TransGlassApp {
     hotkey_draft: HotkeyConfig,
     hotkey_message: Option<String>,
     hotkey_capture: Option<HotkeyCaptureTarget>,
+    /// 开始录入的时间（刚点「录入」的那一下鼠标左键不算）
+    hotkey_capture_at: Option<std::time::Instant>,
     hotkey_priority_ui: bool,
     ui_state: UiState,
     always_on_top: bool,
@@ -1561,6 +1599,7 @@ impl TransGlassApp {
             hotkey_draft: load_or_create_hotkey_config(),
             hotkey_message: None,
             hotkey_capture: None,
+            hotkey_capture_at: None,
             hotkey_priority_ui: current_priority_flag(),
             ui_state,
             always_on_top,
@@ -2210,12 +2249,19 @@ impl TransGlassApp {
     fn validate_hotkey_spec(spec: &HotkeySpec) -> Result<(), String> {
         unsafe {
             let mods = parse_modifiers(&spec.modifiers);
-            if mods.0 == 0 {
-                return Err("修饰键不能为空（建议至少包含 ALT/CTRL/SHIFT/WIN 之一）".into());
-            }
             let vk = parse_vk(&spec.key);
             if vk.is_none() {
                 return Err(format!("无效按键：{}", spec.key));
+            }
+            let mouse = matches!(vk, Some(v) if is_mouse_vk(v));
+            if mods.0 == 0 {
+                // 鼠标键可以单按；但左右键必须带修饰键，否则会抢掉正常点击
+                if !mouse {
+                    return Err("修饰键不能为空（建议至少包含 ALT/CTRL/SHIFT/WIN 之一）".into());
+                }
+                if matches!(vk, Some(0x01) | Some(0x02)) {
+                    return Err("鼠标左键/右键必须带修饰键（例如 Alt+鼠标左键）".into());
+                }
             }
         }
         Ok(())
@@ -2281,6 +2327,25 @@ impl TransGlassApp {
         if let Err(e) = Self::validate_config(&self.hotkey_draft) {
             self.hotkey_message = Some(e);
             return;
+        }
+        // 槽位里已经用到鼠标侧键时，把旧版「鼠标侧键」那套清空，不然一次按下会触发两次
+        {
+            let used_x1 = HotkeySlot::ALL.iter().any(|s| {
+                let k = s.get(&self.hotkey_draft).key.trim().to_uppercase();
+                k == "鼠标侧键1" || k == "XBUTTON1" || k == "MOUSE4"
+            });
+            let used_x2 = HotkeySlot::ALL.iter().any(|s| {
+                let k = s.get(&self.hotkey_draft).key.trim().to_uppercase();
+                k == "鼠标侧键2" || k == "XBUTTON2" || k == "MOUSE5"
+            });
+            if let Some(m) = self.hotkey_draft.mouse.as_mut() {
+                if used_x1 {
+                    m.xbutton1 = None;
+                }
+                if used_x2 {
+                    m.xbutton2 = None;
+                }
+            }
         }
         let path = get_config_path();
         match serde_json::to_string_pretty(&self.hotkey_draft)
@@ -2431,6 +2496,11 @@ impl eframe::App for TransGlassApp {
 
         if self.hotkey_capture.is_some() {
             let mut captured: Option<(String, String)> = None;
+            // 刚点「录入」的那一下鼠标左键不能算，否则会立刻绑成"鼠标左键"
+            let armed = self
+                .hotkey_capture_at
+                .map(|t| t.elapsed().as_secs_f32() > 0.18)
+                .unwrap_or(true);
             ctx.input(|i| {
                 for e in &i.events {
                     if let egui::Event::Key {
@@ -2444,6 +2514,31 @@ impl eframe::App for TransGlassApp {
                             captured = Some((egui_modifiers_to_string(*modifiers), k));
                             break;
                         }
+                    }
+                    if let egui::Event::PointerButton {
+                        button,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = e
+                    {
+                        if !armed && matches!(button, egui::PointerButton::Primary) {
+                            continue;
+                        }
+                        let name = match button {
+                            egui::PointerButton::Primary => "鼠标左键",
+                            egui::PointerButton::Secondary => "鼠标右键",
+                            egui::PointerButton::Middle => "鼠标中键",
+                            egui::PointerButton::Extra1 => "鼠标侧键1",
+                            egui::PointerButton::Extra2 => "鼠标侧键2",
+                        };
+                        captured = Some((egui_modifiers_to_string(*modifiers), name.to_string()));
+                        break;
+                    }
+                    if let egui::Event::MouseWheel { delta, modifiers, .. } = e {
+                        let name = if delta.y > 0.0 { "滚轮上" } else { "滚轮下" };
+                        captured = Some((egui_modifiers_to_string(*modifiers), name.to_string()));
+                        break;
                     }
                 }
             });
@@ -3224,9 +3319,22 @@ unsafe fn parse_vk(s: &str) -> Option<u32> {
         "[" | "OEM_4" => 0xDB, "]" | "OEM_6" => 0xDD, "\\" | "OEM_5" => 0xDC,
         ";" | "OEM_1" => 0xBA, "'" | "OEM_7" => 0xDE,
         "," | "OEM_COMMA" => 0xBC, "." | "OEM_PERIOD" => 0xBE, "/" | "OEM_2" => 0xBF,
+        // 鼠标键（虚拟键码）+ 滚轮（自定义码，只有鼠标钩子认）
+        "鼠标左键" | "MOUSE1" => 0x01,
+        "鼠标右键" | "MOUSE2" => 0x02,
+        "鼠标中键" | "MOUSE3" => 0x04,
+        "鼠标侧键1" | "XBUTTON1" | "MOUSE4" => 0x05,
+        "鼠标侧键2" | "XBUTTON2" | "MOUSE5" => 0x06,
+        "滚轮上" | "WHEELUP" => 0x20A,
+        "滚轮下" | "WHEELDOWN" => 0x20B,
         _ => return None,
     };
     Some(vk)
+}
+
+/// 是不是"鼠标键"：这些键 RegisterHotKey 注册不了，由鼠标钩子接管
+pub(crate) fn is_mouse_vk(vk: u32) -> bool {
+    matches!(vk, 0x01 | 0x02 | 0x04 | 0x05 | 0x06 | 0x20A | 0x20B)
 }
 
 /// 注册单个热键；失败时把原因记进 `RUNTIME_ISSUES`，不再静默吞掉。
@@ -3239,6 +3347,10 @@ unsafe fn try_register_hotkey(id: i32, spec: &HotkeySpec, name: &str) -> bool {
         ));
         return false;
     };
+    // 鼠标键没有 RegisterHotKey，交给低级鼠标钩子（见 mouse_hook_proc）
+    if is_mouse_vk(vk) {
+        return true;
+    }
     match RegisterHotKey(None, id, mods, vk) {
         Ok(()) => true,
         Err(e) => {
@@ -3554,6 +3666,7 @@ impl HotkeySlot {
 pub(crate) const KEY_CHOICES: &[&str] = &[
     "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
     "S", "T", "U", "V", "W", "X", "Y", "Z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "鼠标左键", "鼠标右键", "鼠标中键", "鼠标侧键1", "鼠标侧键2", "滚轮上", "滚轮下",
     "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14",
     "F15", "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24", "SPACE", "TAB",
     "ENTER", "ESC", "BACKSPACE", "DELETE", "INSERT", "HOME", "END", "PAGEUP", "PAGEDOWN",
@@ -5282,6 +5395,15 @@ impl TransGlassApp {
                 .small()
                 .weak(),
         );
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(
+                "点「录入」后按任意键或鼠标键即可绑定（支持鼠标侧键1/2、中键、滚轮上下）；\
+                 鼠标左键/右键必须配修饰键。",
+            )
+            .small()
+            .weak(),
+        );
         ui.add_space(10.0);
         self.hotkey_editor_inline(ui);
     }
@@ -5369,11 +5491,12 @@ impl TransGlassApp {
                 });
                 if ui
                     .add_enabled(enabled, egui::Button::new("录入"))
-                    .on_hover_text("按下想用的组合键")
+                    .on_hover_text("按下想用的按键或鼠标键")
                     .clicked()
                 {
                     self.hotkey_capture = Some(slot.capture_target());
-                    self.hotkey_message = Some("请按下组合键".into());
+                    self.hotkey_capture_at = Some(std::time::Instant::now());
+                    self.hotkey_message = Some("按下按键或鼠标键…".into());
                 }
             });
             if enabled {
@@ -5384,50 +5507,6 @@ impl TransGlassApp {
 
         ui.add_space(8.0);
         ui.separator();
-        ui.label(egui::RichText::new("鼠标侧键").strong().color(TEXT_SECONDARY));
-        let defaults = default_config();
-        if self.hotkey_draft.mouse.is_none() {
-            self.hotkey_draft.mouse = defaults.mouse.clone();
-        }
-        if let Some(spec) = self.hotkey_draft.mouse.as_mut() {
-            let mut x1 = spec.xbutton1.clone().unwrap_or_else(|| "none".into());
-            let mut x2 = spec.xbutton2.clone().unwrap_or_else(|| "none".into());
-            let options = [
-                "none",
-                "decrease",
-                "increase",
-                "toggle_topmost",
-                "toggle_click_through",
-                "toggle_pen_passthrough",
-                "cycle_input_mode",
-                "reset_current",
-                "reset_all",
-                "update",
-            ];
-            ui.horizontal(|ui| {
-                ui.label("XButton1");
-                egui::ComboBox::from_id_source("xbutton1_combo")
-                    .selected_text(x1.as_str())
-                    .show_ui(ui, |ui| {
-                        for o in options {
-                            ui.selectable_value(&mut x1, o.into(), o);
-                        }
-                    });
-            });
-            ui.horizontal(|ui| {
-                ui.label("XButton2");
-                egui::ComboBox::from_id_source("xbutton2_combo")
-                    .selected_text(x2.as_str())
-                    .show_ui(ui, |ui| {
-                        for o in options {
-                            ui.selectable_value(&mut x2, o.into(), o);
-                        }
-                    });
-            });
-            spec.xbutton1 = if x1 == "none" { None } else { Some(x1) };
-            spec.xbutton2 = if x2 == "none" { None } else { Some(x2) };
-        }
-
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             if ui.button("保存并应用").clicked() {

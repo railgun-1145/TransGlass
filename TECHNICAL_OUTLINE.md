@@ -53,6 +53,8 @@
 
 **快捷键编辑**：不再单开二级窗口（`hotkey_editor_open` 已删），直接内嵌在设置页「快捷键」分类里，一行一个功能：勾选 / 名称 / 修饰键 / 按键 / 录入。
 
+**鼠标键热键（战争雷霆式）**：键位词表里除了键盘键，还有 `鼠标左键/右键/中键/侧键1/侧键2/滚轮上/滚轮下`，`parse_vk` 分别映射到 VK 0x01/02/04/05/06 和自定义码 0x20A/0x20B。`try_register_hotkey` 遇到鼠标键直接返回成功（`RegisterHotKey` 注册不了），改由 `mouse_hook_proc` 派发：按 `WM_*BUTTONDOWN`/`WM_MOUSEWHEEL` 算出 vk，和 `current_hotkey_mods()` 一起在 `HOTKEY_MATCH` 里查，命中就 `PostThreadMessageW(WM_HOTKEY)` 走同一条处理链；侧键/中键吞掉，左/右键和滚轮放行。校验规则：鼠标键可以不带修饰键，但左/右键必须配修饰键。旧的 `mouse.xbutton1/2` 字段保留兼容，保存时若槽位已占用对应侧键会自动清空，避免一次按键触发两次。
+
 **输入设备（数位板适配）**：`list_input_devices()` 用 RawInput 枚举鼠标（usage 0x01/0x02）、笔（0x0D/0x02）、触摸（0x0D/0x04），标签取路径里的 VID/PID；设置页「输入」有三个下拉（鼠标设备 / 笔设备 / 数位板），选择存 `UiState.input_mouse/input_pen/input_tablet`（设备路径）并写进 `DEV_MOUSE/DEV_PEN/DEV_TABLET`。
 `spawn_raw_input_tracker()` 起一个消息窗口，`RegisterRawInputDevices`（`RIDEV_INPUTSINK`，只旁听、不抢别人的输入）监听 `WM_INPUT`，按设备反查类别和路径 → 选定设备命中笔/数位板就置 `LAST_RAW_PEN=1`、命中鼠标置 0，并记时间戳。钩子热路径的 `effective_is_pen()` 先看 150ms 内有没有 RawInput 上报，有就按设备判断，否则退回 `dwExtraInfo & 0xFFFFFF00 == 0xFF515700` 的老启发式——这样 Wacom/Huion 把笔上报成普通鼠标时也能正确走「笔点透」。
 
