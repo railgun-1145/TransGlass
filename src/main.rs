@@ -1102,6 +1102,7 @@ struct TransGlassApp {
     settings_open: bool,
     mini_mode: bool,
     desk_filter: Option<String>,
+    preview_rate: u8,
     last_mini: bool,
     issues_ver: u32,
     issues_cache: Vec<String>,
@@ -1179,6 +1180,7 @@ impl TransGlassApp {
             settings_open: std::env::var_os("TRANSGLASS_OPEN_SETTINGS").is_some(),
             mini_mode: false,
             desk_filter: None,
+            preview_rate: load_ui_state().preview_rate.unwrap_or(0),
             last_mini: false,
             issues_ver: u32::MAX,
             issues_cache: Vec::new(),
@@ -1448,9 +1450,16 @@ impl TransGlassApp {
             });
             return;
         }
-        // 预览要动起来，主动请求下一帧重绘
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(60));
+        // 预览要动起来，按帧率档位请求下一帧重绘（关闭档不再空转）
+        let repaint_ms: u64 = match self.preview_rate {
+            3 => 0,
+            2 => 500,
+            1 => 125,
+            _ => 60,
+        };
+        if repaint_ms > 0 {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(repaint_ms));
+        }
 
         let mut toggle: Option<isize> = None;
         egui::ScrollArea::vertical()
@@ -1521,7 +1530,7 @@ impl TransGlassApp {
                                 ui.painter().text(
                                     rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    "无预览",
+                                    if self.preview_rate >= 3 { "预览已关闭" } else { "无预览" },
                                     egui::FontId::proportional(12.0),
                                     TEXT_SECONDARY,
                                 );
@@ -1588,9 +1597,17 @@ impl TransGlassApp {
 
     fn thumbnail(&mut self, ctx: &egui::Context, hwnd: isize) -> Option<egui::TextureHandle> {
         let now = std::time::Instant::now();
-        // 动态帧率：前台窗口刷新快（约 15fps），其它窗口慢一些（约 2.5fps）
+        if self.preview_rate >= 3 {
+            return None;
+        }
         let is_fg = unsafe { GetForegroundWindow() == HWND(hwnd as *mut _) };
-        let interval_ms: u64 = if is_fg { 66 } else { 400 };
+        // 0 流畅 15/2.5fps，1 均衡 8/1.2fps，2 省电 2/0.8fps
+        let (fg_ms, bg_ms): (u64, u64) = match self.preview_rate {
+            1 => (125, 800),
+            2 => (500, 1200),
+            _ => (66, 400),
+        };
+        let interval_ms = if is_fg { fg_ms } else { bg_ms };
         if let Some((tex, at)) = self.thumbs.get(&hwnd) {
             if (now.duration_since(*at).as_millis() as u64) < interval_ms {
                 return Some(tex.clone());
@@ -2037,6 +2054,20 @@ impl eframe::App for TransGlassApp {
                         );
                         ui.add_space(12.0);
                         ui.label(egui::RichText::new("窗口").strong().color(TEXT_SECONDARY));
+                        ui.label(egui::RichText::new("预览帧率").small().color(TEXT_SECONDARY));
+                        let mut rate = self.preview_rate;
+                        ui.horizontal(|ui| {
+                            for (v, name) in
+                                [(0u8, "流畅"), (1u8, "均衡"), (2u8, "省电"), (3u8, "关闭（只显示图标）")]
+                            {
+                                if ui.radio_value(&mut rate, v, name).changed() {
+                                    self.preview_rate = rate;
+                                    self.ui_state.preview_rate = Some(rate);
+                                    save_ui_state(&self.ui_state);
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
                         let mut mini = self.mini_mode;
                         if ui
                             .checkbox(&mut mini, "实时小窗（只显示缩略图网格，可随时切回大界面）")
@@ -2719,6 +2750,8 @@ struct UiState {
     w: Option<f32>,
     h: Option<f32>,
     always_on_top: Option<bool>,
+    /// 预览帧率：0 流畅 / 1 均衡 / 2 省电 / 3 关闭
+    preview_rate: Option<u8>,
 }
 
 fn ui_state_path() -> PathBuf {
