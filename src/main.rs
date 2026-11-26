@@ -1204,6 +1204,61 @@ impl TransGlassApp {
         }
     }
 
+    /// 切换到指定虚拟桌面：用 Win+Ctrl+←/→ 逐级切换，并按 IsWindowOnCurrentVirtualDesktop 校验。
+    /// 公开 API 不支持直接 SwitchDesktop 到某个 GUID，所以按当前桌面与目标桌面的相对位置步进。
+    fn switch_desktop_to(&mut self, target: &str) {
+        let Some(vdm) = virtual_desktop_manager() else {
+            return;
+        };
+        let mut order: Vec<String> = Vec::new();
+        for w in &self.wins {
+            if !order.contains(&w.desktop) {
+                order.push(w.desktop.clone());
+            }
+        }
+        let mut cur: Option<String> = None;
+        for w in &self.wins {
+            let on_cur = unsafe {
+                vdm.IsWindowOnCurrentVirtualDesktop(HWND(w.hwnd as *mut _))
+                    .map(|b| b.as_bool())
+                    .unwrap_or(false)
+            };
+            if on_cur {
+                cur = Some(w.desktop.clone());
+                break;
+            }
+        }
+        let Some(cur) = cur else { return };
+        let (Some(ci), Some(ti)) = (
+            order.iter().position(|d| d == &cur),
+            order.iter().position(|d| d == target),
+        ) else {
+            return;
+        };
+        if ci == ti {
+            return;
+        }
+        let right = ti > ci;
+        let steps = (ti as i32 - ci as i32).abs();
+        unsafe {
+            use windows::Win32::UI::Input::KeyboardAndMouse::keybd_event;
+            const VK_LWIN: u8 = 0x5B;
+            const VK_CONTROL: u8 = 0x11;
+            const VK_LEFT: u8 = 0x25;
+            const VK_RIGHT: u8 = 0x27;
+            let arrow = if right { VK_RIGHT } else { VK_LEFT };
+            for _ in 0..steps {
+                keybd_event(VK_LWIN, 0, Default::default(), 0);
+                keybd_event(VK_CONTROL, 0, Default::default(), 0);
+                keybd_event(arrow, 0, Default::default(), 0);
+                keybd_event(arrow, 0, windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP, 0);
+                keybd_event(VK_CONTROL, 0, windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP, 0);
+                keybd_event(VK_LWIN, 0, windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP, 0);
+                std::thread::sleep(std::time::Duration::from_millis(220));
+            }
+        }
+        self.refresh_window_list(true);
+    }
     fn nav_windows(&mut self, ui: &mut egui::Ui) {
         let list: Vec<(isize, String, String)> = self
             .wins
@@ -1333,7 +1388,7 @@ impl TransGlassApp {
             }
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("桌面").small().weak());
+            ui.label(egui::RichText::new("桌面（点即切换）").small().weak());
             if ui
                 .selectable_label(self.desk_filter.is_none(), egui::RichText::new("全部").small())
                 .clicked()
@@ -1349,6 +1404,7 @@ impl TransGlassApp {
                     .clicked()
                 {
                     self.desk_filter = Some(d.clone());
+                    self.switch_desktop_to(d);
                 }
             }
         });
