@@ -8,7 +8,7 @@ use self_update::backends::github::Update;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::thread;
@@ -20,7 +20,7 @@ use windows::core::PCWSTR;
 use windows::core::w;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Threading::*;
-use windows::Win32::UI::Input::{GetCurrentInputMessageSource, IMDT_MOUSE, IMDT_PEN, IMDT_UNAVAILABLE, INPUT_MESSAGE_SOURCE};
+
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -64,6 +64,89 @@ static INPUT_MODE: AtomicI32 = AtomicI32::new(0);
 static LAST_INPUT_IS_PEN: AtomicI32 = AtomicI32::new(-1);
 /// 是否有窗口处于"只开鼠标点透/只开笔点透"的单设备模式；没有就完全跳过低级钩子的重活
 static DEVICE_TRACKING: AtomicBool = AtomicBool::new(false);
+
+// ---- 可选性能计数（设 TRANSGLASS_DEBUG_PERF=1 才启用，关闭时只有一次原子读开销）----
+static PERF_ON: AtomicBool = AtomicBool::new(false);
+static PERF_HOOK_CALLS: AtomicU64 = AtomicU64::new(0);
+static PERF_FAST_CALLS: AtomicU64 = AtomicU64::new(0);
+static PERF_TRACK_CALLS: AtomicU64 = AtomicU64::new(0);
+static PERF_HOOK_NANOS: AtomicU64 = AtomicU64::new(0);
+static PERF_STYLE_FLIPS: AtomicU64 = AtomicU64::new(0);
+
+/// 钩子耗时统计守卫：只在 PERF_ON 时取一次 Instant，Drop 时累加纳秒。
+struct PerfGuard {
+    start: Option<std::time::Instant>,
+}
+
+impl PerfGuard {
+    fn new() -> Self {
+        if PERF_ON.load(Ordering::Relaxed) {
+            PERF_HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
+            Self {
+                start: Some(std::time::Instant::now()),
+            }
+        } else {
+            Self { start: None }
+        }
+    }
+}
+
+impl Drop for PerfGuard {
+    fn drop(&mut self) {
+        if let Some(start) = self.start {
+            PERF_HOOK_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+}
+fn perf_dump() {
+    if !PERF_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let calls = PERF_HOOK_CALLS.load(Ordering::Relaxed);
+    let nanos = PERF_HOOK_NANOS.load(Ordering::Relaxed);
+    let avg = if calls > 0 { nanos as f64 / calls as f64 } else { 0.0 };
+    let text = format!(
+        "hook_calls={}\nfast_path={}\ntracking_path={}\nstyle_flips={}\ntotal_ms={:.3}\navg_us={:.2}\n",
+        calls,
+        PERF_FAST_CALLS.load(Ordering::Relaxed),
+        PERF_TRACK_CALLS.load(Ordering::Relaxed),
+        PERF_STYLE_FLIPS.load(Ordering::Relaxed),
+        nanos as f64 / 1_000_000.0,
+        avg / 1000.0
+    );
+    let _ = fs::write(get_config_path().with_file_name("transglass_perf.txt"), text);
+}
+/// 命中测试缓存：(root_hwnd, left, top, right, bottom)。
+/// 快速拖动/高采样率笔时，指针大量事件落在同一个窗口，没必要每条都 WindowFromPoint + GetAncestor。
+static HIT_CACHE: std::sync::Mutex<Option<(isize, i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
+
+unsafe fn hit_root_at(x: i32, y: i32) -> Option<HWND> {
+    if let Ok(cache) = HIT_CACHE.lock() {
+        if let Some((h, l, t, r, b)) = *cache {
+            if h != 0 && x >= l && x < r && y >= t && y < b {
+                return Some(HWND(h as *mut _));
+            }
+        }
+    }
+    let hit = WindowFromPoint(POINT { x, y });
+    if hit.0.is_null() {
+        return None;
+    }
+    let root = GetAncestor(hit, GA_ROOT);
+    if root.0.is_null() {
+        return None;
+    }
+    let mut rect = RECT::default();
+    let ok = GetWindowRect(root, &mut rect).is_ok();
+    if let Ok(mut slot) = HIT_CACHE.lock() {
+        *slot = if ok {
+            Some((root.0 as isize, rect.left, rect.top, rect.right, rect.bottom))
+        } else {
+            None
+        };
+    }
+    Some(root)
+}
 static LAST_DEVICE: AtomicI32 = AtomicI32::new(-1);
 static LAST_DEVICE_HWND: AtomicIsize = AtomicIsize::new(0);
 const TRANSG_GLASS_INJECT_EXTRA_INFO: usize = 0x5452474Cu64 as usize;
@@ -290,6 +373,7 @@ fn spawn_device_tracking_ticker() {
             break;
         }
         refresh_device_tracking();
+        perf_dump();
     });
 }
 fn spawn_quit_listener() {
@@ -468,26 +552,16 @@ unsafe fn set_hwnd_mouse_transparent(hwnd: HWND, enabled: bool) {
     );
 }
 
+/// 笔识别：只认 Windows 的"指针提升"标记（0xFF515700 | cursorId）。
+/// 钩子线程里 GetCurrentInputMessageSource 必然是 IMDT_UNAVAILABLE，调它是白费一次系统调用，
+/// 高频笔（1000Hz）下这个差别会被放大，所以热路径只做位运算。
+#[inline]
 unsafe fn is_pen_input(info: &MSLLHOOKSTRUCT) -> bool {
-    // 注意：钩子线程里没有"当前输入消息"，GetCurrentInputMessageSource 通常返回 IMDT_UNAVAILABLE。
-    // 旧写法只要它 Ok 就直接 return false，等于永远不认笔；这里只在拿到明确设备类型时才采信。
-    let mut src = INPUT_MESSAGE_SOURCE::default();
-    if GetCurrentInputMessageSource(&mut src).is_ok() {
-        if src.deviceType == IMDT_PEN {
-            return true;
-        }
-        if src.deviceType == IMDT_MOUSE {
-            return false;
-        }
-        if src.deviceType == IMDT_UNAVAILABLE {
-            // 落到下面的 ExtraInfo 启发式
-        }
-    }
-    // Windows 把笔/触摸提升为鼠标消息时会带上这个标记（0xFF515700 | cursorId）
     (info.dwExtraInfo & 0xFFFFFF00) == 0xFF515700
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let _perf = PerfGuard::new();
     if code == HC_ACTION as i32 {
         let msg = wparam.0 as u32;
         let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
@@ -581,6 +655,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         ) {
             // 快路径：面板不可见、也没有"单设备点透"窗口时，钩子里什么都不用做
             if !WINDOW_VISIBLE.load(Ordering::Relaxed) && !DEVICE_TRACKING.load(Ordering::Relaxed) {
+                PERF_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
                 return CallNextHookEx(
                     HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
                     code,
@@ -600,6 +675,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 
             // 没有单设备点透的窗口 → 后面的 WindowFromPoint / 注册表查询全部跳过
             if !DEVICE_TRACKING.load(Ordering::Relaxed) || GLOBAL_REGISTRY.is_empty() {
+                PERF_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
                 return CallNextHookEx(
                     HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
                     code,
@@ -608,29 +684,18 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                 );
             }
 
-            let pt = POINT {
-                x: info.pt.x,
-                y: info.pt.y,
+            PERF_TRACK_CALLS.fetch_add(1, Ordering::Relaxed);
+            let root = match hit_root_at(info.pt.x, info.pt.y) {
+                Some(hwnd) => hwnd,
+                None => {
+                    return CallNextHookEx(
+                        HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+                        code,
+                        wparam,
+                        lparam,
+                    )
+                }
             };
-            let hit = WindowFromPoint(pt);
-            if hit.0.is_null() {
-                return CallNextHookEx(
-                    HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
-                    code,
-                    wparam,
-                    lparam,
-                );
-            }
-
-            let root = GetAncestor(hit, GA_ROOT);
-            if root.0.is_null() {
-                return CallNextHookEx(
-                    HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
-                    code,
-                    wparam,
-                    lparam,
-                );
-            }
 
             let root_val = root.0 as isize;
             if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
@@ -653,6 +718,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                         LAST_DEVICE.store(dev, Ordering::Relaxed);
                         LAST_DEVICE_HWND.store(root_val, Ordering::Relaxed);
                         set_hwnd_mouse_transparent(root, passthrough);
+                        PERF_STYLE_FLIPS.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -2022,6 +2088,7 @@ fn main() -> Result<(), eframe::Error> {
     }
 
     let _single_instance = unsafe { acquire_single_instance() };
+    PERF_ON.store(std::env::var_os("TRANSGLASS_DEBUG_PERF").is_some(), Ordering::Relaxed);
     spawn_quit_listener();
     spawn_device_tracking_ticker();
 
