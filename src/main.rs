@@ -1474,6 +1474,8 @@ enum HotkeyCaptureTarget {
 }
 
 struct TransGlassApp {
+    /// 标题栏图标
+    app_icon: Option<egui::TextureHandle>,
     should_exit: bool,
     hotkey_draft: HotkeyConfig,
     hotkey_message: Option<String>,
@@ -1564,6 +1566,15 @@ impl TransGlassApp {
         // 2. 仿 Trae 风格的深色 UI
         // 浅色主题：色值取自 DSH 界面取样（底 #FAFAFA / 卡 #FFFFFF / 边 #E5E7EB / 主色 #4176E6）
         apply_panel_theme(&cc.egui_ctx);
+        // 标题栏用的小图标（就是那块 MC 玻璃）
+        let app_icon = window_icon_data().map(|icon| {
+            let img = egui::ColorImage::from_rgba_unmultiplied(
+                [icon.width as usize, icon.height as usize],
+                &icon.rgba,
+            );
+            cc.egui_ctx
+                .load_texture("app_icon_small", img, egui::TextureOptions::LINEAR)
+        });
         BOLD_FONT_OK.store(bold_loaded, Ordering::Relaxed);
         if bold_loaded {
             let mut style = (*cc.egui_ctx.style()).clone();
@@ -1595,6 +1606,7 @@ impl TransGlassApp {
         let ui_state = load_ui_state();
         let always_on_top = ui_state.always_on_top.unwrap_or(false);
         Self {
+            app_icon,
             should_exit: false,
             hotkey_draft: load_or_create_hotkey_config(),
             hotkey_message: None,
@@ -1892,6 +1904,18 @@ impl TransGlassApp {
                 .small()
                 .weak(),
             );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new("全部还原").size(13.0),
+                    ))
+                    .on_hover_text("把已控制的窗口全部恢复原样")
+                    .clicked()
+                {
+                    unsafe { restore_all_windows() };
+                    self.refresh_window_list(true);
+                }
+            });
         });
         ui.add_space(10.0);
         if wins.is_empty() {
@@ -2300,7 +2324,6 @@ impl TransGlassApp {
         }
         check("还原当前窗口", &cfg.reset_current)?;
         check("还原所有窗口", &cfg.reset_all)?;
-        check("检查更新", &cfg.update)?;
         if let Some(spec) = cfg.reload.as_ref() {
             check("重载配置", spec)?;
         }
@@ -2368,6 +2391,152 @@ impl TransGlassApp {
             }
         }
     }
+}
+
+/// 直接改主窗口大小：无边框窗口尺寸就是客户区尺寸，比 ViewportCommand::InnerSize 稳
+fn resize_root_window(w: i32, h: i32) {
+    let raw = ROOT_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    unsafe {
+        let _ = SetWindowPos(
+            HWND(raw as *mut _),
+            None,
+            0,
+            0,
+            w,
+            h,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+    }
+}
+
+/// 无边框窗口的边缘缩放：指针进到 6px 里就设置光标，按下就发 BeginResize
+fn handle_window_resize(ctx: &egui::Context) {
+    let rect = ctx.screen_rect();
+    let Some(p) = ctx.pointer_hover_pos() else {
+        return;
+    };
+    const M: f32 = 6.0;
+    let left = p.x < rect.left() + M;
+    let right = p.x > rect.right() - M;
+    let top = p.y < rect.top() + M;
+    let bottom = p.y > rect.bottom() - M;
+    if !(left || right || top || bottom) {
+        return;
+    }
+    let dir = if left && top {
+        egui::ResizeDirection::NorthWest
+    } else if right && top {
+        egui::ResizeDirection::NorthEast
+    } else if left && bottom {
+        egui::ResizeDirection::SouthWest
+    } else if right && bottom {
+        egui::ResizeDirection::SouthEast
+    } else if left {
+        egui::ResizeDirection::West
+    } else if right {
+        egui::ResizeDirection::East
+    } else if top {
+        egui::ResizeDirection::North
+    } else {
+        egui::ResizeDirection::South
+    };
+    let cursor = match dir {
+        egui::ResizeDirection::North | egui::ResizeDirection::South => {
+            egui::CursorIcon::ResizeVertical
+        }
+        egui::ResizeDirection::East | egui::ResizeDirection::West => {
+            egui::CursorIcon::ResizeHorizontal
+        }
+        egui::ResizeDirection::NorthWest | egui::ResizeDirection::SouthEast => {
+            egui::CursorIcon::ResizeNwSe
+        }
+        _ => egui::CursorIcon::ResizeNeSw,
+    };
+    ctx.set_cursor_icon(cursor);
+    if ctx.input(|i| i.pointer.primary_down()) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TitleBtn {
+    Min,
+    Max,
+    Restore,
+    Close,
+}
+
+/// 标题栏按钮：自绘小方块，悬停才出底色（关闭键悬停变红）
+fn titlebar_button(ui: &mut egui::Ui, kind: TitleBtn) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(34.0, 28.0), egui::Sense::click());
+    let hover = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.1);
+    let is_close = kind == TitleBtn::Close;
+    if hover > 0.01 {
+        let bg = if is_close {
+            egui::Color32::from_rgb(0xE8, 0x11, 0x23)
+        } else {
+            egui::Color32::from_rgb(0xF0, 0xF0, 0xF0)
+        };
+        let bg = egui::Color32::from_rgba_unmultiplied(
+            bg.r(),
+            bg.g(),
+            bg.b(),
+            (255.0 * hover) as u8,
+        );
+        ui.painter()
+            .rect_filled(rect.shrink(3.0), egui::Rounding::same(4.0), bg);
+    }
+    let fg = if is_close && hover > 0.5 {
+        egui::Color32::WHITE
+    } else {
+        TEXT_PRIMARY
+    };
+    let c = rect.center();
+    let stroke = egui::Stroke::new(1.2, fg);
+    match kind {
+        TitleBtn::Min => {
+            ui.painter().hline(c.x - 4.5..=c.x + 4.5, c.y + 0.5, stroke);
+        }
+        TitleBtn::Max => {
+            ui.painter().rect_stroke(
+                egui::Rect::from_center_size(c, egui::vec2(9.0, 9.0)),
+                egui::Rounding::same(1.0),
+                stroke,
+            );
+        }
+        TitleBtn::Restore => {
+            ui.painter().rect_stroke(
+                egui::Rect::from_center_size(c + egui::vec2(1.0, 1.0), egui::vec2(8.0, 8.0)),
+                egui::Rounding::same(1.0),
+                stroke,
+            );
+            ui.painter().hline(
+                (c.x - 5.0)..=(c.x + 3.0),
+                c.y - 4.5,
+                egui::Stroke::new(1.2, fg),
+            );
+        }
+        TitleBtn::Close => {
+            let d = 4.5;
+            ui.painter().line_segment(
+                [egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [egui::pos2(c.x + d, c.y - d), egui::pos2(c.x - d, c.y + d)],
+                stroke,
+            );
+        }
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
 }
 
 fn egui_key_to_vk_name(key: egui::Key) -> Option<String> {
@@ -2566,28 +2735,59 @@ impl eframe::App for TransGlassApp {
         // 3. 大界面：左侧导航（桌面分组 + 窗口），右侧详情
         self.refresh_window_list(false);
 
+        // 无边框窗口：边缘 6px 内可以拖动缩放（原生边框没了，得自己处理）
+        handle_window_resize(ctx);
+        self.draw_titlebar(ctx);
+
+        // 小窗模式：切换窗口尺寸与置顶
+        if self.mini_mode != self.last_mini {
+            self.last_mini = self.mini_mode;
+            if self.mini_mode {
+                resize_root_window(400, 560);
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                    egui::WindowLevel::AlwaysOnTop,
+                ));
+            } else {
+                resize_root_window(1000, 700);
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.always_on_top {
+                    egui::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::WindowLevel::Normal
+                }));
+            }
+        }
+
+
         if self.settings_open {
             self.settings_page_ui(ctx);
         } else if !self.mini_mode {
         egui::TopBottomPanel::bottom("actions_bar").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("全部还原").clicked() {
-                    unsafe { restore_all_windows() };
-                    self.refresh_window_list(true);
-                }
-                // 穿透是"每个窗口独立"的功能，放在窗口的右键菜单里（鼠标点透/笔点透），
-                // 全局开关没有意义，这里不再提供。
                 if ui.button("设置").clicked() {
                     self.settings_open = true;
                     self.settings_fade = Some(std::time::Instant::now());
                 }
-                if ui
-                    .button(if self.mini_mode { "返回大界面" } else { "小窗模式" })
-                    .clicked()
-                {
-                    self.mini_mode = !self.mini_mode;
-                }
+                // 小窗模式放右下角，字号比左边的小一档
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(if self.mini_mode {
+                                    "返回大界面"
+                                } else {
+                                    "小窗模式"
+                                })
+                                .size(12.0)
+                                .color(TEXT_SECONDARY),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        self.mini_mode = !self.mini_mode;
+                    }
+                });
             });
             if let Ok(msg) = UPDATE_MSG.read() {
                 if let Some(msg) = msg.as_ref() {
@@ -2642,24 +2842,6 @@ impl eframe::App for TransGlassApp {
 
         }
 
-        // 小窗模式：切换窗口尺寸与置顶
-        if self.mini_mode != self.last_mini {
-            self.last_mini = self.mini_mode;
-            if self.mini_mode {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(400.0, 560.0)));
-                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                    egui::WindowLevel::AlwaysOnTop,
-                ));
-            } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1000.0, 700.0)));
-                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.always_on_top {
-                    egui::WindowLevel::AlwaysOnTop
-                } else {
-                    egui::WindowLevel::Normal
-                }));
-            }
-        }
-
         // 设置页占满主区域，这里不再画窗口列表
         if !self.settings_open {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -2667,12 +2849,14 @@ impl eframe::App for TransGlassApp {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("TransGlass").color(ACCENT).strong().size(16.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("大界面").clicked() {
+                        if ui.button("还原").clicked() {
                             self.mini_mode = false;
                         }
                         if ui.button("设置").clicked() {
+                            // 小窗里点设置：先恢复成大界面，再进设置页
+                            self.mini_mode = false;
                             self.settings_open = true;
-                    self.settings_fade = Some(std::time::Instant::now());
+                            self.settings_fade = Some(std::time::Instant::now());
                         }
                     });
                 });
@@ -2994,6 +3178,8 @@ fn main() -> Result<(), eframe::Error> {
             ui_state.h.filter(|h| *h >= 560.0).unwrap_or(720.0),
         ])
         .with_title("TransGlass 控制面板")
+        // 无系统边框：标题栏自己画，跟界面风格统一
+        .with_decorations(false)
         .with_visible(true);
     // 任务栏/标题栏图标：就是那块 MC 玻璃（程序目录的 icon.png）
     if let Some(icon) = window_icon_data() {
@@ -3100,7 +3286,7 @@ fn default_config() -> HotkeyConfig {
         input_mode_cycle: Some(HotkeySlot::CycleInputMode.default_spec()),
         reset_current: HotkeySlot::ResetCurrent.default_spec(),
         reset_all: HotkeySlot::ResetAll.default_spec(),
-        update: HotkeySlot::Update.default_spec(),
+        update: HotkeySpec { modifiers: "ALT".to_string(), key: "U".to_string() },
         reload: Some(HotkeySlot::Reload.default_spec()),
         mouse: Some(MouseBindingsSpec {
             xbutton1: Some("decrease".into()),
@@ -3504,12 +3690,11 @@ pub(crate) enum HotkeySlot {
     CycleInputMode,
     ResetCurrent,
     ResetAll,
-    Update,
     Reload,
 }
 
 impl HotkeySlot {
-    pub(crate) const ALL: [HotkeySlot; 10] = [
+    pub(crate) const ALL: [HotkeySlot; 9] = [
         HotkeySlot::Increase,
         HotkeySlot::Decrease,
         HotkeySlot::ToggleTop,
@@ -3518,7 +3703,6 @@ impl HotkeySlot {
         HotkeySlot::CycleInputMode,
         HotkeySlot::ResetCurrent,
         HotkeySlot::ResetAll,
-        HotkeySlot::Update,
         HotkeySlot::Reload,
     ];
 
@@ -3532,7 +3716,6 @@ impl HotkeySlot {
             HotkeySlot::CycleInputMode => "切换输入模式",
             HotkeySlot::ResetCurrent => "还原当前窗口",
             HotkeySlot::ResetAll => "还原全部窗口",
-            HotkeySlot::Update => "检查更新",
             HotkeySlot::Reload => "重载热键配置",
         }
     }
@@ -3547,7 +3730,6 @@ impl HotkeySlot {
             HotkeySlot::CycleInputMode => "input_mode",
             HotkeySlot::ResetCurrent => "reset_current",
             HotkeySlot::ResetAll => "reset_all",
-            HotkeySlot::Update => "update",
             HotkeySlot::Reload => "reload",
         }
     }
@@ -3573,7 +3755,6 @@ impl HotkeySlot {
             HotkeySlot::CycleInputMode => ("ALT+SHIFT", "M"),
             HotkeySlot::ResetCurrent => ("ALT", "R"),
             HotkeySlot::ResetAll => ("ALT+SHIFT", "R"),
-            HotkeySlot::Update => ("ALT", "U"),
             HotkeySlot::Reload => ("ALT+SHIFT", "C"),
         };
         HotkeySpec {
@@ -3591,7 +3772,6 @@ impl HotkeySlot {
             HotkeySlot::TogglePen => 5,
             HotkeySlot::ResetCurrent => 6,
             HotkeySlot::ResetAll => 7,
-            HotkeySlot::Update => 8,
             HotkeySlot::Reload => 9,
             HotkeySlot::CycleInputMode => 10,
         }
@@ -3644,7 +3824,6 @@ impl HotkeySlot {
                 .unwrap_or_else(|| self.default_spec()),
             HotkeySlot::ResetCurrent => cfg.reset_current.clone(),
             HotkeySlot::ResetAll => cfg.reset_all.clone(),
-            HotkeySlot::Update => cfg.update.clone(),
             HotkeySlot::Reload => cfg.reload.clone().unwrap_or_else(|| self.default_spec()),
         }
     }
@@ -3659,7 +3838,6 @@ impl HotkeySlot {
             HotkeySlot::CycleInputMode => cfg.input_mode_cycle = Some(spec),
             HotkeySlot::ResetCurrent => cfg.reset_current = spec,
             HotkeySlot::ResetAll => cfg.reset_all = spec,
-            HotkeySlot::Update => cfg.update = spec,
             HotkeySlot::Reload => cfg.reload = Some(spec),
         }
     }
@@ -3674,13 +3852,36 @@ impl HotkeySlot {
             HotkeySlot::CycleInputMode => HotkeyCaptureTarget::CycleInputMode,
             HotkeySlot::ResetCurrent => HotkeyCaptureTarget::ResetCurrent,
             HotkeySlot::ResetAll => HotkeyCaptureTarget::ResetAll,
-            HotkeySlot::Update => HotkeyCaptureTarget::Update,
             HotkeySlot::Reload => HotkeyCaptureTarget::Reload,
         }
     }
 }
 
 /// 编辑器下拉可选的按键（`parse_vk` 全部支持这些名字）
+/// 找出重复的绑定组合，返回 "Alt + P（切换鼠标点透、切换笔点透）" 这种说明
+pub(crate) fn displays_conflict_text(cfg: &HotkeyConfig) -> String {
+    let mut map: std::collections::HashMap<String, Vec<&'static str>> =
+        std::collections::HashMap::new();
+    for slot in HotkeySlot::ALL.iter() {
+        let spec = slot.get(cfg);
+        if spec.key.trim().is_empty() {
+            continue;
+        }
+        map.entry(hotkey_display(&spec)).or_default().push(slot.label());
+    }
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    let mut parts: Vec<String> = Vec::new();
+    for k in keys {
+        if let Some(list) = map.get(k) {
+            if list.len() > 1 {
+                parts.push(format!("{}（{}）", k, list.join("、")));
+            }
+        }
+    }
+    parts.join("；")
+}
+
 /// 键位显示：`ALT+SHIFT` + `P` → `Alt + Shift + P`
 pub(crate) fn hotkey_display(spec: &HotkeySpec) -> String {
     if spec.key.trim().is_empty() {
@@ -5444,6 +5645,75 @@ impl TransGlassApp {
     }
 
     /// 设置页：直接作为主界面内容（不再弹二级窗口）
+    /// 自绘标题栏：图标 + 标题 + 最小化/最大化/关闭；空白处可拖动、双击最大化
+    fn draw_titlebar(&mut self, ctx: &egui::Context) {
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        egui::TopBottomPanel::top("app_titlebar")
+            .exact_height(36.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(SURFACE)
+                    .inner_margin(egui::Margin::symmetric(10.0, 0.0)),
+            )
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                ui.horizontal_centered(|ui| {
+                    if let Some(tex) = self.app_icon.as_ref() {
+                        ui.add(
+                            egui::Image::new(egui::load::SizedTexture::new(
+                                tex.id(),
+                                egui::vec2(16.0, 16.0),
+                            ))
+                            .fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                        );
+                        ui.add_space(6.0);
+                    }
+                    ui.label(
+                        egui::RichText::new("TransGlass 控制面板")
+                            .size(12.5)
+                            .color(TEXT_PRIMARY),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if titlebar_button(ui, TitleBtn::Close).clicked() {
+                            hide_root_window();
+                        }
+                        let mx = if maximized {
+                            titlebar_button(ui, TitleBtn::Restore)
+                        } else {
+                            titlebar_button(ui, TitleBtn::Max)
+                        };
+                        if mx.clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                        }
+                        if titlebar_button(ui, TitleBtn::Min).clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                    });
+                });
+                // 拖动区：左侧 62%（避开右边的按钮）
+                let drag_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), rect.top()),
+                    egui::pos2(rect.left() + rect.width() * 0.62, rect.bottom()),
+                );
+                let resp = ui.interact(
+                    drag_rect,
+                    ui.id().with("titlebar_drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                if resp.double_clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                } else if resp.dragged() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                // 底部一条分隔线
+                ui.painter().hline(
+                    rect.x_range(),
+                    rect.bottom() - 0.5,
+                    egui::Stroke::new(1.0, BORDER),
+                );
+            });
+    }
+
     fn settings_page_ui(&mut self, ctx: &egui::Context) {
         let fade = self
             .settings_fade
@@ -5475,27 +5745,6 @@ impl TransGlassApp {
                             self.hotkey_draft = default_config();
                             self.hotkey_message = Some("已恢复默认（尚未保存）".into());
                         }
-                        ui.add_space(8.0);
-                        match Self::validate_config(&self.hotkey_draft) {
-                            Ok(()) => {
-                                let (text, color) = match self.hotkey_message.as_ref() {
-                                    Some(msg) => (msg.clone(), TEXT_SECONDARY),
-                                    None => (
-                                        "组合键均合法且无冲突".to_string(),
-                                        egui::Color32::from_rgb(0x2E, 0x7D, 0x32),
-                                    ),
-                                };
-                                ui.label(egui::RichText::new(text).small().color(color));
-                            }
-                            Err(err) => {
-                                ui.label(
-                                    egui::RichText::new(format!("配置有问题：{err}"))
-                                        .small()
-                                        .color(ERROR),
-                                );
-                            }
-                        }
-                        ui.separator();
                     }
                 });
             });
@@ -5638,7 +5887,20 @@ impl TransGlassApp {
             ui.add_space(2.0);
         }
 
-        ui.add_space(6.0);
+        // 只在有冲突时提示（不显示"一切正常"这种废话）
+        let conflicts = displays_conflict_text(&self.hotkey_draft);
+        if !conflicts.is_empty() {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(format!("快捷键冲突：{conflicts}"))
+                    .small()
+                    .color(ERROR),
+            );
+        }
+        if let Some(msg) = self.hotkey_message.as_ref() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(msg).small().weak());
+        }
     }
 
     fn settings_page_input(&mut self, ui: &mut egui::Ui) {

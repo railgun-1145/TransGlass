@@ -49,7 +49,10 @@
 
 **字体**：优先 `C:\Windows\Fonts\msyh.ttc`（微软雅黑），失败才退回 simhei/simsun（黑体在小字号下又硬又挤，以前放第一优先所以界面像"代码注释"）。另外单独加载 `msyhbd.ttc` 注册成 `FontFamily::Name("bold")`，只给 `Heading` / `Button` 用，正文保持常规字重——这是 egui 里做"真粗体"的唯一办法（`RichText::strong()` 只改颜色不加粗）。
 
-**标题栏**：Windows 10 上标题栏跟随系统 `SystemUsesLightTheme`；实测 `DWMWA_USE_IMMERSIVE_DARK_MODE=0` 在这台机器上不生效（设了也还是黑的），`DWMWA_CAPTION_COLOR` 在 19045 上返回 E_INVALIDARG。想要浅色标题栏只能改成无边框窗口 + 自绘标题栏。
+**标题栏**：`with_decorations(false)` 无边框窗口，标题栏自己画（`draw_titlebar`）：左侧 `icon.png` 纹理 + 「TransGlass 控制面板」，右侧自绘 最小化/最大化(还原)/关闭 三个按钮（`titlebar_button`，悬停才出底色、关闭悬停变红）；左 62% 区域 `ui.interact(...)` 拖动 → `ViewportCommand::StartDrag`，双击 → 切换 `Maximized`；关闭按钮走 `hide_root_window()`（和系统关闭一致：隐藏到托盘）。
+无边框后原生缩放边框也没了，`handle_window_resize()` 在窗口边缘 6px 内按指针位置发 `ViewportCommand::BeginResize(dir)` 并设置对应光标。窗口尺寸切换（小窗/大界面）用 `resize_root_window()`（`SetWindowPos`）而不是 `InnerSize`——无边框窗口尺寸就是客户区尺寸，`InnerSize` 在这台机器上只生效了一半（宽度没变）。注意窗口尺寸同步那段必须放在 `settings_open` 分支**之前**，否则小窗里点设置切到设置页时不会变大。
+
+**窗口按钮尺寸**：小窗模式下头部是「设置 / 还原」两个按钮，`还原` 只是把 `mini_mode = false`；`设置` 会同时把 `mini_mode = false` 再打开设置页，所以永远是「大界面 + 设置页」。
 
 **快捷键编辑**：不再单开二级窗口（`hotkey_editor_open` 已删），直接内嵌在设置页「快捷键」分类里，一行一个功能：勾选 / 名称 / 修饰键 / 按键 / 录入。
 
