@@ -3284,15 +3284,19 @@ fn window_menu(ui: &mut egui::Ui, hwnd: isize, title: &str) {
     if ui.checkbox(&mut pen_flag, "笔点透").changed() {
         unsafe { toggle_pen_passthrough(HWND(hwnd as *mut _)) };
     }
+    let mut pct = (alpha as f32 / 255.0 * 100.0).round();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("透明度").small().weak());
-        let pct = (alpha as f32 / 255.0 * 100.0).round() as i32;
-        for p in [100, 90, 80, 70, 50] {
-            if ui.selectable_label(pct == p, egui::RichText::new(format!("{p}%")).small()).clicked() {
-                unsafe {
-                    ensure_managed(HWND(hwnd as *mut _));
-                    set_window_alpha(HWND(hwnd as *mut _), (p as f32 * 2.55).round() as u8);
-                }
+        ui.spacing_mut().slider_width = 128.0;
+        let resp = ui.add(
+            egui::Slider::new(&mut pct, 30.0..=100.0)
+                .suffix("%")
+                .show_value(true),
+        );
+        if resp.changed() {
+            unsafe {
+                ensure_managed(HWND(hwnd as *mut _));
+                set_window_alpha(HWND(hwnd as *mut _), (pct * 2.55).round() as u8);
             }
         }
     });
