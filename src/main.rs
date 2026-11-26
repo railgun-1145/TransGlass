@@ -1448,6 +1448,10 @@ impl TransGlassApp {
             });
             return;
         }
+        // 预览要动起来，主动请求下一帧重绘
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(60));
+
         let mut toggle: Option<isize> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -1584,8 +1588,11 @@ impl TransGlassApp {
 
     fn thumbnail(&mut self, ctx: &egui::Context, hwnd: isize) -> Option<egui::TextureHandle> {
         let now = std::time::Instant::now();
+        // 动态帧率：前台窗口刷新快（约 15fps），其它窗口慢一些（约 2.5fps）
+        let is_fg = unsafe { GetForegroundWindow() == HWND(hwnd as *mut _) };
+        let interval_ms: u64 = if is_fg { 66 } else { 400 };
         if let Some((tex, at)) = self.thumbs.get(&hwnd) {
-            if now.duration_since(*at).as_secs() < 3 {
+            if (now.duration_since(*at).as_millis() as u64) < interval_ms {
                 return Some(tex.clone());
             }
         }
