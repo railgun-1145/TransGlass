@@ -6209,6 +6209,17 @@ impl TransGlassApp {
                         if titlebar_button(ui, TitleBtn::Close).clicked() {
                             hide_root_window();
                         }
+                        let mx = if maximized {
+                            titlebar_button(ui, TitleBtn::Restore)
+                        } else {
+                            titlebar_button(ui, TitleBtn::Max)
+                        };
+                        if mx.clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                        }
+                        if titlebar_button(ui, TitleBtn::Min).clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
                         if ui
                             .add(
                                 egui::Button::new(
@@ -6223,17 +6234,6 @@ impl TransGlassApp {
                             .clicked()
                         {
                             open_help_page();
-                        }
-                        let mx = if maximized {
-                            titlebar_button(ui, TitleBtn::Restore)
-                        } else {
-                            titlebar_button(ui, TitleBtn::Max)
-                        };
-                        if mx.clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-                        }
-                        if titlebar_button(ui, TitleBtn::Min).clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
                     });
                 });
