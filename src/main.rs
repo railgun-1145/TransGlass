@@ -2202,11 +2202,11 @@ impl TransGlassApp {
                         ui.add_space(6.0);
                         ui.add(
                             egui::Label::new({
-                                let app = unsafe { app_short_name(HWND(hwnd as *mut _)) };
+                                let app = unsafe { cached_app_name(HWND(hwnd as *mut _)) };
                                 let text = if app.is_empty() {
                                     title.to_string()
                                 } else {
-                                    format!("{app} · {title}")
+                                    format!("【{app}】 {title}")
                                 };
                                 egui::RichText::new(text)
                                     .font(font_title(14.0))
@@ -2535,6 +2535,35 @@ unsafe fn process_exe_name(hwnd: HWND) -> Option<String> {
     Some(path.rsplit('\\').next().unwrap_or("").to_lowercase())
 }
 
+/// 软件名缓存：(hwnd, 名字, 时间)。列表每帧刷新，不缓存会每帧 OpenProcess 好几次
+static APP_CACHE: std::sync::RwLock<Vec<(isize, String, f32)>> = std::sync::RwLock::new(Vec::new());
+
+/// 带缓存的软件短名（3 秒过期，窗口换了也能跟上）
+pub(crate) unsafe fn cached_app_name(hwnd: HWND) -> String {
+    let key = hwnd.0 as isize;
+    let now = anim_secs();
+    if let Ok(c) = APP_CACHE.read() {
+        if let Some((_, name, at)) = c.iter().find(|(k, _, _)| *k == key) {
+            if now - at < 3.0 {
+                return name.clone();
+            }
+        }
+    }
+    let name = app_short_name(hwnd);
+    if let Ok(mut c) = APP_CACHE.write() {
+        if let Some(e) = c.iter_mut().find(|(k, _, _)| *k == key) {
+            e.1 = name.clone();
+            e.2 = now;
+        } else {
+            c.push((key, name.clone(), now));
+            if c.len() > 96 {
+                c.remove(0);
+            }
+        }
+    }
+    name
+}
+
 /// 给界面用的软件短名（Photoshop / Lightroom / AE …）
 pub(crate) unsafe fn app_short_name(hwnd: HWND) -> String {
     let Some(exe) = process_exe_name(hwnd) else {
@@ -2622,7 +2651,7 @@ unsafe fn compat_app_name(hwnd: HWND) -> Option<String> {
     }
     let path = String::from_utf16_lossy(&buf[..len as usize]);
     let exe = path.rsplit('\\').next().unwrap_or("").to_lowercase();
-    const LIST: [&str; 10] = [
+    const LIST: [&str; 17] = [
         "photoshop",
         "illustrator",
         "aftereffects",
@@ -2633,6 +2662,13 @@ unsafe fn compat_app_name(hwnd: HWND) -> Option<String> {
         "artworld",
         "画世界",
         "painter",
+        "obs64",
+        "obs32",
+        "vlc",
+        "potplayer",
+        "winword",
+        "excel",
+        "powerpnt",
     ];
     if LIST.iter().any(|n| exe.contains(n)) {
         Some(exe)
@@ -2658,6 +2694,14 @@ fn resize_root_window(w: i32, h: i32) {
             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
         );
     }
+}
+
+/// 用默认浏览器打开使用教程
+fn open_help_page() {
+    let url = "https://github.com/railgun-1145/TransGlass/blob/master/docs/%E4%BD%BF%E7%94%A8%E6%95%99%E7%A8%8B.md";
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .spawn();
 }
 
 /// 无边框窗口的边缘缩放：指针进到 6px 里就设置光标，按下就发 BeginResize
@@ -4937,6 +4981,8 @@ struct BallPanel {
     close_btn: (i32, i32, i32, i32),
     /// 左下方显示「当前目标窗口」的一行
     target_row: (i32, i32, i32, i32),
+    /// 面板最底下显示「最近输入」的一行
+    input_row: (i32, i32, i32, i32),
 }
 
 /// 展开布局：MC 背包/设置界面风格——标题栏 + 左侧 4 个按钮 + 右侧深色槽底站纸娃娃 + 底部透明度条。
@@ -4957,6 +5003,7 @@ fn ball_panel(t: f32) -> BallPanel {
     let slider = (px0 + 10, 198, px0 + 208, 224);
     let close_btn = (px0 + 188, 26, px0 + 210, 42);
     let target_row = (px0 + 10, 176, px0 + 130, 194);
+    let input_row = (px0 + 10, 226, px0 + 130, 242);
     BallPanel {
         panel,
         title,
@@ -4966,6 +5013,7 @@ fn ball_panel(t: f32) -> BallPanel {
         slider,
         close_btn,
         target_row,
+        input_row,
     }
 }
 
@@ -5379,6 +5427,7 @@ unsafe fn ball_render() {
         draw_mc_cross(buf, w, h, p.close_btn, (255, 255, 255), panel_alpha);
         // 目标窗口那一行：MC 凹槽底 + 窗口标题
         draw_mc_target_row(buf, w, h, p.target_row, panel_alpha);
+        draw_mc_target_row(buf, w, h, p.input_row, panel_alpha);
     }
 
     // 中间：MC 3D 纸娃娃（基岩版左上角纸娃娃观感，随光标连续转向）
@@ -5547,27 +5596,23 @@ unsafe fn ball_render() {
             if h.0.is_null() {
                 "未选中窗口".to_string()
             } else {
-                // 先写"是什么软件"，再写"在干什么"（透明度/置顶状态）
-                let app = app_short_name(h);
-                let alpha = target_alpha_now();
-                let pct = ((alpha as f32 / 255.0) * 100.0).round() as i32;
-                let doing = if GLOBAL_REGISTRY
-                    .get(&(h.0 as isize))
-                    .map(|s| s.user_pref_topmost)
-                    .unwrap_or(false)
-                {
-                    format!("{pct}% 置顶")
-                } else {
-                    format!("{pct}%")
-                };
+                // 只显示"是什么软件"，用【】框起来
+                let app = cached_app_name(h);
                 if app.is_empty() {
-                    doing
+                    "未选中窗口".to_string()
                 } else {
-                    format!("{app} {doing}")
+                    format!("【{app}】")
                 }
             }
         };
         draw_mc_label(mem, &target_text, p.target_row, fade((255, 255, 255)));
+        // 最近一次输入：鼠标 / 笔（面板最底下一行）
+        let last_input = match LAST_INPUT_IS_PEN.load(Ordering::Relaxed) {
+            1 => "最近输入：笔",
+            0 => "最近输入：鼠标",
+            _ => "最近输入：—",
+        };
+        draw_mc_label(mem, last_input, p.input_row, fade((255, 255, 255)));
         let labels = ["置顶", "穿透", "模式", "还原"];
         for (i, r) in p.buttons.iter().enumerate() {
             draw_mc_label(mem, labels[i], *r, fade((255, 255, 255)));
@@ -6163,6 +6208,21 @@ impl TransGlassApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if titlebar_button(ui, TitleBtn::Close).clicked() {
                             hide_root_window();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("帮助")
+                                        .size(12.0)
+                                        .color(TEXT_SECONDARY),
+                                )
+                                .frame(false)
+                                .min_size(egui::vec2(0.0, 22.0)),
+                            )
+                            .on_hover_text("用浏览器打开使用教程")
+                            .clicked()
+                        {
+                            open_help_page();
                         }
                         let mx = if maximized {
                             titlebar_button(ui, TitleBtn::Restore)
