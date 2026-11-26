@@ -53,7 +53,10 @@
 
 **快捷键编辑**：不再单开二级窗口（`hotkey_editor_open` 已删），直接内嵌在设置页「快捷键」分类里，一行一个功能：勾选 / 名称 / 修饰键 / 按键 / 录入。
 
-**设置页**：`settings_open` 时弹一个占屏幕 92%×90% 的居中窗口（`fixed_size` + `anchor(CENTER_CENTER)`），左侧 `SETTINGS_TABS` 五个分类（快捷键 / 输入 / 窗口与预览 / 悬浮球与纸娃娃 / 维护），右侧按 `settings_tab` 调 `settings_page_*`。分类页拆成 `impl TransGlassApp` 的独立方法，别再把所有控件塞进一个 `egui::Window`。
+**输入设备（数位板适配）**：`list_input_devices()` 用 RawInput 枚举鼠标（usage 0x01/0x02）、笔（0x0D/0x02）、触摸（0x0D/0x04），标签取路径里的 VID/PID；设置页「输入」有三个下拉（鼠标设备 / 笔设备 / 数位板），选择存 `UiState.input_mouse/input_pen/input_tablet`（设备路径）并写进 `DEV_MOUSE/DEV_PEN/DEV_TABLET`。
+`spawn_raw_input_tracker()` 起一个消息窗口，`RegisterRawInputDevices`（`RIDEV_INPUTSINK`，只旁听、不抢别人的输入）监听 `WM_INPUT`，按设备反查类别和路径 → 选定设备命中笔/数位板就置 `LAST_RAW_PEN=1`、命中鼠标置 0，并记时间戳。钩子热路径的 `effective_is_pen()` 先看 150ms 内有没有 RawInput 上报，有就按设备判断，否则退回 `dwExtraInfo & 0xFFFFFF00 == 0xFF515700` 的老启发式——这样 Wacom/Huion 把笔上报成普通鼠标时也能正确走「笔点透」。
+
+**设置页**：不再弹窗口，`settings_open` 时主界面直接切成设置页（`settings_page_ui`：底部「← 返回 / 设置 / 版本」+ 左侧 `SETTINGS_TABS` 五个分类 + 右侧 `settings_page_*` 内容）。注意主界面的 `CentralPanel` 也被 `if !self.settings_open` 包住了，否则两个 CentralPanel 会叠在一起画。
 
 ### 4.4 悬浮球：分层窗口与 3D 纸娃娃
 悬浮球是一个 `WS_EX_LAYERED | WS_EX_NOACTIVATE` 的 Win32 窗口，每帧在内存 DIB 上重画后用 `UpdateLayeredWindow(ULW_ALPHA)` 贴到桌面。要点：

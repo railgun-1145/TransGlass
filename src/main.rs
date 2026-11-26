@@ -63,6 +63,13 @@ static HOTKEY_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static INPUT_MODE: AtomicI32 = AtomicI32::new(0);
 /// 最近一次识别到的输入设备：-1 未知、0 鼠标、1 笔（面板上显示，也用来避免反复改样式）
 static LAST_INPUT_IS_PEN: AtomicI32 = AtomicI32::new(-1);
+/// RawInput 最近一次来自"笔/数位板"还是"鼠标"（-1 未知），以及时间戳（anim_secs 的 f32 bits）
+static LAST_RAW_PEN: AtomicI32 = AtomicI32::new(-1);
+static LAST_RAW_AT: AtomicU32 = AtomicU32::new(0);
+/// 用户在设置里选定的设备路径（None = 自动）
+static DEV_PEN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+static DEV_MOUSE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+static DEV_TABLET: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 /// 是否有窗口处于"只开鼠标点透/只开笔点透"的单设备模式；没有就完全跳过低级钩子的重活
 static DEVICE_TRACKING: AtomicBool = AtomicBool::new(false);
 
@@ -578,6 +585,307 @@ unsafe fn set_hwnd_mouse_transparent(hwnd: HWND, enabled: bool) {
     );
 }
 
+/// 输入设备类别：0 鼠标，1 笔/数位板，2 触摸，3 其它 HID
+#[derive(Clone)]
+pub(crate) struct InputDev {
+    pub(crate) kind: u8,
+    pub(crate) path: String,
+    pub(crate) label: String,
+}
+
+/// 设备列表缓存：设置页每帧都枚举一次太浪费，2 秒刷新
+static DEVICE_CACHE: std::sync::RwLock<(f32, usize)> = std::sync::RwLock::new((0.0, 0));
+static DEVICES: std::sync::RwLock<Vec<InputDev>> = std::sync::RwLock::new(Vec::new());
+
+/// 带缓存的设备列表（kind：0 鼠标 / 1 笔 / 2 触摸 / 3 其它）
+fn input_devices_cached() -> Vec<InputDev> {
+    let now = anim_secs();
+    if let (Ok(cache), Ok(list)) = (DEVICE_CACHE.read(), DEVICES.read()) {
+        if now - cache.0 < 2.0 && cache.1 > 0 {
+            return list.clone();
+        }
+    }
+    let fresh = list_input_devices();
+    if let Ok(mut list) = DEVICES.write() {
+        *list = fresh.clone();
+    }
+    if let Ok(mut cache) = DEVICE_CACHE.write() {
+        *cache = (now, fresh.len());
+    }
+    fresh
+}
+
+/// 枚举 RawInput 能看到的输入设备（鼠标 / 笔 / 触摸）
+pub(crate) fn list_input_devices() -> Vec<InputDev> {
+    use windows::Win32::UI::Input::{
+        GetRawInputDeviceInfoW, GetRawInputDeviceList, RAWINPUTDEVICELIST, RIDI_DEVICEINFO,
+        RIDI_DEVICENAME, RID_DEVICE_INFO, RIM_TYPEHID, RIM_TYPEMOUSE,
+    };
+    let mut out = Vec::new();
+    unsafe {
+        let mut count: u32 = 0;
+        let cb = std::mem::size_of::<RAWINPUTDEVICELIST>() as u32;
+        if GetRawInputDeviceList(None, &mut count, cb) == u32::MAX || count == 0 {
+            return out;
+        }
+        let mut list = vec![RAWINPUTDEVICELIST::default(); count as usize];
+        let got = GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut count, cb);
+        if got == u32::MAX {
+            return out;
+        }
+        for d in list.iter().take(got as usize) {
+            // 设备路径
+            let mut len: u32 = 0;
+            let _ = GetRawInputDeviceInfoW(d.hDevice, RIDI_DEVICENAME, None, &mut len);
+            if len == 0 {
+                continue;
+            }
+            let mut buf = vec![0u16; len as usize + 1];
+            let rc = GetRawInputDeviceInfoW(
+                d.hDevice,
+                RIDI_DEVICENAME,
+                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                &mut len,
+            );
+            if rc == u32::MAX {
+                continue;
+            }
+            let path = String::from_utf16_lossy(&buf[..len as usize]);
+            // 设备类型
+            let mut info: RID_DEVICE_INFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<RID_DEVICE_INFO>() as u32;
+            let mut sz = info.cbSize;
+            let _ = GetRawInputDeviceInfoW(
+                d.hDevice,
+                RIDI_DEVICEINFO,
+                Some(&mut info as *mut _ as *mut core::ffi::c_void),
+                &mut sz,
+            );
+            let kind = if d.dwType == RIM_TYPEMOUSE {
+                0u8
+            } else if d.dwType == RIM_TYPEHID {
+                let page = info.Anonymous.hid.usUsagePage;
+                let usage = info.Anonymous.hid.usUsage;
+                match (page, usage) {
+                    (0x0D, 0x02) => 1, // 笔
+                    (0x0D, 0x04) => 2, // 触摸
+                    _ => 3,
+                }
+            } else {
+                continue; // 键盘之类不要
+            };
+            // 标签：从路径里抠 VID/PID，太长的路径只显示尾巴
+            let mut label = String::new();
+            if let Some(i) = path.find("VID_") {
+                label.push_str(&path[i..(i + 8).min(path.len())]);
+            }
+            if let Some(i) = path.find("PID_") {
+                label.push(' ');
+                label.push_str(&path[i..(i + 8).min(path.len())]);
+            }
+            if label.trim().is_empty() {
+                label = path.rsplit('#').next().unwrap_or(&path).to_string();
+            }
+            let kind_name = match kind {
+                0 => "鼠标",
+                1 => "笔",
+                2 => "触摸",
+                _ => "HID",
+            };
+            out.push(InputDev {
+                kind,
+                path,
+                label: format!("{kind_name} {}", label.trim()),
+            });
+        }
+    }
+    out
+}
+
+/// 后台线程：注册 RawInput（INPUTSINK，不抢走其它程序），按设备标出"这一下是笔还是鼠标"
+fn spawn_raw_input_tracker() {
+    use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK};
+    thread::spawn(|| unsafe {
+        let class = w!("TransGlassRawInput");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(raw_input_proc),
+            hInstance: HINSTANCE(windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default().0),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        let _ = RegisterClassW(&wc);
+        let hwnd = match CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class,
+            w!("TransGlassRawInput"),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            None,
+            None,
+            None,
+        ) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        // 鼠标 + 笔 + 触摸，INPUTSINK 表示不抢别人的输入，只是想旁听
+        let devices = [
+            RAWINPUTDEVICE {
+                usUsagePage: 1,
+                usUsage: 2, // 鼠标
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: hwnd,
+            },
+            RAWINPUTDEVICE {
+                usUsagePage: 0x0D,
+                usUsage: 0x02, // 笔
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: hwnd,
+            },
+            RAWINPUTDEVICE {
+                usUsagePage: 0x0D,
+                usUsage: 0x04, // 触摸
+                dwFlags: RIDEV_INPUTSINK,
+                hwndTarget: hwnd,
+            },
+        ];
+        if RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32).is_err() {
+            return;
+        }
+        // 设备句柄 -> 类别 的缓存
+        let (devs, hids) = build_raw_cache();
+        let _ = (&devs, &hids);
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            let _ = DispatchMessageW(&msg);
+        }
+    });
+}
+
+/// 缓存设备句柄 → (类别, 路径)。RAWINPUT 里只给 HANDLE，要先反查。
+fn build_raw_cache() -> (Vec<(isize, u8, String)>, ()) {
+    use windows::Win32::UI::Input::{
+        GetRawInputDeviceInfoW, GetRawInputDeviceList, RAWINPUTDEVICELIST, RIDI_DEVICEINFO,
+        RIM_TYPEHID, RIM_TYPEMOUSE, RID_DEVICE_INFO,
+    };
+    let mut out = Vec::new();
+    unsafe {
+        let mut count: u32 = 0;
+        let cb = std::mem::size_of::<RAWINPUTDEVICELIST>() as u32;
+        if GetRawInputDeviceList(None, &mut count, cb) == u32::MAX || count == 0 {
+            return (out, ());
+        }
+        let mut list = vec![RAWINPUTDEVICELIST::default(); count as usize];
+        let got = GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut count, cb);
+        if got == u32::MAX {
+            return (out, ());
+        }
+        for d in list.iter().take(got as usize) {
+            let mut info: RID_DEVICE_INFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<RID_DEVICE_INFO>() as u32;
+            let mut sz = info.cbSize;
+            let _ = GetRawInputDeviceInfoW(
+                d.hDevice,
+                RIDI_DEVICEINFO,
+                Some(&mut info as *mut _ as *mut core::ffi::c_void),
+                &mut sz,
+            );
+            let kind = if d.dwType == RIM_TYPEMOUSE {
+                0u8
+            } else if d.dwType == RIM_TYPEHID {
+                match (info.Anonymous.hid.usUsagePage, info.Anonymous.hid.usUsage) {
+                    (0x0D, 0x02) => 1,
+                    (0x0D, 0x04) => 2,
+                    _ => 3,
+                }
+            } else {
+                continue;
+            };
+            let mut len: u32 = 0;
+            let _ = GetRawInputDeviceInfoW(d.hDevice, windows::Win32::UI::Input::RIDI_DEVICENAME, None, &mut len);
+            let mut buf = vec![0u16; len as usize + 1];
+            let rc = GetRawInputDeviceInfoW(
+                d.hDevice,
+                windows::Win32::UI::Input::RIDI_DEVICENAME,
+                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                &mut len,
+            );
+            let path = if rc == u32::MAX {
+                String::new()
+            } else {
+                String::from_utf16_lossy(&buf[..len as usize])
+            };
+            out.push((d.hDevice.0 as isize, kind, path));
+        }
+    }
+    (out, ())
+}
+
+unsafe extern "system" fn raw_input_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if msg == WM_INPUT {
+        use windows::Win32::UI::Input::{
+            GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTHEADER, RID_INPUT,
+        };
+        let mut size: u32 = std::mem::size_of::<RAWINPUT>() as u32;
+        let mut buf = vec![0u8; size as usize];
+        let got = GetRawInputData(
+            HRAWINPUT(l.0 as *mut _),
+            RID_INPUT,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            &mut size,
+            std::mem::size_of::<RAWINPUTHEADER>() as u32,
+        );
+        if got != u32::MAX {
+            let raw = &*(buf.as_ptr() as *const RAWINPUT);
+            let dev = raw.header.hDevice.0 as isize;
+            let (cache, _) = build_raw_cache();
+            let mut is_pen: i32 = -1;
+            if let Some((_, kind, path)) = cache.iter().find(|(h, _, _)| *h == dev) {
+                let pen_sel = DEV_PEN.read().ok().and_then(|g| g.clone());
+                let tab_sel = DEV_TABLET.read().ok().and_then(|g| g.clone());
+                let mouse_sel = DEV_MOUSE.read().ok().and_then(|g| g.clone());
+                if path.is_empty() {
+                    is_pen = if *kind >= 1 && *kind <= 2 { 1 } else { 0 };
+                } else if pen_sel.as_deref() == Some(path.as_str())
+                    || tab_sel.as_deref() == Some(path.as_str())
+                {
+                    is_pen = 1;
+                } else if mouse_sel.as_deref() == Some(path.as_str()) {
+                    is_pen = 0;
+                } else if *kind == 0 {
+                    is_pen = 0;
+                } else if *kind == 1 || *kind == 2 {
+                    is_pen = 1;
+                }
+            }
+            if is_pen >= 0 {
+                LAST_RAW_PEN.store(is_pen, Ordering::Relaxed);
+                LAST_RAW_AT.store(anim_secs().to_bits(), Ordering::Relaxed);
+            }
+        }
+    }
+    DefWindowProcW(hwnd, msg, w, l)
+}
+
+/// 判断这一次输入算不算"笔"：优先看去设置里选定的设备（RawInput 150ms 内的上报），否则退回旧启发式
+unsafe fn effective_is_pen(info: &MSLLHOOKSTRUCT) -> bool {
+    let at = f32::from_bits(LAST_RAW_AT.load(Ordering::Relaxed));
+    if at > 0.0 {
+        let now = anim_secs();
+        if now - at < 0.15 {
+            let p = LAST_RAW_PEN.load(Ordering::Relaxed);
+            if p >= 0 {
+                return p == 1;
+            }
+        }
+    }
+    is_pen_input(info)
+}
+
 /// 笔识别：只认 Windows 的"指针提升"标记（0xFF515700 | cursorId）。
 /// 钩子线程里 GetCurrentInputMessageSource 必然是 IMDT_UNAVAILABLE，调它是白费一次系统调用，
 /// 高频笔（1000Hz）下这个差别会被放大，所以热路径只做位运算。
@@ -736,7 +1044,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
             if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
                 if state.mouse_passthrough != state.pen_passthrough {
                     let is_pen = match get_input_mode() {
-                        InputMode::Auto => is_pen_input(&info),
+                        InputMode::Auto => effective_is_pen(&info),
                         InputMode::ForceMouse => false,
                         InputMode::ForcePen => true,
                     };
@@ -1225,10 +1533,6 @@ impl TransGlassApp {
                 egui::TextStyle::Heading,
                 egui::FontId::new(20.0, egui::FontFamily::Name("bold".into())),
             );
-            style.text_styles.insert(
-                egui::TextStyle::Button,
-                egui::FontId::new(14.0, egui::FontFamily::Name("bold".into())),
-            );
             cc.egui_ctx.set_style(style);
         }
         let _ = EGUI_CTX.set(cc.egui_ctx.clone());
@@ -1389,8 +1693,6 @@ impl TransGlassApp {
             ui.label(egui::RichText::new("没有可见窗口").small().weak());
             return;
         }
-        ui.label(egui::RichText::new("单击窗口 = 控制 ｜ 再单击 = 复原 ｜ 右键看设置").small().weak());
-        ui.add_space(4.0);
         let mut order: Vec<String> = Vec::new();
         for (_, _, d) in &list {
             if !order.contains(d) {
@@ -2154,22 +2456,24 @@ impl eframe::App for TransGlassApp {
         // 3. 大界面：左侧导航（桌面分组 + 窗口），右侧详情
         self.refresh_window_list(false);
 
-        if !self.mini_mode {
+        if self.settings_open {
+            self.settings_page_ui(ctx);
+        } else if !self.mini_mode {
         egui::TopBottomPanel::bottom("actions_bar").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("♻ 全部还原").clicked() {
+                if ui.button("全部还原").clicked() {
                     unsafe { restore_all_windows() };
                     self.refresh_window_list(true);
                 }
                 // 穿透是"每个窗口独立"的功能，放在窗口的右键菜单里（鼠标点透/笔点透），
                 // 全局开关没有意义，这里不再提供。
-                if ui.button("⚙ 设置").clicked() {
+                if ui.button("设置").clicked() {
                     self.settings_open = true;
                     self.settings_fade = Some(std::time::Instant::now());
                 }
                 if ui
-                    .button(if self.mini_mode { "▣ 返回大界面" } else { "▤ 小窗模式" })
+                    .button(if self.mini_mode { "返回大界面" } else { "小窗模式" })
                     .clicked()
                 {
                     self.mini_mode = !self.mini_mode;
@@ -2190,36 +2494,11 @@ impl eframe::App for TransGlassApp {
             .show(ctx, |ui| {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("TransGlass").color(ACCENT).strong().size(20.0));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let weak_btn = |ui: &mut egui::Ui, text: &str| -> egui::Response {
-                            ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new(text).size(12.0).color(TEXT_SECONDARY),
-                                )
-                                .frame(false)
-                                .min_size(egui::vec2(0.0, 22.0)),
-                            )
-                        };
-                        if weak_btn(ui, "隐藏").on_hover_text("隐藏到托盘").clicked() {
-                            hide_root_window();
-                        }
-                        let pin_text = if self.always_on_top { "置顶中" } else { "置顶" };
-                        let pin = weak_btn(ui, pin_text)
-                            .on_hover_text(if self.always_on_top { "点击取消置顶" } else { "点击让面板置顶" });
-                        if pin.clicked() {
-                            self.always_on_top = !self.always_on_top;
-                            self.ui_state.always_on_top = Some(self.always_on_top);
-                            save_ui_state(&self.ui_state);
-                            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                                if self.always_on_top {
-                                    egui::WindowLevel::AlwaysOnTop
-                                } else {
-                                    egui::WindowLevel::Normal
-                                },
-                            ));
-                        }
-                    });
+                    ui.label(
+                        egui::RichText::new("TransGlass")
+                            .color(ACCENT)
+                            .font(font_title(20.0)),
+                    );
                 });
                 ui.add_space(6.0);
                 if ui
@@ -2271,15 +2550,17 @@ impl eframe::App for TransGlassApp {
             }
         }
 
+        // 设置页占满主区域，这里不再画窗口列表
+        if !self.settings_open {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.mini_mode {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("TransGlass").color(ACCENT).strong().size(16.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("▣ 大界面").clicked() {
+                        if ui.button("大界面").clicked() {
                             self.mini_mode = false;
                         }
-                        if ui.button("⚙").clicked() {
+                        if ui.button("设置").clicked() {
                             self.settings_open = true;
                     self.settings_fade = Some(std::time::Instant::now());
                         }
@@ -2297,7 +2578,7 @@ impl eframe::App for TransGlassApp {
                     .inner_margin(egui::Margin::symmetric(10.0, 6.0))
                     .show(ui, |ui| {
                         ui.label(
-                            egui::RichText::new(format!("⚠ {} 条配置/热键问题", issues.len()))
+                            egui::RichText::new(format!("{} 条配置/热键问题", issues.len()))
                                 .color(egui::Color32::from_rgb(180, 83, 9))
                                 .small()
                                 .strong(),
@@ -2314,6 +2595,7 @@ impl eframe::App for TransGlassApp {
             }
             self.detail_pane(ui);
         });
+        }
 
         // 悬停计时由后台线程驱动（不依赖 UI 帧），这里只负责离开时清除
         if !self.hover_seen {
@@ -2322,68 +2604,6 @@ impl eframe::App for TransGlassApp {
             unsafe { hide_hilite() };
         }
 
-        if self.settings_open {
-            let mut open = true;
-            // PCL 那种快速淡入：切分类 / 刚打开时 150ms 从透明推上来
-            let fade = self
-                .settings_fade
-                .map(|t| (t.elapsed().as_secs_f32() / 0.15).clamp(0.0, 1.0))
-                .unwrap_or(1.0);
-            let screen = ctx.screen_rect();
-            let size = egui::vec2(screen.width() * 0.92, screen.height() * 0.9);
-            egui::Window::new("设置")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .movable(false)
-                .fixed_size(size)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.set_opacity(fade);
-                    ui.horizontal_top(|ui| {
-                        ui.vertical(|ui| {
-                            ui.set_width(150.0);
-                            ui.add_space(2.0);
-                            for (i, name) in SETTINGS_TABS.iter().enumerate() {
-                                let sel = self.settings_tab == i;
-                                if ui
-                                    .selectable_label(sel, egui::RichText::new(*name).size(15.0))
-                                    .clicked()
-                                    && self.settings_tab != i
-                                {
-                                    self.settings_tab = i;
-                                    self.settings_fade = Some(std::time::Instant::now());
-                                }
-                            }
-                            ui.add_space(10.0);
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                    .small()
-                                    .weak(),
-                            );
-                        });
-                        ui.separator();
-                        ui.vertical(|ui| {
-                            ui.set_width(ui.available_width());
-                            egui::ScrollArea::vertical()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    match self.settings_tab {
-                                        0 => self.settings_page_hotkeys(ui),
-                                        1 => self.settings_page_input(ui),
-                                        2 => self.settings_page_window(ui),
-                                        3 => self.settings_page_ball(ui),
-                                        _ => self.settings_page_maint(ui),
-                                    }
-                                });
-                        });
-                    });
-                });
-            if !open {
-                self.settings_open = false;
-            }
-        }
         if self.selftest_open {
             let mut open = self.selftest_open;
             egui::Window::new("自检报告")
@@ -2540,6 +2760,16 @@ fn main() -> Result<(), eframe::Error> {
     load_ball_tex();
     let boot_state = load_ui_state();
     load_ball_skin(boot_state.skin.as_deref(), ui_doll_model(&boot_state));
+    if let Ok(mut g) = DEV_MOUSE.write() {
+        *g = boot_state.input_mouse.clone();
+    }
+    if let Ok(mut g) = DEV_PEN.write() {
+        *g = boot_state.input_pen.clone();
+    }
+    if let Ok(mut g) = DEV_TABLET.write() {
+        *g = boot_state.input_tablet.clone();
+    }
+    spawn_raw_input_tracker();
     BALL_FLOAT.store(boot_state.idle_float.unwrap_or(true), Ordering::Relaxed);
     BALL_SWAY.store(boot_state.idle_sway.unwrap_or(true), Ordering::Relaxed);
     if let Some(sc) = boot_state.ball_scale {
@@ -2914,6 +3144,10 @@ struct UiState {
     idle_float: Option<bool>,
     /// 待机手臂轻摆（默认开）
     idle_sway: Option<bool>,
+    /// 设置里选定的输入设备路径（None = 自动）
+    input_mouse: Option<String>,
+    input_pen: Option<String>,
+    input_tablet: Option<String>,
     view_mode: Option<u8>,
     /// 兼容旧配置
     preview_rate: Option<u8>,
@@ -5031,7 +5265,7 @@ pub(crate) const SETTINGS_TABS: [&str; 5] = [
 
 impl TransGlassApp {
     fn settings_page_hotkeys(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("快捷键").font(font_title(20.0)).color(TEXT_PRIMARY));
+        ui.label(egui::RichText::new("快捷键").size(18.0).color(TEXT_PRIMARY));
         ui.add_space(2.0);
         let mut priority = self.hotkey_priority_ui;
         if ui
@@ -5050,6 +5284,65 @@ impl TransGlassApp {
         );
         ui.add_space(10.0);
         self.hotkey_editor_inline(ui);
+    }
+
+    /// 设置页：直接作为主界面内容（不再弹二级窗口）
+    fn settings_page_ui(&mut self, ctx: &egui::Context) {
+        let fade = self
+            .settings_fade
+            .map(|t| (t.elapsed().as_secs_f32() / 0.12).clamp(0.0, 1.0))
+            .unwrap_or(1.0);
+        egui::TopBottomPanel::bottom("settings_bar").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("← 返回").clicked() {
+                    self.settings_open = false;
+                }
+                ui.label(
+                    egui::RichText::new("设置")
+                        .size(15.0)
+                        .color(TEXT_PRIMARY),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                            .small()
+                            .weak(),
+                    );
+                });
+            });
+            ui.add_space(4.0);
+        });
+        egui::SidePanel::left("settings_nav")
+            .resizable(false)
+            .exact_width(160.0)
+            .show(ctx, |ui| {
+                ui.add_space(12.0);
+                ui.set_opacity(fade);
+                for (i, name) in SETTINGS_TABS.iter().enumerate() {
+                    if nav_row(ui, self.settings_tab == i, name, false).clicked()
+                        && self.settings_tab != i
+                    {
+                        self.settings_tab = i;
+                        self.settings_fade = Some(std::time::Instant::now());
+                    }
+                }
+            });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.set_opacity(fade);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add_space(8.0);
+                    match self.settings_tab {
+                        0 => self.settings_page_hotkeys(ui),
+                        1 => self.settings_page_input(ui),
+                        2 => self.settings_page_window(ui),
+                        3 => self.settings_page_ball(ui),
+                        _ => self.settings_page_maint(ui),
+                    }
+                });
+        });
     }
 
     /// 快捷键编辑（内嵌，不再单开二级窗口）。每行一个功能：勾选 / 名称 / 修饰键 / 按键 / 录入。
@@ -5169,7 +5462,7 @@ impl TransGlassApp {
     }
 
     fn settings_page_input(&mut self, ui: &mut egui::Ui) {
-        ui.heading("输入");
+        ui.label(egui::RichText::new("输入").size(18.0).color(TEXT_PRIMARY));
         ui.add_space(6.0);
         if ui
             .button(format!("输入模式：{}（点击切换）", input_mode_label()))
@@ -5177,16 +5470,139 @@ impl TransGlassApp {
         {
             cycle_input_mode();
         }
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         ui.label(
             egui::RichText::new("WinTab 驱动（Wacom/Huion 默认模式）的笔建议用「强制笔」。")
+                .small()
+                .weak(),
+        );
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("输入设备").size(15.0).color(TEXT_PRIMARY));
+        ui.label(
+            egui::RichText::new(
+                "选好设备后，自动模式会按设备判断这一次是笔还是鼠标，\n适合驱动把数位板笔上报成普通鼠标的情况。",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(8.0);
+
+        let devs = input_devices_cached();
+        let mice: Vec<String> = devs
+            .iter()
+            .filter(|d| d.kind == 0)
+            .map(|d| d.path.clone())
+            .collect();
+        let pens: Vec<String> = devs
+            .iter()
+            .filter(|d| d.kind == 1)
+            .map(|d| d.path.clone())
+            .collect();
+        let tablets: Vec<String> = devs
+            .iter()
+            .filter(|d| d.kind == 1 || d.kind == 2)
+            .map(|d| d.path.clone())
+            .collect();
+        let label_of = |list: &[String]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|p| {
+                    let l = devs
+                        .iter()
+                        .find(|d| &d.path == p)
+                        .map(|d| d.label.clone())
+                        .unwrap_or_else(|| p.rsplit('#').next().unwrap_or(p).to_string());
+                    (p.clone(), l)
+                })
+                .collect()
+        };
+        // 三个下拉：鼠标 / 笔 / 数位板
+        for (title, items, cur_static, key) in [
+            ("鼠标设备", label_of(&mice), 0u8, "mouse"),
+            ("笔设备", label_of(&pens), 1u8, "pen"),
+            ("数位板", label_of(&tablets), 2u8, "tablet"),
+        ] {
+            let _ = cur_static;
+            let cur = match key {
+                "mouse" => self.ui_state.input_mouse.clone(),
+                "pen" => self.ui_state.input_pen.clone(),
+                _ => self.ui_state.input_tablet.clone(),
+            };
+            let cur_label = cur
+                .as_ref()
+                .and_then(|c| items.iter().find(|(p, _)| p == c).map(|(_, l)| l.clone()))
+                .unwrap_or_else(|| "自动（全部设备）".to_string());
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [96.0, 22.0],
+                    egui::Label::new(egui::RichText::new(title).size(13.0)),
+                );
+                let mut picked: Option<Option<String>> = None;
+                egui::ComboBox::from_id_source(format!("dev_{key}"))
+                    .width(320.0)
+                    .selected_text(cur_label)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(cur.is_none(), "自动（全部设备）")
+                            .clicked()
+                        {
+                            picked = Some(None);
+                        }
+                        for (path, label) in &items {
+                            if ui
+                                .selectable_label(cur.as_deref() == Some(path.as_str()), label)
+                                .on_hover_text(path)
+                                .clicked()
+                            {
+                                picked = Some(Some(path.clone()));
+                            }
+                        }
+                        if items.is_empty() {
+                            ui.label(egui::RichText::new("（没检测到这类设备）").small().weak());
+                        }
+                    });
+                if let Some(p) = picked {
+                    match key {
+                        "mouse" => {
+                            self.ui_state.input_mouse = p.clone();
+                            if let Ok(mut g) = DEV_MOUSE.write() {
+                                *g = p;
+                            }
+                        }
+                        "pen" => {
+                            self.ui_state.input_pen = p.clone();
+                            if let Ok(mut g) = DEV_PEN.write() {
+                                *g = p;
+                            }
+                        }
+                        _ => {
+                            self.ui_state.input_tablet = p.clone();
+                            if let Ok(mut g) = DEV_TABLET.write() {
+                                *g = p;
+                            }
+                        }
+                    }
+                    save_ui_state(&self.ui_state);
+                }
+            });
+            ui.add_space(4.0);
+        }
+        ui.add_space(6.0);
+        let dev = match LAST_INPUT_IS_PEN.load(Ordering::Relaxed) {
+            1 => "笔",
+            0 => "鼠标",
+            _ => "—",
+        };
+        ui.label(
+            egui::RichText::new(format!("最近一次输入：{dev}　·　共检测到 {} 个设备", devs.len()))
                 .small()
                 .weak(),
         );
     }
 
     fn settings_page_window(&mut self, ui: &mut egui::Ui) {
-        ui.heading("窗口与预览");
+        ui.label(egui::RichText::new("窗口与预览").size(18.0).color(TEXT_PRIMARY));
         ui.add_space(6.0);
         ui.label(egui::RichText::new("预览帧率").strong().color(TEXT_SECONDARY));
         let mut fps = self.preview_fps as f32;
@@ -5234,7 +5650,7 @@ impl TransGlassApp {
     }
 
     fn settings_page_ball(&mut self, ui: &mut egui::Ui) {
-        ui.heading("悬浮球与纸娃娃");
+        ui.label(egui::RichText::new("悬浮球与纸娃娃").size(18.0).color(TEXT_PRIMARY));
         ui.add_space(6.0);
         let mut choose_skin = self.ui_state.skin.clone();
         let skins = list_skins();
@@ -5324,7 +5740,7 @@ impl TransGlassApp {
     }
 
     fn settings_page_maint(&mut self, ui: &mut egui::Ui) {
-        ui.heading("维护");
+        ui.label(egui::RichText::new("维护").size(18.0).color(TEXT_PRIMARY));
         ui.add_space(6.0);
         if ui.button("运行自检").clicked() {
             let _ = selftest::run_hosted();
