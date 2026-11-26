@@ -3935,6 +3935,8 @@ unsafe fn toggle_main_window() {
 // ---- 悬浮球试验窗口：Win32 分层窗口 + UpdateLayeredWindow（逐像素透明） ----
 // ---- 悬浮球：Win32 分层窗口（ARGB 逐像素透明）+ 自带点击处理 ----
 static BALL_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 最后一次点击命中的（非自身的）窗口，悬浮球遥控的目标
+static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static BALL_EXPANDED: AtomicBool = AtomicBool::new(false);
 static BALL_ANIM: AtomicU32 = AtomicU32::new(0); // f32 bits，0..1 弹出动画
 static BALL_REQ_PANEL: AtomicBool = AtomicBool::new(false);
@@ -3954,13 +3956,13 @@ unsafe fn ball_center() -> (i32, i32) {
     (BALL_W - 42, BALL_H / 2)
 }
 
-unsafe fn ball_satellites(t: f32) -> [(i32, i32); 3] {
+unsafe fn ball_satellites(t: f32) -> [(i32, i32); 6] {
     let (bx, by) = ball_center();
-    let mut out = [(0, 0); 3];
-    let angles = [150.0f32, 180.0, 210.0];
+    let mut out = [(0, 0); 6];
+    let angles = [112.0f32, 138.5, 165.0, 195.0, 221.5, 248.0];
     for (i, a) in angles.iter().enumerate() {
         let rad = a.to_radians();
-        let r = 42.0 + 54.0 * t;
+        let r = 40.0 + 58.0 * t;
         out[i] = (
             bx + (rad.cos() * r) as i32,
             by + (rad.sin() * r) as i32,
@@ -4027,7 +4029,7 @@ unsafe fn ball_render() {
 
     if t > 0.02 {
         let sats = ball_satellites(t);
-        let labels = ["面板", "小窗", "还原"];
+        let labels = ["透-", "透+", "置顶", "穿透", "模式", "还原"];
         for (i, (sx, sy)) in sats.iter().enumerate() {
             let r = (17.0 * (0.6 + 0.4 * t)) as i32 * ss;
             let (sx, sy) = (sx * ss, sy * ss);
@@ -4142,7 +4144,7 @@ unsafe fn ball_hit(x: i32, y: i32) -> u8 {
     }
     if t > 0.5 {
         for (i, (sx, sy)) in ball_satellites(t).iter().enumerate() {
-            if ((x - sx).pow(2) + (y - sy).pow(2)) <= 20 * 20 {
+            if ((x - sx).pow(2) + (y - sy).pow(2)) <= 18 * 18 {
                 return (i + 1) as u8;
             }
         }
@@ -4168,20 +4170,24 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                         std::thread::sleep(std::time::Duration::from_millis(14));
                     }
                 }
-                1 => {
-                    BALL_REQ_PANEL.store(true, Ordering::Relaxed);
-                    BALL_EXPANDED.store(false, Ordering::Relaxed);
-                    BALL_ANIM.store(0f32.to_bits(), Ordering::Relaxed);
-                    ball_render();
-                }
-                2 => {
-                    BALL_REQ_MINI.store(true, Ordering::Relaxed);
-                    BALL_EXPANDED.store(false, Ordering::Relaxed);
-                    BALL_ANIM.store(0f32.to_bits(), Ordering::Relaxed);
-                    ball_render();
-                }
-                3 => {
-                    BALL_REQ_RESTORE.store(true, Ordering::Relaxed);
+                1..=6 => {
+                    let target = {
+                        let t = TARGET_HWND.load(Ordering::Relaxed);
+                        if t != 0 {
+                            HWND(t as *mut _)
+                        } else {
+                            GetForegroundWindow()
+                        }
+                    };
+                    match ball_hit(x, y) {
+                        1 => ball_apply(target, BallAction::AlphaDown),
+                        2 => ball_apply(target, BallAction::AlphaUp),
+                        3 => ball_apply(target, BallAction::Topmost),
+                        4 => ball_apply(target, BallAction::Passthrough),
+                        5 => ball_apply(target, BallAction::CycleMode),
+                        6 => ball_apply(target, BallAction::Restore),
+                        _ => {}
+                    }
                     BALL_EXPANDED.store(false, Ordering::Relaxed);
                     BALL_ANIM.store(0f32.to_bits(), Ordering::Relaxed);
                     ball_render();
@@ -4264,6 +4270,74 @@ unsafe fn set_all_passthrough(on: bool) {
         };
         if let Some((alpha, top)) = values {
             let _ = apply_transparency_to_hwnd(hwnd, alpha, top, on, on);
+        }
+    }
+    request_ui_repaint();
+}
+
+#[derive(Clone, Copy)]
+enum BallAction {
+    AlphaDown,
+    AlphaUp,
+    Topmost,
+    Passthrough,
+    CycleMode,
+    Restore,
+}
+
+unsafe fn ball_apply(target: HWND, action: BallAction) {
+    if target.0.is_null() || is_own_hwnd(target) || is_shell_hwnd(target) {
+        return;
+    }
+    match action {
+        BallAction::Restore => restore_window(target),
+        BallAction::CycleMode => cycle_input_mode(),
+        BallAction::Topmost => toggle_topmost(target),
+        BallAction::Passthrough => {
+            ensure_managed(target);
+            let v = target.0 as isize;
+            let (alpha, top, mouse, pen) = {
+                let mut out = (255u8, false, false, false);
+                if let Some(st) = GLOBAL_REGISTRY.get(&v) {
+                    out = (
+                        st.current_alpha,
+                        st.user_pref_topmost,
+                        st.mouse_passthrough,
+                        st.pen_passthrough,
+                    );
+                }
+                out
+            };
+            let on = !(mouse && pen);
+            if let Some(mut st) = GLOBAL_REGISTRY.get_mut(&v) {
+                st.mouse_passthrough = on;
+                st.pen_passthrough = on;
+            }
+            let _ = apply_transparency_to_hwnd(target, alpha, top, on, on);
+        }
+        BallAction::AlphaDown | BallAction::AlphaUp => {
+            ensure_managed(target);
+            let v = target.0 as isize;
+            let mut alpha = 255u8;
+            let mut top = false;
+            let mut mouse = false;
+            let mut pen = false;
+            if let Some(st) = GLOBAL_REGISTRY.get(&v) {
+                alpha = st.current_alpha;
+                top = st.user_pref_topmost;
+                mouse = st.mouse_passthrough;
+                pen = st.pen_passthrough;
+            }
+            let step = 26u8;
+            let next = match action {
+                BallAction::AlphaUp => alpha.saturating_sub(step),
+                _ => alpha.saturating_add(step),
+            }
+            .clamp(40, 255);
+            if let Some(mut st) = GLOBAL_REGISTRY.get_mut(&v) {
+                st.current_alpha = next;
+            }
+            let _ = apply_transparency_to_hwnd(target, next, top, mouse, pen);
         }
     }
     request_ui_repaint();
