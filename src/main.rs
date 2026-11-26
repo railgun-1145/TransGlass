@@ -1185,6 +1185,8 @@ impl TransGlassApp {
             ui.label(egui::RichText::new("没有可见窗口").small().weak());
             return;
         }
+        ui.label(egui::RichText::new("单击窗口 = 控制 ｜ 再单击 = 复原 ｜ 右键看设置").small().weak());
+        ui.add_space(4.0);
         let mut order: Vec<String> = Vec::new();
         for (_, _, d) in &list {
             if !order.contains(d) {
@@ -1193,6 +1195,7 @@ impl TransGlassApp {
         }
         let cur_sel = self.selected;
         let mut select: Option<isize> = None;
+        let mut control_now: Option<isize> = None;
         let mut restore_now: Option<isize> = None;
         for desk in order {
             let items: Vec<&(isize, String, String)> =
@@ -1217,9 +1220,20 @@ impl TransGlassApp {
                         if !managed {
                             text = text.weak();
                         }
-                        let resp = ui.selectable_label(cur_sel == Some(*hwnd), text);
+                        let resp = ui
+                            .selectable_label(cur_sel == Some(*hwnd), text)
+                            .on_hover_text(if managed {
+                                "点击复原这个窗口（再点一次重新控制）"
+                            } else {
+                                "点击控制这个窗口（透明度 90%）；再点一次复原"
+                            });
                         if resp.clicked() {
                             select = Some(*hwnd);
+                            if managed {
+                                restore_now = Some(*hwnd);
+                            } else {
+                                control_now = Some(*hwnd);
+                            }
                         }
                         resp.context_menu(|ui| {
                             ui.label(egui::RichText::new(title.as_str()).strong().small());
@@ -1269,6 +1283,10 @@ impl TransGlassApp {
         }
         if let Some(h) = select {
             self.selected = Some(h);
+        }
+        if let Some(h) = control_now {
+            unsafe { control_window(HWND(h as *mut _)) };
+            self.refresh_window_list(true);
         }
         if let Some(h) = restore_now {
             unsafe { restore_window(HWND(h as *mut _)) };
@@ -3010,4 +3028,10 @@ unsafe fn set_window_alpha(hwnd: HWND, alpha: u8) {
         let _ = apply_transparency_to_hwnd(hwnd, alpha, top, mouse, pen);
     }
     request_ui_repaint();
+}
+
+/// 一键控制：纳入管理并套用默认控制参数（透明度 90%），用于列表单击
+unsafe fn control_window(hwnd: HWND) {
+    ensure_managed(hwnd);
+    set_window_alpha(hwnd, 230);
 }
