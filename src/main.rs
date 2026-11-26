@@ -4944,8 +4944,6 @@ static DOLL_DBLCLICK: AtomicBool = AtomicBool::new(true);
 /// 上次点纸娃娃的时间/位置（判断双击）
 static DOLL_LAST_CLICK: AtomicU32 = AtomicU32::new(0);
 static DOLL_LAST_POS: AtomicU32 = AtomicU32::new(0);
-/// 纸娃娃垂直居中的偏移（f32 bits），做阻尼平滑，避免逐帧 ±1px 抖动
-static DOLL_OFF_Y: AtomicU32 = AtomicU32::new(0);
 
 fn ball_expand_target() -> bool {
     BALL_EXPANDED.load(Ordering::Relaxed)
@@ -5361,7 +5359,7 @@ fn spawn_doll_ticker() {
             }
             // 待机动画关掉后，静置就完全不重绘
             let idle_anim = BALL_FLOAT.load(Ordering::Relaxed) || BALL_SWAY.load(Ordering::Relaxed);
-            let due = idle_anim && (t - last_render) >= 0.18;
+            let due = idle_anim && (t - last_render) >= 0.12;
             if moving || active || hover_changed || due {
                 last_render = t;
                 unsafe { ball_render() };
@@ -5465,7 +5463,7 @@ unsafe fn ball_render() {
             w as usize,
             h as usize,
             bx as f32,
-            by as f32 + 3.0 + bob,
+            by as f32 + 3.0 + bob.round(),
             skin,
             &pose,
         );
@@ -5486,16 +5484,10 @@ unsafe fn ball_render() {
                 // 水平：只按"舞台中心 - 球心"平移，不跟 bbox 走。
                 // 转视角时轮廓宽度一直在变，用 bbox 居中会让整个人左右抖一下（原地抽畜）。
                 let dx = cx - bx;
-                // 垂直：按包围盒居中，但做阻尼平滑，头和手臂的摆动不会变成逐帧跳动
-                let target_dy = (cy - (y0 + y1) / 2) as f32;
-                let prev_dy = f32::from_bits(DOLL_OFF_Y.load(Ordering::Relaxed));
-                let dy_f = if prev_dy.abs() < 0.01 {
-                    target_dy
-                } else {
-                    prev_dy + (target_dy - prev_dy) * 0.35
-                };
-                DOLL_OFF_Y.store(dy_f.to_bits(), Ordering::Relaxed);
-                let dy = dy_f.round() as i32;
+                // 垂直：和水平一样只按「舞台中心 - 球心」平移。
+                // 人物本身在 render 里就是以 (bx,by) 为模型中心画的，再拿 bbox 去二次居中
+                // 只会把包围盒每帧 ±1~2px 的抖动放大成"原地抽畜"，而且会把待机浮动抵消掉。
+                let dy = cy - by;
                 for yy in 0..bh {
                     for xx in 0..bw {
                         let sx = x0 + xx;
