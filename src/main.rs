@@ -1131,7 +1131,6 @@ enum HotkeyCaptureTarget {
 
 struct TransGlassApp {
     should_exit: bool,
-    hotkey_editor_open: bool,
     hotkey_draft: HotkeyConfig,
     hotkey_message: Option<String>,
     hotkey_capture: Option<HotkeyCaptureTarget>,
@@ -1171,49 +1170,82 @@ struct TransGlassApp {
 
 impl TransGlassApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // 1. 设置中文字体 (尝试多个常用路径)
+        // 1. 字体：优先微软雅黑（现代 UI 字体），失败了才退回黑体/宋体。
+        //    以前把 simhei 放第一优先，黑体在小字号下笔画又硬又挤，看着像"代码注释"。
         let mut fonts = egui::FontDefinitions::default();
         let font_paths = [
-            "C:\\Windows\\Fonts\\simhei.ttf", // 黑体 (TTF)
-            "C:\\Windows\\Fonts\\simkai.ttf", // 楷体 (TTF)
-            "C:\\Windows\\Fonts\\msyh.ttc",   // 微软雅黑 (TTC)
+            "C:\\Windows\\Fonts\\msyh.ttc",
             "C:\\Windows\\Fonts\\msyh.ttf",
-            "C:\\Windows\\Fonts\\simsun.ttc", // 宋体 (TTC)
+            "C:\\Windows\\Fonts\\simhei.ttf",
+            "C:\\Windows\\Fonts\\simsun.ttc",
             "C:\\Windows\\Fonts\\simsun.ttf",
         ];
-
-        let mut font_loaded = false;
         for path in font_paths {
             if let Ok(font_data) = std::fs::read(path) {
                 fonts
                     .font_data
-                    .insert("my_font".to_owned(), egui::FontData::from_owned(font_data));
+                    .insert("cjk".to_owned(), egui::FontData::from_owned(font_data));
                 fonts
                     .families
                     .get_mut(&egui::FontFamily::Proportional)
                     .unwrap()
-                    .insert(0, "my_font".to_owned());
+                    .insert(0, "cjk".to_owned());
                 fonts
                     .families
                     .get_mut(&egui::FontFamily::Monospace)
                     .unwrap()
-                    .push("my_font".to_owned());
-                font_loaded = true;
+                    .push("cjk".to_owned());
                 break;
             }
         }
-
-        let _ = font_loaded;
+        // 粗体家族（雅黑 Bold）：只给标题用，正文用常规字重
+        let bold_loaded = if let Ok(bold) = std::fs::read("C:\\Windows\\Fonts\\msyhbd.ttc") {
+            fonts
+                .font_data
+                .insert("cjk_bold".to_owned(), egui::FontData::from_owned(bold));
+            let fam = egui::FontFamily::Name("bold".into());
+            let mut list = vec!["cjk_bold".to_owned()];
+            if let Some(base) = fonts.families.get(&egui::FontFamily::Proportional) {
+                list.extend(base.iter().cloned());
+            }
+            fonts.families.insert(fam, list);
+            true
+        } else {
+            false
+        };
         cc.egui_ctx.set_fonts(fonts);
 
         // 2. 仿 Trae 风格的深色 UI
         // 浅色主题：色值取自 DSH 界面取样（底 #FAFAFA / 卡 #FFFFFF / 边 #E5E7EB / 主色 #4176E6）
         apply_panel_theme(&cc.egui_ctx);
+        if bold_loaded {
+            let mut style = (*cc.egui_ctx.style()).clone();
+            style.text_styles.insert(
+                egui::TextStyle::Heading,
+                egui::FontId::new(19.0, egui::FontFamily::Name("bold".into())),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Button,
+                egui::FontId::new(13.0, egui::FontFamily::Name("bold".into())),
+            );
+            cc.egui_ctx.set_style(style);
+        }
         let _ = EGUI_CTX.set(cc.egui_ctx.clone());
 
         if let Ok(handle) = cc.window_handle() {
             if let RawWindowHandle::Win32(h) = handle.as_raw() {
                 ROOT_HWND.store(h.hwnd.get(), Ordering::Relaxed);
+                // 系统深色模式会给浅色界面配一条纯黑标题栏，很难看；强制用浅色标题栏
+                unsafe {
+                    use windows::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+                    let dark: i32 = 0;
+                    let _ = DwmSetWindowAttribute(
+                        HWND(h.hwnd.get() as *mut _),
+                        windows::Win32::Graphics::Dwm::DWMWA_USE_IMMERSIVE_DARK_MODE,
+                        &dark as *const i32 as *const core::ffi::c_void,
+                        std::mem::size_of::<i32>() as u32,
+                    );
+                }
             }
         }
 
@@ -1221,7 +1253,6 @@ impl TransGlassApp {
         let always_on_top = ui_state.always_on_top.unwrap_or(false);
         Self {
             should_exit: false,
-            hotkey_editor_open: false,
             hotkey_draft: load_or_create_hotkey_config(),
             hotkey_message: None,
             hotkey_capture: None,
@@ -1864,13 +1895,6 @@ impl TransGlassApp {
         }
         None
     }
-    fn open_hotkey_editor(&mut self) {
-        self.hotkey_draft = load_or_create_hotkey_config();
-        self.hotkey_message = None;
-        self.hotkey_capture = None;
-        self.hotkey_editor_open = true;
-    }
-
     fn validate_hotkey_spec(spec: &HotkeySpec) -> Result<(), String> {
         unsafe {
             let mods = parse_modifiers(&spec.modifiers);
@@ -2158,9 +2182,21 @@ impl eframe::App for TransGlassApp {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("TransGlass").color(ACCENT).strong().size(18.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let pin = ui
-                            .add(egui::Button::new(if self.always_on_top { "📌" } else { "📍" }).frame(false))
-                            .on_hover_text(if self.always_on_top { "面板已置顶，点击取消" } else { "点击让面板置顶" });
+                        let weak_btn = |ui: &mut egui::Ui, text: &str| -> egui::Response {
+                            ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new(text).size(12.0).color(TEXT_SECONDARY),
+                                )
+                                .frame(false)
+                                .min_size(egui::vec2(0.0, 22.0)),
+                            )
+                        };
+                        if weak_btn(ui, "隐藏").on_hover_text("隐藏到托盘").clicked() {
+                            hide_root_window();
+                        }
+                        let pin_text = if self.always_on_top { "置顶中" } else { "置顶" };
+                        let pin = weak_btn(ui, pin_text)
+                            .on_hover_text(if self.always_on_top { "点击取消置顶" } else { "点击让面板置顶" });
                         if pin.clicked() {
                             self.always_on_top = !self.always_on_top;
                             self.ui_state.always_on_top = Some(self.always_on_top);
@@ -2172,9 +2208,6 @@ impl eframe::App for TransGlassApp {
                                     egui::WindowLevel::Normal
                                 },
                             ));
-                        }
-                        if ui.button("🗙").on_hover_text("隐藏到托盘").clicked() {
-                            hide_root_window();
                         }
                     });
                 });
@@ -2375,156 +2408,6 @@ impl eframe::App for TransGlassApp {
             self.selftest_open = open;
         }
 
-        if self.hotkey_editor_open {
-            let defaults = default_config();
-            let mut open = self.hotkey_editor_open;
-            egui::Window::new("快捷键设置")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(true)
-                .default_width(380.0)
-                .show(ctx, |ui| {
-                    let path = get_config_path();
-                    ui.label(format!("配置文件：{}", path.display()));
-                    ui.add_space(8.0);
-
-                    // 统一槽位表驱动：新增热键 = HotkeySlot 加一个变体 + ALL 加一项
-                    egui::ScrollArea::vertical()
-                        .max_height(430.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for slot in HotkeySlot::ALL {
-                                let optional = slot.optional();
-                                let mut enabled = !optional || slot.enabled(&self.hotkey_draft);
-                                let mut spec = slot.get(&self.hotkey_draft);
-                                ui.group(|ui| {
-                                    ui.horizontal(|ui| {
-                                        if optional {
-                                            if ui.checkbox(&mut enabled, "").changed() {
-                                                slot.set_enabled(&mut self.hotkey_draft, enabled);
-                                            }
-                                        } else {
-                                            ui.add_space(18.0);
-                                        }
-                                        ui.add(egui::Label::new(
-                                            egui::RichText::new(slot.label()).small(),
-                                        ));
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if ui
-                                                    .add_enabled(
-                                                        enabled,
-                                                        egui::Button::new("录入").small(),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    self.hotkey_capture =
-                                                        Some(slot.capture_target());
-                                                    self.hotkey_message =
-                                                        Some("请按下组合键".into());
-                                                }
-                                            },
-                                        );
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(18.0);
-                                        ui.add_enabled_ui(enabled, |ui| {
-                                            hotkey_mods_ui(ui, &mut spec.modifiers);
-                                            hotkey_key_ui(ui, &mut spec.key, slot.id());
-                                        });
-                                    });
-                                });
-                                if enabled {
-                                    slot.set(&mut self.hotkey_draft, spec);
-                                }
-                            }
-                        });
-
-                    ui.add_space(6.0);
-                    match Self::validate_config(&self.hotkey_draft) {
-                        Ok(()) => {
-                            ui.label(egui::RichText::new("组合键均合法且无冲突").small().weak());
-                        }
-                        Err(err) => {
-                            ui.label(
-                                egui::RichText::new(format!("配置有问题：{err}"))
-                                    .small()
-                                    .color(ERROR),
-                            );
-                        }
-                    }
-
-                    ui.add_space(10.0);
-                    if self.hotkey_draft.mouse.is_none() {
-                        self.hotkey_draft.mouse = defaults.mouse.clone();
-                    }
-                    if let Some(spec) = self.hotkey_draft.mouse.as_mut() {
-                        ui.label("鼠标侧键绑定");
-
-                        let mut x1 = spec.xbutton1.clone().unwrap_or_else(|| "none".into());
-                        let mut x2 = spec.xbutton2.clone().unwrap_or_else(|| "none".into());
-
-                        ui.horizontal(|ui| {
-                            ui.label("XButton1");
-                            egui::ComboBox::from_id_source("xbutton1_combo")
-                                .selected_text(x1.as_str())
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut x1, "none".into(), "none");
-                                    ui.selectable_value(&mut x1, "decrease".into(), "decrease");
-                                    ui.selectable_value(&mut x1, "increase".into(), "increase");
-                                    ui.selectable_value(&mut x1, "toggle_topmost".into(), "toggle_topmost");
-                                    ui.selectable_value(&mut x1, "toggle_click_through".into(), "toggle_click_through");
-                                    ui.selectable_value(&mut x1, "toggle_pen_passthrough".into(), "toggle_pen_passthrough");
-                                    ui.selectable_value(&mut x1, "cycle_input_mode".into(), "cycle_input_mode");
-                                    ui.selectable_value(&mut x1, "reset_current".into(), "reset_current");
-                                    ui.selectable_value(&mut x1, "reset_all".into(), "reset_all");
-                                    ui.selectable_value(&mut x1, "update".into(), "update");
-                                });
-                        });
-
-                        ui.horizontal(|ui| {
-                            ui.label("XButton2");
-                            egui::ComboBox::from_id_source("xbutton2_combo")
-                                .selected_text(x2.as_str())
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut x2, "none".into(), "none");
-                                    ui.selectable_value(&mut x2, "decrease".into(), "decrease");
-                                    ui.selectable_value(&mut x2, "increase".into(), "increase");
-                                    ui.selectable_value(&mut x2, "toggle_topmost".into(), "toggle_topmost");
-                                    ui.selectable_value(&mut x2, "toggle_click_through".into(), "toggle_click_through");
-                                    ui.selectable_value(&mut x2, "toggle_pen_passthrough".into(), "toggle_pen_passthrough");
-                                    ui.selectable_value(&mut x2, "cycle_input_mode".into(), "cycle_input_mode");
-                                    ui.selectable_value(&mut x2, "reset_current".into(), "reset_current");
-                                    ui.selectable_value(&mut x2, "reset_all".into(), "reset_all");
-                                    ui.selectable_value(&mut x2, "update".into(), "update");
-                                });
-                        });
-
-                        spec.xbutton1 = if x1 == "none" { None } else { Some(x1) };
-                        spec.xbutton2 = if x2 == "none" { None } else { Some(x2) };
-                    }
-
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("保存并应用").clicked() {
-                            self.save_and_reload_hotkeys();
-                        }
-                        if ui.button("恢复默认").clicked() {
-                            self.hotkey_draft = default_config();
-                            self.hotkey_message = Some("已恢复默认（尚未保存）".into());
-                        }
-                        if ui.button("关闭").clicked() {
-                            self.hotkey_editor_open = false;
-                        }
-                    });
-                    if let Some(msg) = self.hotkey_message.as_ref() {
-                        ui.add_space(6.0);
-                        ui.label(msg);
-                    }
-                });
-            self.hotkey_editor_open = open;
-        }
     }
 }
 
@@ -5126,7 +5009,7 @@ pub(crate) const SETTINGS_TABS: [&str; 5] = [
 impl TransGlassApp {
     fn settings_page_hotkeys(&mut self, ui: &mut egui::Ui) {
         ui.heading("快捷键");
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         let mut priority = self.hotkey_priority_ui;
         if ui
             .checkbox(&mut priority, "快捷键优先（被别的程序占用时也强制生效）")
@@ -5143,8 +5026,122 @@ impl TransGlassApp {
                 .weak(),
         );
         ui.add_space(10.0);
-        if ui.button("打开快捷键编辑器…").clicked() {
-            self.open_hotkey_editor();
+        self.hotkey_editor_inline(ui);
+    }
+
+    /// 快捷键编辑（内嵌，不再单开二级窗口）。每行一个功能：勾选 / 名称 / 修饰键 / 按键 / 录入。
+    fn hotkey_editor_inline(&mut self, ui: &mut egui::Ui) {
+        for slot in HotkeySlot::ALL {
+            let optional = slot.optional();
+            let mut enabled = !optional || slot.enabled(&self.hotkey_draft);
+            let mut spec = slot.get(&self.hotkey_draft);
+            ui.horizontal(|ui| {
+                if optional {
+                    if ui.checkbox(&mut enabled, "").changed() {
+                        slot.set_enabled(&mut self.hotkey_draft, enabled);
+                    }
+                } else {
+                    ui.add_space(18.0);
+                }
+                ui.add_sized(
+                    [96.0, 22.0],
+                    egui::Label::new(egui::RichText::new(slot.label()).size(13.0)),
+                );
+                ui.add_enabled_ui(enabled, |ui| {
+                    hotkey_mods_ui(ui, &mut spec.modifiers);
+                    hotkey_key_ui(ui, &mut spec.key, slot.id());
+                });
+                if ui
+                    .add_enabled(enabled, egui::Button::new("录入"))
+                    .on_hover_text("按下想用的组合键")
+                    .clicked()
+                {
+                    self.hotkey_capture = Some(slot.capture_target());
+                    self.hotkey_message = Some("请按下组合键".into());
+                }
+            });
+            if enabled {
+                slot.set(&mut self.hotkey_draft, spec);
+            }
+            ui.add_space(2.0);
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(egui::RichText::new("鼠标侧键").strong().color(TEXT_SECONDARY));
+        let defaults = default_config();
+        if self.hotkey_draft.mouse.is_none() {
+            self.hotkey_draft.mouse = defaults.mouse.clone();
+        }
+        if let Some(spec) = self.hotkey_draft.mouse.as_mut() {
+            let mut x1 = spec.xbutton1.clone().unwrap_or_else(|| "none".into());
+            let mut x2 = spec.xbutton2.clone().unwrap_or_else(|| "none".into());
+            let options = [
+                "none",
+                "decrease",
+                "increase",
+                "toggle_topmost",
+                "toggle_click_through",
+                "toggle_pen_passthrough",
+                "cycle_input_mode",
+                "reset_current",
+                "reset_all",
+                "update",
+            ];
+            ui.horizontal(|ui| {
+                ui.label("XButton1");
+                egui::ComboBox::from_id_source("xbutton1_combo")
+                    .selected_text(x1.as_str())
+                    .show_ui(ui, |ui| {
+                        for o in options {
+                            ui.selectable_value(&mut x1, o.into(), o);
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.label("XButton2");
+                egui::ComboBox::from_id_source("xbutton2_combo")
+                    .selected_text(x2.as_str())
+                    .show_ui(ui, |ui| {
+                        for o in options {
+                            ui.selectable_value(&mut x2, o.into(), o);
+                        }
+                    });
+            });
+            spec.xbutton1 = if x1 == "none" { None } else { Some(x1) };
+            spec.xbutton2 = if x2 == "none" { None } else { Some(x2) };
+        }
+
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.button("保存并应用").clicked() {
+                self.save_and_reload_hotkeys();
+            }
+            if ui.button("恢复默认").clicked() {
+                self.hotkey_draft = default_config();
+                self.hotkey_message = Some("已恢复默认（尚未保存）".into());
+            }
+        });
+        ui.add_space(6.0);
+        match Self::validate_config(&self.hotkey_draft) {
+            Ok(()) => {
+                ui.label(
+                    egui::RichText::new("组合键均合法且无冲突")
+                        .small()
+                        .color(egui::Color32::from_rgb(0x2E, 0x7D, 0x32)),
+                );
+            }
+            Err(err) => {
+                ui.label(
+                    egui::RichText::new(format!("配置有问题：{err}"))
+                        .small()
+                        .color(ERROR),
+                );
+            }
+        }
+        if let Some(msg) = self.hotkey_message.as_ref() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(msg).small().weak());
         }
     }
 

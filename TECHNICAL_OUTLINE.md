@@ -47,6 +47,12 @@
 
 **图标**：任务栏/标题栏用 `ViewportBuilder::with_icon()` 读程序目录的 `icon.png`（那块 MC 玻璃）；exe 文件图标靠 `build.rs` 里 `embed_resource::compile("app_icon.rc")` 嵌入 `icon.ico`（由 icon.png 生成的多尺寸 ico），这样资源管理器/快捷方式也是同一块玻璃。
 
+**字体**：优先 `C:\Windows\Fonts\msyh.ttc`（微软雅黑），失败才退回 simhei/simsun（黑体在小字号下又硬又挤，以前放第一优先所以界面像"代码注释"）。另外单独加载 `msyhbd.ttc` 注册成 `FontFamily::Name("bold")`，只给 `Heading` / `Button` 用，正文保持常规字重——这是 egui 里做"真粗体"的唯一办法（`RichText::strong()` 只改颜色不加粗）。
+
+**标题栏**：Windows 10 上标题栏跟随系统 `SystemUsesLightTheme`；实测 `DWMWA_USE_IMMERSIVE_DARK_MODE=0` 在这台机器上不生效（设了也还是黑的），`DWMWA_CAPTION_COLOR` 在 19045 上返回 E_INVALIDARG。想要浅色标题栏只能改成无边框窗口 + 自绘标题栏。
+
+**快捷键编辑**：不再单开二级窗口（`hotkey_editor_open` 已删），直接内嵌在设置页「快捷键」分类里，一行一个功能：勾选 / 名称 / 修饰键 / 按键 / 录入。
+
 **设置页**：`settings_open` 时弹一个占屏幕 92%×90% 的居中窗口（`fixed_size` + `anchor(CENTER_CENTER)`），左侧 `SETTINGS_TABS` 五个分类（快捷键 / 输入 / 窗口与预览 / 悬浮球与纸娃娃 / 维护），右侧按 `settings_tab` 调 `settings_page_*`。分类页拆成 `impl TransGlassApp` 的独立方法，别再把所有控件塞进一个 `egui::Window`。
 
 ### 4.4 悬浮球：分层窗口与 3D 纸娃娃
