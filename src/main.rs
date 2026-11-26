@@ -62,6 +62,8 @@ static HOTKEY_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static INPUT_MODE: AtomicI32 = AtomicI32::new(0);
 /// 最近一次识别到的输入设备：-1 未知、0 鼠标、1 笔（面板上显示，也用来避免反复改样式）
 static LAST_INPUT_IS_PEN: AtomicI32 = AtomicI32::new(-1);
+/// 是否有窗口处于"只开鼠标点透/只开笔点透"的单设备模式；没有就完全跳过低级钩子的重活
+static DEVICE_TRACKING: AtomicBool = AtomicBool::new(false);
 static LAST_DEVICE: AtomicI32 = AtomicI32::new(-1);
 static LAST_DEVICE_HWND: AtomicIsize = AtomicIsize::new(0);
 const TRANSG_GLASS_INJECT_EXTRA_INFO: usize = 0x5452474Cu64 as usize;
@@ -280,6 +282,16 @@ fn request_running_instance_quit() -> bool {
     }
 }
 
+/// 每 300ms 重算"是否需要按设备跟踪点透"，避免在持锁路径上扫描注册表导致自锁。
+fn spawn_device_tracking_ticker() {
+    thread::spawn(|| loop {
+        thread::sleep(std::time::Duration::from_millis(300));
+        if APP_EXIT_REQUESTED.load(Ordering::Relaxed) {
+            break;
+        }
+        refresh_device_tracking();
+    });
+}
 fn spawn_quit_listener() {
     thread::spawn(|| unsafe {
         if let Ok(event) = CreateEventW(None, true, false, QUIT_EVENT_NAME) {
@@ -567,7 +579,27 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                 | WM_MOUSEHWHEEL
                 | WM_MOUSEMOVE
         ) {
-            if GLOBAL_REGISTRY.is_empty() {
+            // 快路径：面板不可见、也没有"单设备点透"窗口时，钩子里什么都不用做
+            if !WINDOW_VISIBLE.load(Ordering::Relaxed) && !DEVICE_TRACKING.load(Ordering::Relaxed) {
+                return CallNextHookEx(
+                    HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
+                    code,
+                    wparam,
+                    lparam,
+                );
+            }
+
+            // 状态行只需要设备类型：只读 ExtraInfo，不查窗口、不调 API
+            if WINDOW_VISIBLE.load(Ordering::Relaxed) {
+                let quick_pen = (info.dwExtraInfo & 0xFFFFFF00) == 0xFF515700;
+                let dev = if quick_pen { 1 } else { 0 };
+                if LAST_INPUT_IS_PEN.swap(dev, Ordering::Relaxed) != dev {
+                    request_ui_repaint();
+                }
+            }
+
+            // 没有单设备点透的窗口 → 后面的 WindowFromPoint / 注册表查询全部跳过
+            if !DEVICE_TRACKING.load(Ordering::Relaxed) || GLOBAL_REGISTRY.is_empty() {
                 return CallNextHookEx(
                     HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
                     code,
@@ -602,18 +634,13 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 
             let root_val = root.0 as isize;
             if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
-                // 只要指针落在受管窗口上就记录一次设备类型，面板状态行才有东西显示
-                let is_pen = match get_input_mode() {
-                    InputMode::Auto => is_pen_input(&info),
-                    InputMode::ForceMouse => false,
-                    InputMode::ForcePen => true,
-                };
-                let dev = if is_pen { 1 } else { 0 };
-                if LAST_INPUT_IS_PEN.swap(dev, Ordering::Relaxed) != dev {
-                    // 设备类型变了才刷新面板，避免状态行停在旧值
-                    request_ui_repaint();
-                }
                 if state.mouse_passthrough != state.pen_passthrough {
+                    let is_pen = match get_input_mode() {
+                        InputMode::Auto => is_pen_input(&info),
+                        InputMode::ForceMouse => false,
+                        InputMode::ForcePen => true,
+                    };
+                    let dev = if is_pen { 1 } else { 0 };
                     let passthrough = if is_pen {
                         state.pen_passthrough
                     } else {
@@ -774,6 +801,15 @@ unsafe fn apply_transparency_to_hwnd(
     Ok(())
 }
 
+/// 只有存在"单设备点透"的窗口时，钩子才需要逐事件判断笔/鼠标；否则一律走快路径。
+/// 只在用户操作（改透明度/开关/还原）时调用，不在每条鼠标消息里扫描。
+fn refresh_device_tracking() {
+    let need = GLOBAL_REGISTRY
+        .iter()
+        .any(|kv| kv.value().mouse_passthrough != kv.value().pen_passthrough);
+    DEVICE_TRACKING.store(need, Ordering::Relaxed);
+}
+
 unsafe fn toggle_topmost(hwnd: HWND) {
     if hwnd.0.is_null() {
         return;
@@ -884,6 +920,7 @@ unsafe fn restore_window(hwnd: HWND) {
         return;
     }
     if let Some((_, state)) = GLOBAL_REGISTRY.remove(&(hwnd.0 as isize)) {
+        // 移除后由 refresh_device_tracking() 统一重算
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
         let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, state.original_ex_style as i32);
         if !state.original_is_topmost {
@@ -898,6 +935,7 @@ unsafe fn restore_window(hwnd: HWND) {
             );
         }
     }
+    refresh_device_tracking();
     request_ui_repaint();
 }
 
@@ -972,6 +1010,10 @@ struct TransGlassApp {
     geo_changed_at: Option<std::time::Instant>,
     selftest_open: bool,
     selftest_text: String,
+    issues_ver: u32,
+    issues_cache: Vec<String>,
+    overview_ver: u32,
+    overview_cache: Vec<(String, String, bool)>,
 }
 
 impl TransGlassApp {
@@ -1044,6 +1086,10 @@ impl TransGlassApp {
             geo_changed_at: None,
             selftest_open: false,
             selftest_text: String::new(),
+            issues_ver: u32::MAX,
+            issues_cache: Vec::new(),
+            overview_ver: u32::MAX,
+            overview_cache: Vec::new(),
         }
     }
 
@@ -1364,7 +1410,12 @@ impl eframe::App for TransGlassApp {
             ui.add_space(10.0);
 
             // 配置/热键问题提示（以前这些错误是静默吞掉的）
-            let issues = snapshot_issues();
+            let issue_ver = ISSUES_VERSION.load(Ordering::Relaxed);
+            if issue_ver != self.issues_ver {
+                self.issues_ver = issue_ver;
+                self.issues_cache = snapshot_issues();
+            }
+            let issues = &self.issues_cache;
             if !issues.is_empty() {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgb(60, 40, 10))
@@ -1629,7 +1680,13 @@ impl eframe::App for TransGlassApp {
 
             ui.add_space(10.0);
             // 键位总览：以前这里只有一句"去设置里改"，用户根本看不到当前绑了什么
-            let overview = snapshot_hotkey_overview();
+            let overview_ver = OVERVIEW_VERSION.load(Ordering::Relaxed);
+            if overview_ver != self.overview_ver {
+                self.overview_ver = overview_ver;
+                self.overview_cache = snapshot_hotkey_overview();
+            }
+            let overview = &self.overview_cache;
+            let mut want_editor = false;
             let header = egui::RichText::new(format!("当前快捷键（{} 项）", overview.len()))
                 .strong()
                 .size(13.0);
@@ -1649,7 +1706,7 @@ impl eframe::App for TransGlassApp {
                         .max_height(room)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for (name, combo, ok) in &overview {
+                            for (name, combo, ok) in overview {
                                 ui.horizontal(|ui| {
                                     let mark = if *ok { "✅" } else { "⚠" };
                                     ui.label(egui::RichText::new(format!("{mark} {name}")).small());
@@ -1664,9 +1721,14 @@ impl eframe::App for TransGlassApp {
                         });
                     ui.add_space(4.0);
                     if ui.button("打开快捷键设置").clicked() {
-                        self.open_hotkey_editor();
+                        want_editor = true;
                     }
                 });
+            refresh_device_tracking();
+            // 借用结束之后再打开编辑器，避免同时可变借用 self
+            if want_editor {
+                self.open_hotkey_editor();
+            }
         });
 
         if self.selftest_open {
@@ -1961,6 +2023,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let _single_instance = unsafe { acquire_single_instance() };
     spawn_quit_listener();
+    spawn_device_tracking_ticker();
 
     thread::spawn(|| {
         while let Ok(event) = MenuEvent::receiver().recv() {
@@ -2256,12 +2319,16 @@ unsafe fn parse_modifiers(s: &str) -> HOT_KEY_MODIFIERS {
 /// `load_or_create_hotkey_config` 解析失败时静默重建默认配置并覆盖原文件，
 /// 用户既不知道热键没绑上，也不知道自己的配置被换了。
 static RUNTIME_ISSUES: RwLock<Vec<String>> = RwLock::new(Vec::new());
+/// 只在内容变化时才让 UI 重新克隆快照，避免每帧加锁+分配
+static ISSUES_VERSION: AtomicU32 = AtomicU32::new(0);
+static OVERVIEW_VERSION: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) fn push_issue(msg: impl Into<String>) {
     let msg = msg.into();
     if let Ok(mut issues) = RUNTIME_ISSUES.write() {
         if !issues.iter().any(|m| m == &msg) {
             issues.push(msg);
+            ISSUES_VERSION.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -2275,7 +2342,10 @@ pub(crate) fn snapshot_issues() -> Vec<String> {
 
 pub(crate) fn clear_issues() {
     if let Ok(mut issues) = RUNTIME_ISSUES.write() {
-        issues.clear();
+        if !issues.is_empty() {
+            issues.clear();
+            ISSUES_VERSION.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -2286,6 +2356,7 @@ static HOTKEY_OVERVIEW: RwLock<Vec<(String, String, bool)>> = RwLock::new(Vec::n
 pub(crate) fn set_hotkey_overview(rows: Vec<(String, String, bool)>) {
     if let Ok(mut slot) = HOTKEY_OVERVIEW.write() {
         *slot = rows;
+        OVERVIEW_VERSION.fetch_add(1, Ordering::Relaxed);
     }
 }
 
