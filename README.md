@@ -98,3 +98,9 @@
 
 - `TECHNICAL_OUTLINE.md`：技术溯源与模块说明
 - `TIMELINE.md`：三个仓库（TransGlass / TransGlass-cursor- / transglass-trae-cn）的时间线与合并记录
+
+## 文档
+
+- [ARCHIVE.md](ARCHIVE.md) —— 项目归档 / 上下文总结：全貌、版本历史、踩过的坑、构建打包发布流程
+- [docs/使用教程.md](docs/使用教程.md) —— 图文使用教程（软件里「帮助」按钮直达）
+- [TECHNICAL_OUTLINE.md](TECHNICAL_OUTLINE.md) —— 实现细节
