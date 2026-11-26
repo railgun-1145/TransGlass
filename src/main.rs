@@ -3496,6 +3496,8 @@ fn window_menu(ui: &mut egui::Ui, hwnd: isize, title: &str) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("透明度").small().weak());
         ui.spacing_mut().slider_width = 128.0;
+        ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_rgb(0xC3, 0xC9, 0xD3);
+        ui.visuals_mut().widgets.hovered.bg_fill = egui::Color32::from_rgb(0xA8, 0xB0, 0xBC);
         let resp = ui.add(
             egui::Slider::new(&mut pct, 30.0..=100.0)
                 .suffix("%")
