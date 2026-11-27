@@ -67,7 +67,6 @@ pub fn init() {
     });
 }
 
-#[derive(Clone)]
 struct Candidate {
     hwnd: isize,
     title: String,
@@ -78,6 +77,14 @@ struct Candidate {
     prev_above: isize,
     minimized: bool,
     topmost: bool,
+    /// 窗口缩略图（最小化/抓取失败时 None，卡片退回图标）
+    preview: Option<Preview>,
+}
+
+struct Preview {
+    w: i32,
+    h: i32,
+    bgra: Vec<u8>,
 }
 
 struct Session {
@@ -236,7 +243,7 @@ unsafe extern "system" fn esc_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
 unsafe fn on_toggle() {
     match MODE.load(Ordering::Relaxed) {
         MODE_IDLE => open_chooser(),
-        MODE_CHOOSING => cancel_chooser(),
+        MODE_CHOOSING => move_selection(1),
         _ => end_session(),
     }
 }
@@ -248,6 +255,22 @@ unsafe fn open_chooser() {
     let _ = EnumWindows(Some(enum_candidate), LPARAM(&mut candidates as *mut _ as isize));
     if candidates.is_empty() {
         return;
+    }
+    // 给非最小化窗口抓一张缩略图；最小化/GPU 黑帧保持 None，卡片退回图标
+    for c in candidates.iter_mut() {
+        if c.minimized {
+            continue;
+        }
+        if let Some(img) = crate::capture_window(HWND(c.hwnd as *mut _)) {
+            let (pw, ph) = (img.size[0] as i32, img.size[1] as i32);
+            if pw > 0 && ph > 0 {
+                let mut bgra = Vec::with_capacity((pw * ph * 4) as usize);
+                for px in &img.pixels {
+                    bgra.extend_from_slice(&[px.b(), px.g(), px.r(), 255]);
+                }
+                c.preview = Some(Preview { w: pw, h: ph, bgra });
+            }
+        }
     }
     let selected = candidates
         .iter()
@@ -280,10 +303,14 @@ unsafe fn cancel_chooser() {
 unsafe fn choose(index: usize) {
     let cand = ST.with(|cell| {
         let st = cell.borrow();
-        st.candidates.get(index).cloned()
+        st.candidates
+            .get(index)
+            .map(|c| (c.hwnd, c.prev_above, c.topmost, c.minimized))
     });
-    let Some(cand) = cand else { return };
-    let win = HWND(cand.hwnd as *mut _);
+    let Some((cand_hwnd, cand_prev_above, cand_topmost, cand_minimized)) = cand else {
+        return;
+    };
+    let win = HWND(cand_hwnd as *mut _);
     if !IsWindow(win).as_bool() {
         MODE.store(MODE_IDLE, Ordering::Relaxed);
         return;
@@ -296,23 +323,25 @@ unsafe fn choose(index: usize) {
     ST.with(|cell| {
         let mut st = cell.borrow_mut();
         st.session = Some(Session {
-            hwnd: cand.hwnd,
-            prev_above: cand.prev_above,
-            topmost: cand.topmost,
-            minimized: cand.minimized,
+            hwnd: cand_hwnd,
+            prev_above: cand_prev_above,
+            topmost: cand_topmost,
+            minimized: cand_minimized,
             was_transparent,
         });
         st.esc_hook = 0;
     });
-    SESSION_HWND.store(cand.hwnd, Ordering::Relaxed);
+    SESSION_HWND.store(cand_hwnd, Ordering::Relaxed);
     MODE.store(MODE_ACTIVE, Ordering::Relaxed);
+    crate::set_target_window(cand_hwnd);
+    crate::ball_mark_dirty();
 
     let h = SELECTOR_HWND.load(Ordering::Relaxed);
     if h != 0 {
         let _ = ShowWindow(HWND(h as *mut _), SW_HIDE);
     }
 
-    if cand.minimized {
+    if cand_minimized {
         let _ = ShowWindow(win, SW_RESTORE);
     }
     if was_transparent {
@@ -340,6 +369,7 @@ unsafe fn end_session() {
     });
     MODE.store(MODE_IDLE, Ordering::Relaxed);
     SESSION_HWND.store(0, Ordering::Relaxed);
+    crate::ball_mark_dirty();
 
     if hook != 0 {
         let _ = UnhookWindowsHookEx(HHOOK(hook as *mut _));
@@ -572,6 +602,7 @@ unsafe extern "system" fn enum_candidate(hwnd: HWND, lp: LPARAM) -> BOOL {
         prev_above,
         minimized: IsIconic(hwnd).as_bool(),
         topmost,
+        preview: None,
     });
     BOOL(1)
 }
@@ -661,7 +692,7 @@ unsafe fn draw_and_show() {
     };
     draw_text(
         mem,
-        "← → 选择 · Enter 控制 · Esc 取消",
+        "← → / 再按热键 切换 · Enter 控制 · Esc 取消",
         &mut rc,
         (138, 138, 138),
         font_hint,
@@ -698,7 +729,7 @@ unsafe fn draw_and_show() {
     let mut card_rects = Vec::with_capacity(visible);
     for i in 0..visible {
         let idx = start + i;
-        let (app, title, icon, minimized) = ST.with(|cell| {
+        let (app, title, icon, minimized, has_preview) = ST.with(|cell| {
             let st = cell.borrow();
             let c = &st.candidates[idx];
             let app = if c.app.trim().is_empty() {
@@ -706,7 +737,7 @@ unsafe fn draw_and_show() {
             } else {
                 c.app.clone()
             };
-            (app, c.title.clone(), c.icon, c.minimized)
+            (app, c.title.clone(), c.icon, c.minimized, c.preview.is_some())
         });
         let x0 = card_x0 + i as i32 * (CARD_W + CARD_GAP);
         let y0 = card_y0;
@@ -722,47 +753,59 @@ unsafe fn draw_and_show() {
             frame_rect(buf, bw, x0, y0, x1, y1, (232, 235, 239), 1);
         }
 
-        // 图标：类图标没有就画个字母块
-        let iw = 44;
-        let ih = 44;
-        let ix = x0 + (CARD_W - iw) / 2;
-        let iy = y0 + 18;
-        if icon != 0 {
-            let _ = DrawIconEx(
-                mem,
-                ix,
-                iy,
-                HICON(icon as *mut _),
-                iw,
-                ih,
-                0,
-                None,
-                DI_NORMAL,
-            );
+        if has_preview {
+            // 预览图区域：128×80，等比缩放 + 细边框（Alt+Tab 感）
+            ST.with(|cell| {
+                let st = cell.borrow();
+                if let Some(p) = st.candidates[idx].preview.as_ref() {
+                    frame_rect(buf, bw, x0 + 9, y0 + 11, x0 + 139, y0 + 93, (205, 210, 216), 1);
+                    draw_preview(buf, bw, x0 + 10, y0 + 12, 128, 80, p);
+                }
+            });
         } else {
-            fill_rect(buf, bw, ix, iy, ix + iw, iy + ih, (226, 231, 236), 255);
-            let mut rc = RECT {
-                left: ix,
-                top: iy + 8,
-                right: ix + iw,
-                bottom: iy + ih,
-            };
-            let initial: String = app.chars().next().map(|c| c.to_string()).unwrap_or_default();
-            draw_text(
-                mem,
-                &initial,
-                &mut rc,
-                (70, 90, 100),
-                font_icon,
-                DT_CENTER | DT_TOP,
-            );
+            // 没有缩略图：大图标 / 首字母块
+            let iw = 44;
+            let ih = 44;
+            let ix = x0 + (CARD_W - iw) / 2;
+            let iy = y0 + 18;
+            if icon != 0 {
+                let _ = DrawIconEx(
+                    mem,
+                    ix,
+                    iy,
+                    HICON(icon as *mut _),
+                    iw,
+                    ih,
+                    0,
+                    None,
+                    DI_NORMAL,
+                );
+            } else {
+                fill_rect(buf, bw, ix, iy, ix + iw, iy + ih, (226, 231, 236), 255);
+                let mut rc = RECT {
+                    left: ix,
+                    top: iy + 8,
+                    right: ix + iw,
+                    bottom: iy + ih,
+                };
+                let initial: String = app.chars().next().map(|c| c.to_string()).unwrap_or_default();
+                draw_text(
+                    mem,
+                    &initial,
+                    &mut rc,
+                    (70, 90, 100),
+                    font_icon,
+                    DT_CENTER | DT_TOP,
+                );
+            }
         }
 
+        let (app_top, title_top) = if has_preview { (100, 126) } else { (76, 102) };
         let mut rc = RECT {
             left: x0 + 10,
-            top: y0 + 76,
+            top: y0 + app_top,
             right: x1 - 10,
-            bottom: y0 + 100,
+            bottom: y0 + app_top + 24,
         };
         draw_text(
             mem,
@@ -774,9 +817,9 @@ unsafe fn draw_and_show() {
         );
         let mut rc = RECT {
             left: x0 + 10,
-            top: y0 + 102,
+            top: y0 + title_top,
             right: x1 - 10,
-            bottom: y0 + 128,
+            bottom: y0 + title_top + 26,
         };
         draw_text(
             mem,
@@ -812,7 +855,7 @@ unsafe fn draw_and_show() {
         bottom: py0 + ph - 12,
     };
     let hint = format!(
-        "共 {} 个窗口 · 选中后临时关闭点透，Esc 或再次按热键结束并恢复排列",
+        "共 {} 个窗口 · ←/→ 或再按热键切换 · 选中后临时关闭点透，Esc 取消/结束",
         n
     );
     draw_text(mem, &hint, &mut rc, (138, 138, 138), font_hint, DT_LEFT);
@@ -985,4 +1028,47 @@ fn frame_rect(
     fill_rect(buf, w, x0, y1 - t, x1, y1, rgb, 255);
     fill_rect(buf, w, x0, y0, x0 + t, y1, rgb, 255);
     fill_rect(buf, w, x1 - t, y0, x1, y1, rgb, 255);
+}
+
+/// 把窗口缩略图等比缩放进卡片预览区（最近邻；窗口图本身已经够小，不做插值免得糊）。
+fn draw_preview(
+    buf: &mut [u8],
+    bw: i32,
+    dx: i32,
+    dy: i32,
+    dw: i32,
+    dh: i32,
+    p: &Preview,
+) {
+    if p.w <= 0 || p.h <= 0 || p.bgra.len() < 4 {
+        return;
+    }
+    let scale = (dw as f32 / p.w as f32).min(dh as f32 / p.h as f32);
+    let tw = ((p.w as f32 * scale).round() as i32).clamp(1, dw);
+    let th = ((p.h as f32 * scale).round() as i32).clamp(1, dh);
+    let ox = dx + (dw - tw) / 2;
+    let oy = dy + (dh - th) / 2;
+    for yy in 0..th {
+        let sy = ((yy as i64 * p.h as i64) / th as i64) as i32;
+        for xx in 0..tw {
+            let sx = ((xx as i64 * p.w as i64) / tw as i64) as i32;
+            let si = ((sy * p.w + sx) * 4) as usize;
+            if si + 3 >= p.bgra.len() {
+                continue;
+            }
+            let px = ox + xx;
+            let py = oy + yy;
+            if px < 0 || py < 0 || px >= bw {
+                continue;
+            }
+            let di = ((py * bw + px) * 4) as usize;
+            if di + 3 >= buf.len() {
+                continue;
+            }
+            buf[di] = p.bgra[si];
+            buf[di + 1] = p.bgra[si + 1];
+            buf[di + 2] = p.bgra[si + 2];
+            buf[di + 3] = 255;
+        }
+    }
 }

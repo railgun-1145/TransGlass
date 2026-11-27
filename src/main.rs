@@ -317,6 +317,7 @@ fn cycle_input_mode() {
         InputMode::ForcePen => InputMode::Auto,
     };
     INPUT_MODE.store(next as i32, Ordering::Relaxed);
+    ball_mark_dirty();
     request_ui_repaint();
 }
 
@@ -905,6 +906,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
             if let Some(root) = hit_root_at(info.pt.x, info.pt.y) {
                 if !is_own_hwnd(root) && !is_shell_hwnd(root) {
                     TARGET_HWND.store(root.0 as isize, Ordering::Relaxed);
+                    ball_mark_dirty();
                     log_hilite(&format!("target={:?}", root.0));
                 }
             }
@@ -4910,7 +4912,7 @@ fn window_menu(ui: &mut egui::Ui, hwnd: isize, title: &str) {
 }
 
 /// 用 PrintWindow 抓一帧窗口缩略图（失败返回 None，卡片会显示"无预览"）
-unsafe fn capture_window(hwnd: HWND) -> Option<egui::ColorImage> {
+pub(crate) unsafe fn capture_window(hwnd: HWND) -> Option<egui::ColorImage> {
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
         ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
@@ -5098,6 +5100,21 @@ static BALL_DOLL_RECT: AtomicU64 = AtomicU64::new(0);
 static BALL_REQ_PANEL: AtomicBool = AtomicBool::new(false);
 static BALL_REQ_MINI: AtomicBool = AtomicBool::new(false);
 static BALL_REQ_RESTORE: AtomicBool = AtomicBool::new(false);
+/// 面板上的状态变了（输入模式 / Alt 会话状态 / 目标窗口）时，叫 ticker 重画一次，
+/// 即使待机动画全关也不会一直显示旧状态。
+static BALL_DIRTY: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn ball_mark_dirty() {
+    BALL_DIRTY.store(true, Ordering::Relaxed);
+}
+
+/// 点透会话选中窗口后，把遥控目标也切过去，面板才能显示「操作中」。
+pub(crate) fn set_target_window(hwnd: isize) {
+    if hwnd != 0 {
+        TARGET_HWND.store(hwnd, Ordering::Relaxed);
+        ball_mark_dirty();
+    }
+}
 
 const BALL_W: i32 = 250;
 const BALL_H: i32 = 250;
@@ -5533,7 +5550,8 @@ fn spawn_doll_ticker() {
             // 待机动画关掉后，静置就完全不重绘
             let idle_anim = BALL_FLOAT.load(Ordering::Relaxed) || BALL_SWAY.load(Ordering::Relaxed);
             let due = idle_anim && (t - last_render) >= 0.12;
-            if moving || active || hover_changed || due {
+            let dirty = BALL_DIRTY.swap(false, Ordering::Relaxed);
+            if moving || active || hover_changed || due || dirty {
                 last_render = t;
                 unsafe { ball_render() };
             }
@@ -5734,8 +5752,9 @@ unsafe fn ball_render() {
         };
         draw_mc_label(mem, "TransGlass", p.title, fade((80, 80, 80)));
         // 目标窗口那一行：没目标就显示「未选中窗口」
+        let target_hwnd = ball_target();
         let target_text = {
-            let h = ball_target();
+            let h = target_hwnd;
             if h.0.is_null() {
                 "未选中窗口".to_string()
             } else {
@@ -5756,7 +5775,34 @@ unsafe fn ball_render() {
             _ => "最近输入：—",
         };
         draw_mc_label(mem, last_input, p.input_row, fade((255, 255, 255)));
-        let labels = ["置顶", "穿透", "模式", "还原"];
+        // 右下：当前目标是不是 Alt 会话里正在操作的窗口（选中 = 红字）
+        let operating = !target_hwnd.0.is_null()
+            && crate::selector::is_session_window(target_hwnd.0 as isize);
+        let status_color = if operating {
+            (220, 70, 70)
+        } else {
+            (255, 255, 255)
+        };
+        let status_rect = (
+            p.input_row.2 + 4,
+            p.input_row.1,
+            p.panel.2 - 10,
+            p.input_row.3,
+        );
+        draw_mc_label(
+            mem,
+            if operating { "操作中" } else { "未操作" },
+            status_rect,
+            fade(status_color),
+        );
+        // 模式按钮直接把当前输入模式写在按钮上（自动 / 鼠标 / 笔）
+        let mode_short = match get_input_mode() {
+            InputMode::Auto => "自动",
+            InputMode::ForceMouse => "鼠标",
+            InputMode::ForcePen => "笔",
+        };
+        let mode_label = format!("模式：{mode_short}");
+        let labels = ["置顶", "穿透", mode_label.as_str(), "还原"];
         for (i, r) in p.buttons.iter().enumerate() {
             draw_mc_label(mem, labels[i], *r, fade((255, 255, 255)));
         }
