@@ -115,6 +115,12 @@
 - **坑**：hook 的 fast-path 必须加 `regions::has_any()`，否则无单设备点透/注册表为空时提前返回，选区完全不生效；`UpdateLayeredWindow` 前不能把 DIB 从 mem DC 取消选中（否则 0x8007001F、窗口全透明）；窗口别用 0×0 创建；`SetWindowRgn` 会裁画面，不能用；任意窗口做不了逐像素 alpha，视觉洞只能靠下层快照覆盖层。
 - **限制**：快照静态（下方变了要刷新）；覆盖层只跟前台目标；选区只存内存；没有顶点编辑/持久化。
 
+### 4.7 选择可视化 / 悬浮球控制（`selection.rs`）
+- **选择框**：全屏置顶、`WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE` 的分层窗口；150ms 定时器读 `TARGET_HWND`，在目标窗口外圈画 2px 绿框 + 「已选中 · 软件名」标签；目标关闭/最小化/矩形为空就隐藏。只在目标/矩形/软件名变化时重画（全屏 DIB）。
+- **右键悬浮球**：`WindowFromPoint` 在球中心拿到的是球自己；沿 `GW_HWNDNEXT` 往下跳过 own/shell、检查矩形包含该点、`GetAncestor(GA_ROOT)` 取顶层；找到就 `select_window_for_control`（切 `TARGET_HWND` + 弹面板），找不到只弹当前目标面板。右键不再关闭球（关球用面板 ×）。
+- **卡片 / Alt**：卡片右键菜单「选中并显示控制」→ `select_window_for_control`；Alt 会话 `choose` 也走同一个函数，选中后自动弹球 + 选择框。
+- **坑**：选择框不能让目标失焦；全屏覆盖是置顶的（目标在后面也会显示框，这是有意指示）；悬浮球右键不要传给下面窗口；`ball_set_expanded` 在主线程跑 200ms 动画，别从会重入的地方反复调。
+
 ## 5. 构建与打包流程
 1. **环境准备**: 安装 Rust 工具链 (MSVC) 及 Inno Setup。
 2. **编译源码**: 

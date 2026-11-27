@@ -333,7 +333,7 @@ unsafe fn choose(index: usize) {
     });
     SESSION_HWND.store(cand_hwnd, Ordering::Relaxed);
     MODE.store(MODE_ACTIVE, Ordering::Relaxed);
-    crate::set_target_window(cand_hwnd);
+    crate::select_window_for_control(cand_hwnd);
     crate::ball_mark_dirty();
 
     let h = SELECTOR_HWND.load(Ordering::Relaxed);

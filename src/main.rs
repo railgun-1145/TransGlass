@@ -25,6 +25,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 mod regions;
+mod selection;
 mod selector;
 mod selftest;
 mod doll;
@@ -3534,6 +3535,7 @@ fn main() -> Result<(), eframe::Error> {
     // 点透会话选择器：独立线程 + 分层窗口，热键只往它投消息
     selector::init();
     regions::init();
+    selection::init();
 
     thread::spawn(|| unsafe {
         HOTKEY_THREAD_ID.store(GetCurrentThreadId(), Ordering::Relaxed);
@@ -4885,6 +4887,10 @@ fn window_menu(ui: &mut egui::Ui, hwnd: isize, title: &str) {
         .text_styles
         .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
     ui.label(egui::RichText::new(title).strong().size(14.0));
+    if ui.button("选中并显示控制").clicked() {
+        crate::select_window_for_control(hwnd);
+        ui.close_menu();
+    }
     ui.separator();
     let st = GLOBAL_REGISTRY
         .get(&hwnd)
@@ -5136,6 +5142,7 @@ static BALL_LAST_ACTIVE: AtomicU32 = AtomicU32::new(0);
 /// 纸娃娃当前占用的窗口内矩形（用于点击命中，0 = 无）
 static BALL_DOLL_RECT: AtomicU64 = AtomicU64::new(0);
 static BALL_REQ_PANEL: AtomicBool = AtomicBool::new(false);
+const WM_BALL_POPUP: u32 = WM_APP + 0x5A;
 static BALL_REQ_MINI: AtomicBool = AtomicBool::new(false);
 static BALL_REQ_RESTORE: AtomicBool = AtomicBool::new(false);
 /// 面板上的状态变了（输入模式 / Alt 会话状态 / 目标窗口）时，叫 ticker 重画一次，
@@ -5151,6 +5158,33 @@ pub(crate) fn set_target_window(hwnd: isize) {
     if hwnd != 0 {
         TARGET_HWND.store(hwnd, Ordering::Relaxed);
         ball_mark_dirty();
+    }
+}
+
+pub(crate) fn current_target() -> isize {
+    TARGET_HWND.load(Ordering::Relaxed)
+}
+
+/// 右键卡片/Alt 会话选中后：把遥感目标切过去并主动弹出悬浮球控制面板。
+pub(crate) fn select_window_for_control(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    set_target_window(hwnd);
+    ball_popup_panel();
+}
+
+/// 主动弹出悬浮球面板（必要时先显示悬浮球）。
+pub(crate) fn ball_popup_panel() {
+    let mut h = BALL_HWND.load(Ordering::Relaxed);
+    if h == 0 || !unsafe { IsWindowVisible(HWND(h as *mut _)).as_bool() } {
+        unsafe { set_ball_visible(true) };
+        h = BALL_HWND.load(Ordering::Relaxed);
+    }
+    if h != 0 {
+        unsafe {
+            let _ = PostMessageW(HWND(h as *mut _), WM_BALL_POPUP, WPARAM(0), LPARAM(0));
+        }
     }
 }
 
@@ -6073,18 +6107,7 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                             return LRESULT(0);
                         }
                     }
-                    let target = !ball_expand_target();
-                    BALL_EXPANDED.store(target, Ordering::Relaxed);
-                    // 12 步 × 16ms ≈ 200ms，三次方 ease-out：起手快、收尾慢
-                    let steps = 12;
-                    for i in 0..=steps {
-                        let v = i as f32 / steps as f32;
-                        let e = 1.0 - (1.0 - v).powi(3);
-                        let t = if target { e } else { 1.0 - e };
-                        BALL_ANIM.store(t.to_bits(), Ordering::Relaxed);
-                        ball_render();
-                        std::thread::sleep(std::time::Duration::from_millis(16));
-                    }
+                    ball_set_expanded(!ball_expand_target());
                 }
                 1..=4 => {
                     let target = ball_target();
@@ -6104,9 +6127,66 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
             }
             LRESULT(0)
         }
-        // 右键不再关闭悬浮球（关球改用面板标题栏的 ×）
-        WM_RBUTTONUP => DefWindowProcW(hwnd, msg, w, l),
+        WM_BALL_POPUP => {
+            ball_set_expanded(true);
+            LRESULT(0)
+        }
+        // 右键悬浮球：选中球下面那个窗口，显示选择框并主动弹出控制面板
+        WM_RBUTTONUP => {
+            let pt = POINT {
+                x: BALL_POS_X.load(Ordering::Relaxed) + BALL_W - 42,
+                y: BALL_POS_Y.load(Ordering::Relaxed) + BALL_H / 2,
+            };
+            let mut hit = WindowFromPoint(pt);
+            let mut n = 0;
+            let mut picked = false;
+            while !hit.0.is_null() && n < 64 {
+                if !is_own_hwnd(hit) && !is_shell_hwnd(hit) && IsWindowVisible(hit).as_bool() {
+                    let mut rc = RECT::default();
+                    if GetWindowRect(hit, &mut rc).is_ok()
+                        && pt.x >= rc.left
+                        && pt.x < rc.right
+                        && pt.y >= rc.top
+                        && pt.y < rc.bottom
+                    {
+                        let root = GetAncestor(hit, GA_ROOT);
+                        let root = if root.0.is_null() { hit } else { root };
+                        if !is_own_hwnd(root) && !is_shell_hwnd(root) {
+                            crate::select_window_for_control(root.0 as isize);
+                            picked = true;
+                            break;
+                        }
+                    }
+                }
+                let Some(next) = GetWindow(hit, GW_HWNDNEXT).ok() else {
+                    break;
+                };
+                hit = next;
+                n += 1;
+            }
+            if !picked {
+                ball_set_expanded(true);
+            }
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, w, l),
+    }
+}
+
+unsafe fn ball_set_expanded(target: bool) {
+    if ball_expand_target() == target {
+        return;
+    }
+    BALL_EXPANDED.store(target, Ordering::Relaxed);
+    // 12 步 × 16ms ≈ 200ms，三次方 ease-out：起手快、收尾慢
+    let steps = 12;
+    for i in 0..=steps {
+        let v = i as f32 / steps as f32;
+        let e = 1.0 - (1.0 - v).powi(3);
+        let t = if target { e } else { 1.0 - e };
+        BALL_ANIM.store(t.to_bits(), Ordering::Relaxed);
+        ball_render();
+        std::thread::sleep(std::time::Duration::from_millis(16));
     }
 }
 
