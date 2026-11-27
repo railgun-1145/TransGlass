@@ -107,12 +107,13 @@
 - **坑**：`WM_ACTIVATE(WA_INACTIVE)` 在 `AttachThreadInput` 抢前台时会瞬时报一次，不能当取消；非 topmost 窗口的 z 序锚点要跳过 topmost 分组，否则结束会被顶成 topmost；缩略图抓取是同步的，别每帧抓；待机动画全关时状态变化必须靠 `BALL_DIRTY` 重画。
 
 ### 4.6 自由形状点透选区（`regions.rs`）
-- **数据**：`Mutex<Vec<(hwnd, Vec<Vec<(f32,f32)>>)>>`，多边形按**客户区归一化 0..1**保存；窗口移动/缩放后用当前客户区屏幕矩形还原。
-- **编辑器**：独立线程 + 客户区大小的分层窗口（`WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_TOPMOST`）；目标先 `SW_RESTORE`（如果最小化）并 `SetWindowPos(HWND_TOP)` 提顶、记录上方同层级窗口；GDI 画压暗层 + 指令条 + 已有区域（绿半透明填充/绿边）+ 当前套索（橙线）。鼠标按下/移动/抬起收集点，`Enter` 保存、`Backspace` 撤销、`Esc` 取消；结束隐藏覆盖层、恢复 z 序和最小化。
-- **生效**：`mouse_hook_proc` 每条鼠标消息在 `hit_root_at` **之前**调 `regions::enforce_at`；对每个有选区的窗口，鼠标在客户区内且命中任一多边形时给窗口加 `WS_EX_TRANSPARENT`（点击落到下层），出洞或离开窗口立刻恢复。点透会话窗口 / 整窗点透窗口跳过（样式由别的逻辑负责）。
-- **入口**：主界面窗口卡片右键菜单 →「编辑自由形状选区…」/「清空选区」，显示当前数量；`regions::open_editor(hwnd)` 通过 `PostMessage(WM_APP+0x51)` 叫编辑线程。
-- **坑**：hook 的 fast-path 必须加 `regions::has_any()`，否则无单设备点透/注册表为空时提前返回，选区完全不生效；`UpdateLayeredWindow` 前不能把 DIB 从 mem DC 取消选中（否则 0x8007001F、窗口全透明）；窗口别用 0×0 创建；`SetWindowRgn` 会裁画面，不能用。
-- **限制**：选区只存内存（重启后要重画）；没有顶点编辑/持久化；编辑一次只能画一个多边形，可连续画多个。
+- **数据**：`Mutex<Vec<(hwnd, Vec<Region>)>>`，`Region { pts, invert, opacity }`；多边形按**客户区归一化 0..1**保存。每圈 `invert=false` 表示圈内是洞，`true` 表示圈内保留、客户区补集是洞；点击穿透 = 所有圈 mask 的并集（与透明度无关）。
+- **编辑器**：独立线程 + 客户区大小的分层窗口（`WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_TOPMOST`）；目标先 `SW_RESTORE`（如果最小化）并 `SetWindowPos(HWND_TOP)` 提顶、记录上方同层级窗口；GDI 画压暗层 + 两行指令条 + 已有区域（正常绿/反向蓝，选中金框）+ 当前套索（橙线）。鼠标收集点；`Enter` 保存、`Backspace/Delete` 删、`Esc` 取消；`Tab` 选圈、`I` 反向、`[` `]` 调该圈透明度。结束隐藏覆盖层、恢复 z 序和最小化。
+- **点击穿透**：`mouse_hook_proc` 每条鼠标消息在 `hit_root_at` **之前**调 `regions::enforce_at`；对每个有选区的窗口，鼠标在客户区内且命中任一 `region_contains` 时给窗口加 `WS_EX_TRANSPARENT`，出洞/离开恢复。点透会话窗口 / 整窗点透窗口跳过。
+- **真·透明洞**：`regions_visual` 线程维护一个置顶、`WS_EX_TRANSPARENT|WS_EX_NOACTIVATE` 的分层覆盖层；刷新时 `SW_HIDE` 目标 → 屏幕 BitBlt 出客户区下方快照 → `SW_SHOW`；按每像素「包含该点的圈的最大透明度」写快照 alpha。只在该窗口是前台时显示；目标移动/缩放后快照位置不对就隐藏，等刷新。菜单「刷新透明洞画面」重新抓取。
+- **入口**：主界面窗口卡片右键菜单 →「编辑自由形状选区…」/「刷新透明洞画面」/「清空选区」，显示当前数量；`regions::open_editor(hwnd)` / `refresh_visual(hwnd)` 通过 `PostMessage` 叫对应线程。
+- **坑**：hook 的 fast-path 必须加 `regions::has_any()`，否则无单设备点透/注册表为空时提前返回，选区完全不生效；`UpdateLayeredWindow` 前不能把 DIB 从 mem DC 取消选中（否则 0x8007001F、窗口全透明）；窗口别用 0×0 创建；`SetWindowRgn` 会裁画面，不能用；任意窗口做不了逐像素 alpha，视觉洞只能靠下层快照覆盖层。
+- **限制**：快照静态（下方变了要刷新）；覆盖层只跟前台目标；选区只存内存；没有顶点编辑/持久化。
 
 ## 5. 构建与打包流程
 1. **环境准备**: 安装 Rust 工具链 (MSVC) 及 Inno Setup。

@@ -4939,6 +4939,10 @@ fn window_menu(ui: &mut egui::Ui, hwnd: isize, title: &str) {
         crate::regions::open_editor(hwnd);
         ui.close_menu();
     }
+    if n_regions > 0 && ui.button("刷新透明洞画面").clicked() {
+        crate::regions::refresh_visual(hwnd);
+        ui.close_menu();
+    }
     if n_regions > 0 && ui.button("清空选区").clicked() {
         crate::regions::clear(hwnd);
         ui.close_menu();
