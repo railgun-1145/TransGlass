@@ -26,6 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const WM_EDITOR_OPEN: u32 = WM_APP + 0x51;
 const WM_VISUAL_REFRESH: u32 = WM_APP + 0x52;
 const WM_VISUAL_HIDE: u32 = WM_APP + 0x53;
+const WM_VISUAL_MASK: u32 = WM_APP + 0x54;
 
 #[derive(Clone, Debug)]
 pub struct Region {
@@ -137,6 +138,65 @@ pub fn set_regions(hwnd: isize, regions: Vec<Region>) {
         hide_visual();
     } else {
         refresh_visual(hwnd);
+    }
+}
+
+pub fn snapshot_all() -> Vec<(isize, Vec<Region>)> {
+    REGIONS.lock().map(|v| v.clone()).unwrap_or_default()
+}
+
+pub fn update_region(hwnd: isize, idx: usize, invert: Option<bool>, opacity: Option<u8>) {
+    let mut any_visual = false;
+    if let Ok(mut v) = REGIONS.lock() {
+        if let Some((_, regions)) = v.iter_mut().find(|(h, _)| *h == hwnd) {
+            if let Some(r) = regions.get_mut(idx) {
+                if let Some(i) = invert {
+                    r.invert = i;
+                }
+                if let Some(o) = opacity {
+                    r.opacity = o.min(100);
+                }
+            }
+            any_visual = regions.iter().any(|r| r.opacity > 0);
+        }
+    }
+    clear_hole_style(hwnd);
+    if any_visual {
+        refresh_visual_mask();
+    } else {
+        hide_visual();
+    }
+}
+
+pub fn remove_region(hwnd: isize, idx: usize) {
+    let mut empty = false;
+    let mut any_visual = false;
+    if let Ok(mut v) = REGIONS.lock() {
+        if let Some((_, regions)) = v.iter_mut().find(|(h, _)| *h == hwnd) {
+            if idx < regions.len() {
+                regions.remove(idx);
+            }
+            empty = regions.is_empty();
+            any_visual = regions.iter().any(|r| r.opacity > 0);
+        }
+        if empty {
+            v.retain(|(h, _)| *h != hwnd);
+        }
+    }
+    clear_hole_style(hwnd);
+    if empty || !any_visual {
+        hide_visual();
+    } else {
+        refresh_visual_mask();
+    }
+}
+
+fn refresh_visual_mask() {
+    let h = VISUAL_HWND.load(Ordering::Relaxed);
+    if h != 0 {
+        unsafe {
+            let _ = PostMessageW(HWND(h as *mut _), WM_VISUAL_MASK, WPARAM(0), LPARAM(0));
+        }
     }
 }
 
@@ -934,6 +994,23 @@ unsafe extern "system" fn visual_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             let target = VISUAL_REQ.lock().ok().and_then(|mut p| p.take()).unwrap_or(0);
             if target != 0 {
                 capture_visual(hwnd, target);
+            }
+            LRESULT(0)
+        }
+        WM_VISUAL_MASK => {
+            let (target, w, h, has_snapshot) = VS.with(|v| {
+                let st = v.borrow();
+                (st.target, st.w, st.h, st.snapshot.is_some())
+            });
+            if target != 0 && w > 0 && h > 0 && has_snapshot {
+                if let Ok(map) = REGIONS.lock() {
+                    if let Some((_, regions)) = map.iter().find(|(x, _)| *x == target) {
+                        let regions = regions.clone();
+                        VS.with(|v| v.borrow_mut().regions = regions);
+                    }
+                }
+                draw_visual(hwnd);
+                follow_visual(hwnd);
             }
             LRESULT(0)
         }
