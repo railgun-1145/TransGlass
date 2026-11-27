@@ -407,6 +407,7 @@ fn spawn_device_tracking_ticker() {
             let fg = GetForegroundWindow();
             if !fg.0.is_null() && !is_own_hwnd(fg) && !is_shell_hwnd(fg) {
                 TARGET_HWND.store(fg.0 as isize, Ordering::Relaxed);
+                ball_bubble();
             }
         }
         perf_dump();
@@ -916,6 +917,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
             if let Some(root) = hit_root_at(info.pt.x, info.pt.y) {
                 if !is_own_hwnd(root) && !is_shell_hwnd(root) {
                     TARGET_HWND.store(root.0 as isize, Ordering::Relaxed);
+                    ball_bubble();
                     ball_mark_dirty();
                     log_hilite(&format!("target={:?}", root.0));
                 }
@@ -1933,9 +1935,8 @@ impl TransGlassApp {
                                 ui.horizontal(|ui| {
                                     if ui.button("选中并显示").clicked() {
                                         crate::select_window_for_control(*hwnd);
-                                        crate::selection::set_enabled(true);
-                                    }
-                                    if ui.button("编辑选区…").clicked() {
+                                                                    }
+                                    if ui.button("编辑当前选区").clicked() {
                                         crate::regions::open_editor(*hwnd);
                                     }
                                     if ui.button("清空选区").clicked() {
@@ -3593,7 +3594,6 @@ fn main() -> Result<(), eframe::Error> {
     // 点透会话选择器：独立线程 + 分层窗口，热键只往它投消息
     selector::init();
     regions::init();
-    selection::init();
 
     thread::spawn(|| unsafe {
         HOTKEY_THREAD_ID.store(GetCurrentThreadId(), Ordering::Relaxed);
@@ -5056,10 +5056,11 @@ fn ps_selection_panel(ui: &mut egui::Ui, selected: &mut usize) {
     }
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        if ui.button("编辑选区…").clicked() {
+        if ui.button("编辑当前选区").clicked() {
             crate::regions::open_editor_at(target, Some(*selected));
         }
-        if ui.button("新建").clicked() {
+        if ui.button("新建选择").clicked() {
+            crate::regions::clear(target);
             crate::regions::open_editor_at(target, None);
         }
     });
@@ -5071,10 +5072,6 @@ fn ps_selection_panel(ui: &mut egui::Ui, selected: &mut usize) {
             crate::regions::refresh_visual(target);
         }
     });
-    let mut on = crate::selection::enabled();
-    if ui.checkbox(&mut on, "显示选中框").changed() {
-        crate::selection::set_enabled(on);
-    }
     ui.separator();
     if let Some(st) = GLOBAL_REGISTRY.get(&target) {
         let pct = (st.current_alpha as f32 / 255.0 * 100.0).round();
@@ -5131,13 +5128,8 @@ fn selection_controls_ui(ui: &mut egui::Ui, hwnd: isize) {
             }
         }
     });
-    let mut on = crate::selection::enabled();
-    if ui.checkbox(&mut on, "显示选中框").changed() {
-        crate::selection::set_enabled(on);
-    }
     if ui.button("选中并显示").clicked() {
         crate::select_window_for_control(hwnd);
-        crate::selection::set_enabled(true);
         ui.close_menu();
     }
     let all = crate::regions::snapshot_all();
@@ -5179,8 +5171,13 @@ fn selection_controls_ui(ui: &mut egui::Ui, hwnd: isize) {
         }
     }
     ui.horizontal(|ui| {
-        if ui.button("编辑选区…").clicked() {
+        if ui.button("编辑当前选区").clicked() {
             crate::regions::open_editor(hwnd);
+            ui.close_menu();
+        }
+        if ui.button("新建选择").clicked() {
+            crate::regions::clear(hwnd);
+            crate::regions::open_editor_at(hwnd, None);
             ui.close_menu();
         }
         if ui.button("清空选区").clicked() {
@@ -5421,6 +5418,7 @@ unsafe fn toggle_main_window() {
 // ---- 悬浮球试验窗口：Win32 分层窗口 + UpdateLayeredWindow（逐像素透明） ----
 // ---- 悬浮球：Win32 分层窗口（ARGB 逐像素透明）+ 自带点击处理 ----
 static BALL_HWND: AtomicIsize = AtomicIsize::new(0);
+static BUBBLE_HWND: AtomicIsize = AtomicIsize::new(0);
 /// 最后一次点击命中的（非自身的）窗口，悬浮球遥控的目标
 static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static BALL_EXPANDED: AtomicBool = AtomicBool::new(false);
@@ -5440,6 +5438,9 @@ static BALL_LAST_ACTIVE: AtomicU32 = AtomicU32::new(0);
 static BALL_DOLL_RECT: AtomicU64 = AtomicU64::new(0);
 static BALL_REQ_PANEL: AtomicBool = AtomicBool::new(false);
 const WM_BALL_POPUP: u32 = WM_APP + 0x5A;
+const WM_BALL_BUBBLE: u32 = WM_APP + 0x5B;
+const BUBBLE_W: i32 = 260;
+const BUBBLE_H: i32 = 112;
 static BALL_REQ_MINI: AtomicBool = AtomicBool::new(false);
 static BALL_REQ_RESTORE: AtomicBool = AtomicBool::new(false);
 /// 面板上的状态变了（输入模式 / Alt 会话状态 / 目标窗口）时，叫 ticker 重画一次，
@@ -5454,6 +5455,7 @@ pub(crate) fn ball_mark_dirty() {
 pub(crate) fn set_target_window(hwnd: isize) {
     if hwnd != 0 {
         TARGET_HWND.store(hwnd, Ordering::Relaxed);
+        ball_bubble();
         ball_mark_dirty();
     }
 }
@@ -5471,6 +5473,7 @@ pub(crate) fn selection_cleanup() {
     let t = TARGET_HWND.load(Ordering::Relaxed);
     if t != 0 && !unsafe { IsWindow(HWND(t as *mut _)).as_bool() } {
         TARGET_HWND.store(0, Ordering::Relaxed);
+        ball_bubble();
         ball_mark_dirty();
     }
     crate::regions::prune();
@@ -5496,6 +5499,16 @@ pub(crate) fn ball_popup_panel() {
     if h != 0 {
         unsafe {
             let _ = PostMessageW(HWND(h as *mut _), WM_BALL_POPUP, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// 目标窗口变化时，让悬浮球弹一个 MC 风格的小对话气泡。
+pub(crate) fn ball_bubble() {
+    let h = BUBBLE_HWND.load(Ordering::Relaxed);
+    if h != 0 {
+        unsafe {
+            let _ = PostMessageW(HWND(h as *mut _), WM_BALL_BUBBLE, WPARAM(0), LPARAM(0));
         }
     }
 }
@@ -6518,6 +6531,7 @@ unsafe fn set_ball_visible(on: bool) {
     } else {
         BALL_EXPANDED.store(false, Ordering::Relaxed);
         BALL_ANIM.store(0.0f32.to_bits(), Ordering::Relaxed);
+        bubble_hide();
         let _ = ShowWindow(h, SW_HIDE);
     }
 }
@@ -6560,7 +6574,243 @@ unsafe fn ball_spawn() {
     };
     let _ = ShowWindow(hwnd, SW_SHOWNA);
     BALL_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+    bubble_spawn();
     ball_render();
+}
+
+unsafe fn bubble_spawn() {
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    if BUBBLE_HWND.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let hinst = match GetModuleHandleW(None) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let class_w: Vec<u16> = "TransGlassBallBubble".encode_utf16().chain(std::iter::once(0)).collect();
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(bubble_proc),
+        hInstance: windows::Win32::Foundation::HINSTANCE(hinst.0),
+        lpszClassName: windows::core::PCWSTR(class_w.as_ptr()),
+        ..Default::default()
+    };
+    let _ = RegisterClassW(&wc);
+    let hwnd = match CreateWindowExW(
+        WS_EX_LAYERED
+            | WS_EX_TRANSPARENT
+            | WS_EX_TOOLWINDOW
+            | WS_EX_TOPMOST
+            | WS_EX_NOACTIVATE,
+        windows::core::PCWSTR(class_w.as_ptr()),
+        windows::core::PCWSTR(class_w.as_ptr()),
+        WS_POPUP,
+        0,
+        0,
+        1,
+        1,
+        None,
+        None,
+        windows::Win32::Foundation::HINSTANCE(hinst.0),
+        None,
+    ) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    BUBBLE_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+    let _ = ShowWindow(hwnd, SW_HIDE);
+}
+
+unsafe extern "system" fn bubble_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    match msg {
+        WM_TIMER => {
+            if w.0 == 3 {
+                let _ = KillTimer(hwnd, 3);
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            LRESULT(0)
+        }
+        WM_BALL_BUBBLE => {
+            bubble_show();
+            LRESULT(0)
+        }
+        WM_NCHITTEST => LRESULT(windows::Win32::UI::WindowsAndMessaging::HTTRANSPARENT as isize),
+        _ => DefWindowProcW(hwnd, msg, w, l),
+    }
+}
+
+unsafe fn bubble_hide() {
+    let h = BUBBLE_HWND.load(Ordering::Relaxed);
+    if h != 0 {
+        let hwnd = HWND(h as *mut _);
+        let _ = KillTimer(hwnd, 3);
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+unsafe fn bubble_show() {
+    if !BALL_SHOWN.load(Ordering::Relaxed) {
+        return;
+    }
+    if current_target() == 0 {
+        bubble_hide();
+        return;
+    }
+    let h = BUBBLE_HWND.load(Ordering::Relaxed);
+    if h == 0 {
+        return;
+    }
+    let bx = BALL_POS_X.load(Ordering::Relaxed) + BALL_W - 42;
+    let by = BALL_POS_Y.load(Ordering::Relaxed) + BALL_H / 2;
+    let sw = GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN);
+    let sh = GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN);
+    let x = (bx - BUBBLE_W / 2).clamp(6, (sw - BUBBLE_W - 6).max(6));
+    let y = (by - 42 - BUBBLE_H).clamp(6, (sh - BUBBLE_H - 6).max(6));
+    if !bubble_render(x, y) {
+        return;
+    }
+    let hwnd = HWND(h as *mut _);
+    let _ = SetWindowPos(
+        hwnd,
+        windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST,
+        x,
+        y,
+        BUBBLE_W,
+        BUBBLE_H,
+        windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE
+            | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
+    );
+    let _ = ShowWindow(hwnd, SW_SHOWNA);
+    SetTimer(hwnd, 3, 3500, None);
+}
+
+unsafe fn bubble_render(x: i32, y: i32) -> bool {
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, GetDC,
+        ReleaseDC, SelectObject, SetBkMode, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BI_RGB,
+        DIB_RGB_COLORS, DEFAULT_CHARSET, DEFAULT_PITCH, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        ANTIALIASED_QUALITY, FW_BOLD, HGDIOBJ, TRANSPARENT,
+    };
+    let w = BUBBLE_W;
+    let h = BUBBLE_H;
+    let tail = 20;
+    let screen = GetDC(HWND::default());
+    let mem = CreateCompatibleDC(screen);
+    let mut bi: BITMAPINFO = std::mem::zeroed();
+    bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB.0;
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let dib = match CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+        Ok(d) => d,
+        Err(_) => {
+            let _ = DeleteDC(mem);
+            ReleaseDC(HWND::default(), screen);
+            return false;
+        }
+    };
+    let old = SelectObject(mem, HGDIOBJ(dib.0));
+    let buf = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
+    buf.fill(0);
+
+    // MC 面板 + 像素尾巴
+    draw_mc_panel(buf, w, h, (4, 4, w - 8, h - 8 - tail), 1.0);
+    let cx = w / 2;
+    for (i, half) in [(0, 18i32), (1, 13), (2, 8), (3, 4)] {
+        let y0 = h - 8 - tail + i * (tail / 4);
+        mc_fill(buf, w, h, cx - half, y0, cx + half, y0 + tail / 4, (0, 0, 0), 1.0);
+    }
+
+    let app = cached_app_name(HWND(current_target() as *mut _));
+    let (tag, color) = crate::selection::mark_for(current_target()).unwrap_or_else(|| {
+        (
+            if app.trim().is_empty() {
+                "窗口".to_string()
+            } else {
+                app.clone()
+            },
+            (47, 194, 124),
+        )
+    });
+    let n = crate::regions::count(current_target());
+    let font_name: Vec<u16> = "Microsoft YaHei".encode_utf16().chain(std::iter::once(0)).collect();
+    let font = CreateFontW(
+        -14,
+        0,
+        0,
+        0,
+        FW_BOLD.0 as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.0 as u32,
+        OUT_DEFAULT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        ANTIALIASED_QUALITY.0 as u32,
+        DEFAULT_PITCH.0 as u32,
+        windows::core::PCWSTR(font_name.as_ptr()),
+    );
+    let old_font = SelectObject(mem, HGDIOBJ(font.0));
+    SetBkMode(mem, TRANSPARENT);
+    // 标记色方块
+    mc_fill(buf, w, h, 14, 16, 24, 26, color, 1.0);
+    draw_mc_label(mem, &format!("已选中 · {}", tag), (30, 8, w - 14, 34), (43, 43, 43));
+    draw_mc_label(mem, &format!("{} · 选区 {} 个", app, n), (16, 34, w - 16, 54), (60, 60, 60));
+    draw_mc_label(mem, "右键悬浮球管理", (16, 56, w - 16, 80), (90, 90, 90));
+
+    // 文字 alpha 补齐 + 预乘
+    for px in buf.chunks_exact_mut(4) {
+        if px[3] == 0 && (px[0] != 0 || px[1] != 0 || px[2] != 0) {
+            px[3] = 255;
+        }
+    }
+    for px in buf.chunks_exact_mut(4) {
+        match px[3] {
+            255 => {}
+            0 => {
+                px[0] = 0;
+                px[1] = 0;
+                px[2] = 0;
+            }
+            a => {
+                let a = a as u32;
+                px[0] = (px[0] as u32 * a / 255) as u8;
+                px[1] = (px[1] as u32 * a / 255) as u8;
+                px[2] = (px[2] as u32 * a / 255) as u8;
+            }
+        }
+    }
+
+    let pos = POINT { x, y };
+    let size = SIZE { cx: w, cy: h };
+    let src = POINT { x: 0, y: 0 };
+    let blend = BLENDFUNCTION {
+        BlendOp: 0,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: 1,
+    };
+    let _ = windows::Win32::UI::WindowsAndMessaging::UpdateLayeredWindow(
+        HWND(BUBBLE_HWND.load(Ordering::Relaxed) as *mut _),
+        screen,
+        Some(&pos),
+        Some(&size),
+        mem,
+        Some(&src),
+        COLORREF(0),
+        Some(&blend),
+        windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
+    );
+
+    SelectObject(mem, old_font);
+    SelectObject(mem, old);
+    let _ = DeleteObject(HGDIOBJ(font.0));
+    let _ = DeleteObject(HGDIOBJ(dib.0));
+    let _ = DeleteDC(mem);
+    ReleaseDC(HWND::default(), screen);
+    true
 }
 
 unsafe fn purge_shell_managed() {
