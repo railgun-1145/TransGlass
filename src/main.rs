@@ -1156,7 +1156,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     )
 }
 
-fn show_root_window() {
+pub(crate) fn show_root_window() {
     WINDOW_VISIBLE.store(true, Ordering::Relaxed);
     if let Some(ctx) = EGUI_CTX.get() {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -1194,6 +1194,33 @@ fn hide_root_window() {
     if let Some(ctx) = EGUI_CTX.get() {
         ctx.request_repaint();
     }
+}
+
+/// 选区编辑器 / 抓透明洞时临时把主界面藏起来：画布干净，也不会被拍进洞里。
+/// 只动 Win32 显示状态，不改变 WINDOW_VISIBLE 的逻辑可见性。
+pub(crate) unsafe fn hide_root_for_overlay() -> bool {
+    let h = ROOT_HWND.load(Ordering::Relaxed);
+    if h == 0 {
+        return false;
+    }
+    let hwnd = HWND(h as *mut _);
+    if !IsWindowVisible(hwnd).as_bool() {
+        return false;
+    }
+    let _ = ShowWindow(hwnd, SW_HIDE);
+    true
+}
+
+/// 对应 hide_root_for_overlay 的恢复。
+pub(crate) unsafe fn show_root_after_overlay() {
+    let h = ROOT_HWND.load(Ordering::Relaxed);
+    if h == 0 || !WINDOW_VISIBLE.load(Ordering::Relaxed) {
+        return;
+    }
+    let hwnd = HWND(h as *mut _);
+    let _ = ShowWindow(hwnd, SW_SHOW);
+    let _ = SetForegroundWindow(hwnd);
+    request_ui_repaint();
 }
 
 // --- 底层核心逻辑 ---
@@ -1576,11 +1603,7 @@ struct TransGlassApp {
     selected: Option<isize>,
     settings_open: bool,
     ps_selected: usize,
-    /// 正在右侧面板的缩略图上圈蒙版
-    ps_draw: bool,
-    /// 正在圈的草稿点（归一化客户区坐标 0..1）
-    ps_points: Vec<(f32, f32)>,
-    /// 草稿属于哪个窗口；目标一换就作废
+    /// 预览的是哪个窗口；目标一换选中条回到第一条
     ps_target: isize,
     /// 设置页当前分类
     settings_tab: usize,
@@ -1713,8 +1736,6 @@ impl TransGlassApp {
             selected: None,
             settings_open: std::env::var_os("TRANSGLASS_OPEN_SETTINGS").is_some(),
             ps_selected: 0,
-            ps_draw: false,
-            ps_points: Vec::new(),
             ps_target: 0,
             settings_tab: 0,
             settings_fade: None,
@@ -1962,9 +1983,13 @@ impl TransGlassApp {
                                     if ui.button("选中并显示").clicked() {
                                         crate::select_window_for_control(*hwnd);
                                                                     }
-                                    if ui.button("圈蒙版（右侧面板）").clicked() {
+                                    if ui
+                                        .button("在窗口上画选区")
+                                        .on_hover_text("在这个窗口上直接画蒙版，确定即生效")
+                                        .clicked()
+                                    {
                                         crate::select_window_for_control(*hwnd);
-                                        crate::show_root_window();
+                                        crate::regions::open_editor(*hwnd);
                                     }
                                     if ui.button("清空蒙版").clicked() {
                                         crate::regions::clear(*hwnd);
@@ -5156,12 +5181,12 @@ fn selection_controls_ui(ui: &mut egui::Ui, hwnd: isize) {
     }
     ui.horizontal(|ui| {
         if ui
-            .button("在右侧面板圈蒙版")
-            .on_hover_text("打开主界面，在「蒙版 / 点透」面板的缩略图上直接圈")
+            .button("在窗口上画选区")
+            .on_hover_text("在这个窗口上拖出矩形/椭圆/自由形状，点「确定」生成一个蒙版")
             .clicked()
         {
             crate::select_window_for_control(hwnd);
-            crate::show_root_window();
+            crate::regions::open_editor(hwnd);
             ui.close_menu();
         }
         if ui.button("清空选区").clicked() {
@@ -6624,11 +6649,7 @@ unsafe fn bubble_spawn() {
     };
     let _ = RegisterClassW(&wc);
     let hwnd = match CreateWindowExW(
-        WS_EX_LAYERED
-            | WS_EX_TRANSPARENT
-            | WS_EX_TOOLWINDOW
-            | WS_EX_TOPMOST
-            | WS_EX_NOACTIVATE,
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
         windows::core::PCWSTR(class_w.as_ptr()),
         windows::core::PCWSTR(class_w.as_ptr()),
         WS_POPUP,
@@ -6677,7 +6698,16 @@ unsafe extern "system" fn bubble_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             bubble_show();
             LRESULT(0)
         }
-        WM_NCHITTEST => LRESULT(windows::Win32::UI::WindowsAndMessaging::HTTRANSPARENT as isize),
+        // 气泡不再是纯装饰：点一下就打开主界面（之前点了没反应，和"用不了"一样）
+        WM_LBUTTONUP => {
+            crate::show_root_window();
+            bubble_hide();
+            LRESULT(0)
+        }
+        WM_SETCURSOR => {
+            let _ = SetCursor(LoadCursorW(None, IDC_HAND).unwrap_or_default());
+            LRESULT(1)
+        }
         _ => DefWindowProcW(hwnd, msg, w, l),
     }
 }
@@ -6860,7 +6890,7 @@ unsafe fn bubble_render(x: i32, y: i32, alpha: u8) -> bool {
         (16, 34, w - 16, 56),
         (222, 222, 226),
     );
-    draw_chat_label(mem, "右键悬浮球管理", (16, 58, w - 16, 82), (152, 152, 158));
+    draw_chat_label(mem, "点这里打开主界面", (16, 58, w - 16, 82), (152, 152, 158));
 
     // 文字 alpha 补齐 + 白字提亮 + 预乘
     for px in buf.chunks_exact_mut(4) {
@@ -7150,18 +7180,23 @@ impl TransGlassApp {
         self.hotkey_editor_inline(ui);
     }
 
-    /// PS 风格「蒙版 / 点透」面板：顶部是目标窗口缩略图，直接在缩略图上圈。
+    /// 右侧「蒙版 / 点透」面板：只做预览；画选区在目标窗口上用编辑器画（画图式工具 + 确定）。
     /// 圈完出现「完成 / 取消」，完成立即写入蒙版（不再开全屏覆盖层编辑器、也不用按 Enter）。
     fn ps_selection_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // 窗口变矮时蒙版列表会超出侧栏，套一层滚动条
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.ps_panel_body(ui, ctx));
+    }
+
+    fn ps_panel_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let target = crate::current_target();
-        // 目标换人了：草稿作废、选中条回到第一条
+        // 目标换人了：预览选中条回到第一条
         if target != self.ps_target {
             self.ps_target = target;
-            self.ps_draw = false;
-            self.ps_points.clear();
             self.ps_selected = 0;
         }
-        let mut regions: Vec<crate::regions::Region> = crate::regions::snapshot_all()
+        let regions: Vec<crate::regions::Region> = crate::regions::snapshot_all()
             .into_iter()
             .find(|(h, _)| *h == target)
             .map(|(_, r)| r)
@@ -7178,7 +7213,7 @@ impl TransGlassApp {
         if target == 0 {
             ui.label(
                 egui::RichText::new(
-                    "右键窗口卡片/左侧窗口，或右键悬浮球选中窗口后，这里直接在缩略图上圈点透蒙版",
+                    "右键窗口卡片/左侧窗口，或右键悬浮球选中窗口后，这里显示这个窗口的蒙版预览",
                 )
                 .small()
                 .weak(),
@@ -7195,7 +7230,7 @@ impl TransGlassApp {
         );
         ui.add_space(4.0);
 
-        // ---------- 目标窗口缩略图：直接在上面圈 ----------
+        // ---------- 目标窗口预览（只读）：蒙版高亮，选中那条金框 ----------
         let tex = self.thumbnail(ctx, target);
         let win = tex
             .as_ref()
@@ -7204,7 +7239,7 @@ impl TransGlassApp {
         let avail_w = ui.available_width().max(120.0);
         let scale = (avail_w / win.x).min(210.0 / win.y).max(0.001);
         let canvas = egui::vec2((win.x * scale).max(80.0), (win.y * scale).max(45.0));
-        let (rect, resp) = ui.allocate_exact_size(canvas, egui::Sense::click_and_drag());
+        let (rect, _resp) = ui.allocate_exact_size(canvas, egui::Sense::hover());
         let painter = ui.painter().with_clip_rect(rect.expand(2.0));
         let cb = unsafe { client_box_in_window(target) }.unwrap_or((0.0, 0.0, win.x, win.y));
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -7227,29 +7262,9 @@ impl TransGlassApp {
                 );
             }
         }
-        // 已有蒙版全部画出来，选中的那条金色粗框（和列表联动）
         for (i, r) in regions.iter().enumerate() {
             let (fill, line, width) = mask_style(r, i == self.ps_selected);
             paint_mask_on_thumb(&painter, &r.pts, rect, win, cb, fill, line, width);
-        }
-        // 正在圈的草稿（橙线 + 起点方块）
-        if self.ps_draw && self.ps_points.len() >= 2 {
-            paint_mask_on_thumb(
-                &painter,
-                &self.ps_points,
-                rect,
-                win,
-                cb,
-                egui::Color32::from_rgba_unmultiplied(0xF5, 0x96, 0x32, 56),
-                egui::Color32::from_rgb(0xF5, 0x96, 0x32),
-                2.0,
-            );
-            let s = thumb_point(rect, win, cb, self.ps_points[0].0, self.ps_points[0].1);
-            painter.rect_filled(
-                egui::Rect::from_center_size(s, egui::vec2(6.0, 6.0)),
-                egui::Rounding::same(1.0),
-                egui::Color32::from_rgb(0xF5, 0x96, 0x32),
-            );
         }
         painter.rect_stroke(
             rect,
@@ -7257,80 +7272,32 @@ impl TransGlassApp {
             egui::Stroke::new(1.0, BORDER),
         );
 
-        // 圈选交互：按住左键在缩略图上拖一圈，点全程收进 self.ps_points（归一化客户区）
-        if tex.is_some() {
-            if resp.drag_started() {
-                self.ps_draw = true;
-                self.ps_points.clear();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button("在窗口上画选区")
+                .on_hover_text("在目标窗口上拖出矩形/椭圆/自由形状，点「确定」生成一个蒙版")
+                .clicked()
+            {
+                crate::regions::open_editor(target);
             }
-            if self.ps_draw {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    let px = ((p.x - rect.left()) / rect.width().max(1.0)) * win.x;
-                    let py = ((p.y - rect.top()) / rect.height().max(1.0)) * win.y;
-                    let nx = ((px - cb.0) / cb.2.max(1.0)).clamp(0.0, 1.0);
-                    let ny = ((py - cb.1) / cb.3.max(1.0)).clamp(0.0, 1.0);
-                    let last = self.ps_points.last().copied();
-                    let far = last.map_or(true, |(lx, ly)| {
-                        thumb_point(rect, win, cb, lx, ly)
-                            .distance(thumb_point(rect, win, cb, nx, ny))
-                            >= 2.5
-                    });
-                    if far && self.ps_points.len() < 800 {
-                        self.ps_points.push((nx, ny));
-                    }
-                }
-                if resp.drag_stopped() && self.ps_points.len() < 3 {
-                    // 只是点了一下，不算一圈
-                    self.ps_draw = false;
-                    self.ps_points.clear();
-                }
-            }
-        }
-        if tex.is_none() {
-            ui.label(
-                egui::RichText::new("恢复目标窗口或调高预览帧率后，才能在这里圈")
-                    .small()
-                    .weak(),
-            );
-        }
-        if self.ps_draw {
-            ui.horizontal(|ui| {
+            if regions.is_empty() {
+                ui.label(egui::RichText::new("还没有蒙版").small().weak());
+            } else {
                 ui.label(
-                    egui::RichText::new(format!("已圈 {} 个点", self.ps_points.len()))
+                    egui::RichText::new(format!("{} 个蒙版", regions.len()))
                         .small()
                         .weak(),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let ok = ui.add_enabled(
-                        self.ps_points.len() >= 3,
-                        egui::Button::new("完成"),
-                    );
-                    if ok.clicked() && self.ps_points.len() >= 3 {
-                        let pts = std::mem::take(&mut self.ps_points);
-                        regions.push(crate::regions::Region {
-                            pts,
-                            invert: false,
-                            opacity: 100,
-                            enabled: true,
-                        });
-                        // 立即写入：列表、点击穿透、透明洞全都马上按新蒙版走
-                        crate::regions::set_regions(target, regions.clone());
-                        self.ps_selected = regions.len() - 1;
-                        self.ps_draw = false;
-                    }
-                    if ui.button("取消").clicked() {
-                        self.ps_draw = false;
-                        self.ps_points.clear();
-                    }
-                });
-            });
-        } else {
-            ui.label(
-                egui::RichText::new("按住左键在缩略图上圈一圈，点「完成」立即生效")
-                    .small()
-                    .weak(),
-            );
-        }
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "框内 = 点透的洞，框外仍可操作；新蒙版默认只点透（透明度 0%），想要视觉洞把列表里的透明度拉起来",
+            )
+            .small()
+            .weak(),
+        );
         ui.separator();
 
         // ---------- 标记 ----------
@@ -7372,7 +7339,7 @@ impl TransGlassApp {
         ui.label(egui::RichText::new("蒙版列表").small().strong());
         if regions.is_empty() {
             ui.label(
-                egui::RichText::new("还没有蒙版：在上面缩略图上圈一圈")
+                egui::RichText::new("还没有蒙版：点上面「在窗口上画选区」到窗口上画")
                     .small()
                     .weak(),
             );
@@ -7514,8 +7481,6 @@ impl TransGlassApp {
             if ui.button("清空蒙版").clicked() {
                 crate::regions::clear(target);
                 self.ps_selected = 0;
-                self.ps_draw = false;
-                self.ps_points.clear();
             }
             if ui.button("刷新透明洞").clicked() {
                 crate::regions::refresh_visual(target);

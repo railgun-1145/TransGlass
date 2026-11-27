@@ -11,7 +11,7 @@
 //! 按选区透明度混合；快照在应用/刷新时截取，下层变了需要刷新。
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Mutex, Once};
 use std::thread;
 
@@ -46,7 +46,6 @@ static HOLE_STYLES: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 static INIT: Once = Once::new();
 static EDITOR_HWND: AtomicIsize = AtomicIsize::new(0);
 static PENDING: Mutex<Option<isize>> = Mutex::new(None);
-static PENDING_SELECTED: Mutex<Option<usize>> = Mutex::new(None);
 
 static VISUAL_HWND: AtomicIsize = AtomicIsize::new(0);
 static VISUAL_REQ: Mutex<Option<isize>> = Mutex::new(None);
@@ -63,20 +62,14 @@ pub fn init() {
     });
 }
 
-/// 全屏覆盖层编辑器。2.18.0 起主界面改成在右侧面板缩略图上直接圈（PS 风格直出），
-/// 这里保留给后续「快捷键唤起老编辑器」用，不再挂界面入口。
-#[allow(dead_code)]
+/// 全屏覆盖层编辑器（2.19.0 改回「窗口上直接画」：矩形/椭圆/自由 + 确定）。
 pub fn open_editor(hwnd: isize) {
     open_editor_at(hwnd, None);
 }
 
-#[allow(dead_code)]
-pub fn open_editor_at(hwnd: isize, selected: Option<usize>) {
+pub fn open_editor_at(hwnd: isize, _selected: Option<usize>) {
     if hwnd == 0 {
         return;
-    }
-    if let Ok(mut p) = PENDING_SELECTED.lock() {
-        *p = selected;
     }
     open_editor_post(hwnd);
 }
@@ -115,6 +108,27 @@ pub fn hide_visual() {
         unsafe {
             let _ = PostMessageW(HWND(h as *mut _), WM_VISUAL_HIDE, WPARAM(0), LPARAM(0));
         }
+    }
+}
+
+static VISUAL_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// 同步版刷新：等视觉线程完成一次抓取再返回（最多等 2 秒）。
+/// 编辑结束用它，保证「藏主界面 → 抓下层 → 恢复主界面」的顺序，洞里的文字才不会和窗口本身错位。
+pub fn refresh_visual_wait(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    let seq = VISUAL_SEQ.load(Ordering::Relaxed);
+    refresh_visual(hwnd);
+    if VISUAL_HWND.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    for _ in 0..400 {
+        if VISUAL_SEQ.load(Ordering::Relaxed) != seq {
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
@@ -158,8 +172,12 @@ pub fn prune() {
     }
 }
 
+/// 编辑结束用：等透明洞真正抓完下层快照再返回（否则主界面可能被拍进洞里）
 pub fn set_regions(hwnd: isize, regions: Vec<Region>) {
-    let any_visual = regions.iter().any(|r| r.opacity > 0);
+    apply_regions(hwnd, regions, true);
+}
+
+fn apply_regions(hwnd: isize, regions: Vec<Region>, wait: bool) {
     let empty = regions.is_empty();
     if let Ok(mut v) = REGIONS.lock() {
         v.retain(|(h, _)| *h != hwnd);
@@ -168,8 +186,12 @@ pub fn set_regions(hwnd: isize, regions: Vec<Region>) {
         }
     }
     clear_hole_style(hwnd);
-    if empty || !any_visual {
+    // 即使当前透明度是 0（只点透、不改外观）也抓一张下层快照存着：
+    // 之后在列表里把透明度滑块拉起来就能立刻看到视觉洞，不用重新抓屏。
+    if empty {
         hide_visual();
+    } else if wait {
+        refresh_visual_wait(hwnd);
     } else {
         refresh_visual(hwnd);
     }
@@ -186,7 +208,6 @@ pub fn update_region(
     opacity: Option<u8>,
     enabled: Option<bool>,
 ) {
-    let mut any_visual = false;
     if let Ok(mut v) = REGIONS.lock() {
         if let Some((_, regions)) = v.iter_mut().find(|(h, _)| *h == hwnd) {
             if let Some(r) = regions.get_mut(idx) {
@@ -200,34 +221,29 @@ pub fn update_region(
                     r.enabled = e;
                 }
             }
-            any_visual = regions.iter().any(|r| r.enabled && r.opacity > 0);
         }
     }
     clear_hole_style(hwnd);
-    if any_visual {
-        refresh_visual_mask();
-    } else {
-        hide_visual();
-    }
+    // 透明度归 0 时只重画 mask（全透明 + follow_visual 会把覆盖层藏起来），
+    // 保留已抓的下层快照，之后拉回透明度不用重抓。
+    refresh_visual_mask();
 }
 
 pub fn remove_region(hwnd: isize, idx: usize) {
     let mut empty = false;
-    let mut any_visual = false;
     if let Ok(mut v) = REGIONS.lock() {
         if let Some((_, regions)) = v.iter_mut().find(|(h, _)| *h == hwnd) {
             if idx < regions.len() {
                 regions.remove(idx);
             }
             empty = regions.is_empty();
-            any_visual = regions.iter().any(|r| r.opacity > 0);
         }
         if empty {
             v.retain(|(h, _)| *h != hwnd);
         }
     }
     clear_hole_style(hwnd);
-    if empty || !any_visual {
+    if empty {
         hide_visual();
     } else {
         refresh_visual_mask();
@@ -374,17 +390,49 @@ unsafe fn client_screen_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
 // 套索编辑器
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 选区编辑器：窗口上直接画（画图式工具 + 拖出封闭图形 + 确定）
+//   左键拖动画一个封闭图形（矩形 / 椭圆 / 自由），点「确定」生成一个蒙版。
+//   框内 = 点透的洞（绿色高亮），框外仍可操作；Enter 确定、Esc 取消、Backspace 重画。
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Rect,
+    Ellipse,
+    Free,
+}
+
+impl Tool {
+    fn index(self) -> usize {
+        match self {
+            Tool::Rect => 0,
+            Tool::Ellipse => 1,
+            Tool::Free => 2,
+        }
+    }
+}
+
 struct EditState {
     active: bool,
     hwnd: isize,
     screen: (i32, i32, i32, i32),
+    /// 已有蒙版（只做参考描边，不在编辑器里改）
     regions: Vec<Region>,
-    selected: Option<usize>,
-    drawing: Vec<(f32, f32)>,
-    drawing_px: Vec<(i32, i32)>,
+    tool: Tool,
+    dragging: bool,
+    drag_from: (i32, i32),
+    drag_to: (i32, i32),
+    /// 自由工具正在采集的点（像素）
+    free: Vec<(i32, i32)>,
+    /// 已经画好的封闭图形（归一化）；点「确定」才写入
+    pending: Option<Vec<(f32, f32)>>,
+    /// 悬停的按钮：0 无、1..3 工具、4 确定、5 取消、6 重画
+    hover: u8,
     was_minimized: bool,
     prev_above: isize,
     topmost: bool,
+    main_was_visible: bool,
 }
 
 impl Default for EditState {
@@ -394,18 +442,122 @@ impl Default for EditState {
             hwnd: 0,
             screen: (0, 0, 0, 0),
             regions: Vec::new(),
-            selected: None,
-            drawing: Vec::new(),
-            drawing_px: Vec::new(),
+            tool: Tool::Rect,
+            dragging: false,
+            drag_from: (0, 0),
+            drag_to: (0, 0),
+            free: Vec::new(),
+            pending: None,
+            hover: 0,
             was_minimized: false,
             prev_above: 0,
             topmost: false,
+            main_was_visible: false,
         }
     }
 }
 
 thread_local! {
     static ES: RefCell<EditState> = RefCell::new(EditState::default());
+}
+
+struct BarLayout {
+    tools: [(i32, i32, i32, i32); 3],
+    ok: (i32, i32, i32, i32),
+    cancel: (i32, i32, i32, i32),
+    redraw: (i32, i32, i32, i32),
+    height: i32,
+}
+
+/// 顶部工具栏布局。窗口太窄时把动作按钮放到第二行。
+fn bar_layout(w: i32) -> BarLayout {
+    let tw = 64;
+    let gap = 6;
+    let tools = [
+        (8, 8, 8 + tw, 40),
+        (8 + tw + gap, 8, 8 + 2 * tw + gap, 40),
+        (8 + 2 * (tw + gap), 8, 8 + 3 * tw + 2 * gap, 40),
+    ];
+    let aw = 76;
+    let (y0, y1, height) = if w >= 560 { (8, 40, 52) } else { (46, 78, 88) };
+    let ok = (w - 8 - aw, y0, w - 8, y1);
+    let cancel = (ok.0 - gap - aw, y0, ok.0 - gap, y1);
+    let redraw = (cancel.0 - gap - aw, y0, cancel.0 - gap, y1);
+    BarLayout {
+        tools,
+        ok,
+        cancel,
+        redraw,
+        height,
+    }
+}
+
+fn in_rect(x: i32, y: i32, r: (i32, i32, i32, i32)) -> bool {
+    x >= r.0 && x < r.2 && y >= r.1 && y < r.3
+}
+
+/// 命中返回：1..3 工具，4 确定，5 取消，6 重画，0 无
+fn hit_bar(x: i32, y: i32, w: i32) -> u8 {
+    let bar = bar_layout(w);
+    if y >= bar.height {
+        return 0;
+    }
+    for (i, r) in bar.tools.iter().enumerate() {
+        if in_rect(x, y, *r) {
+            return 1 + i as u8;
+        }
+    }
+    if in_rect(x, y, bar.ok) {
+        return 4;
+    }
+    if in_rect(x, y, bar.cancel) {
+        return 5;
+    }
+    if in_rect(x, y, bar.redraw) {
+        return 6;
+    }
+    0
+}
+
+fn normalize(x: i32, y: i32, w: i32, h: i32) -> (f32, f32) {
+    let ww = w.max(1) as f32;
+    let hh = h.max(1) as f32;
+    (
+        x.clamp(0, w.max(1)) as f32 / ww,
+        y.clamp(0, h.max(1)) as f32 / hh,
+    )
+}
+
+fn rect_norm(x0: i32, y0: i32, x1: i32, y1: i32, w: i32, h: i32) -> Vec<(f32, f32)> {
+    let (xa, xb) = (x0.min(x1), x0.max(x1));
+    let (ya, yb) = (y0.min(y1), y0.max(y1));
+    vec![
+        normalize(xa, ya, w, h),
+        normalize(xb, ya, w, h),
+        normalize(xb, yb, w, h),
+        normalize(xa, yb, w, h),
+    ]
+}
+
+fn ellipse_norm(x0: i32, y0: i32, x1: i32, y1: i32, w: i32, h: i32) -> Vec<(f32, f32)> {
+    let (xa, xb) = (x0.min(x1), x0.max(x1));
+    let (ya, yb) = (y0.min(y1), y0.max(y1));
+    let cx = (xa + xb) as f32 / 2.0;
+    let cy = (ya + yb) as f32 / 2.0;
+    let rx = ((xb - xa) as f32 / 2.0).max(1.0);
+    let ry = ((yb - ya) as f32 / 2.0).max(1.0);
+    let n = 48;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
+        out.push(normalize(
+            (cx + rx * a.cos()) as i32,
+            (cy + ry * a.sin()) as i32,
+            w,
+            h,
+        ));
+    }
+    out
 }
 
 unsafe fn editor_thread() {
@@ -456,24 +608,6 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
     match msg {
         WM_EDITOR_OPEN => {
             begin_edit(hwnd);
-            LRESULT(0)
-        }
-        WM_TIMER => {
-            if ES.with(|e| e.borrow().active) {
-                let root = crate::main_window_handle();
-                let hidden = root == 0
-                    || unsafe {
-                        !IsWindowVisible(HWND(root as *mut _)).as_bool()
-                            || IsIconic(HWND(root as *mut _)).as_bool()
-                    };
-                let vis = IsWindowVisible(hwnd).as_bool();
-                if hidden && vis {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                } else if !hidden && !vis {
-                    let _ = ShowWindow(hwnd, SW_SHOW);
-                    let _ = SetForegroundWindow(hwnd);
-                }
-            }
             LRESULT(0)
         }
         WM_SETCURSOR => {
@@ -536,17 +670,9 @@ unsafe fn begin_edit(overlay: HWND) {
         .ok()
         .and_then(|v| v.iter().find(|(h, _)| *h == hwnd_val).map(|(_, r)| r.clone()))
         .unwrap_or_default();
-    let selected = if regions.is_empty() {
-        None
-    } else {
-        let wanted = PENDING_SELECTED
-            .lock()
-            .ok()
-            .and_then(|mut p| p.take())
-            .unwrap_or(regions.len() - 1);
-        Some(wanted.min(regions.len() - 1))
-    };
 
+    // 主界面先藏起来：画布干净，下层快照也不会把主界面拍进去（否则洞里的文字会和窗口本身错位）
+    let main_was_visible = crate::hide_root_for_overlay();
     let _ = SetWindowPos(
         hwnd,
         HWND_TOP,
@@ -563,18 +689,22 @@ unsafe fn begin_edit(overlay: HWND) {
             hwnd: hwnd_val,
             screen: (cx, cy, w, h),
             regions,
-            selected,
-            drawing: Vec::new(),
-            drawing_px: Vec::new(),
+            tool: Tool::Rect,
+            dragging: false,
+            drag_from: (0, 0),
+            drag_to: (0, 0),
+            free: Vec::new(),
+            pending: None,
+            hover: 0,
             was_minimized,
             prev_above,
             topmost,
+            main_was_visible,
         };
     });
     let _ = SetWindowPos(overlay, HWND_TOPMOST, cx, cy, w, h, SWP_NOACTIVATE);
     draw_editor(overlay);
     let _ = ShowWindow(overlay, SW_SHOW);
-    SetTimer(overlay, 2, 200, None);
     focus_editor(overlay);
 }
 
@@ -584,9 +714,9 @@ unsafe fn end_edit(overlay: HWND, save: bool) {
         return;
     }
     let _ = ShowWindow(overlay, SW_HIDE);
-    KillTimer(overlay, 2);
     let _ = ReleaseCapture();
     if save {
+        // 同步等透明洞抓完下层快照，再恢复主界面，避免主界面出现在洞里
         set_regions(state.hwnd, state.regions.clone());
     }
     clear_hole_style(state.hwnd);
@@ -614,6 +744,9 @@ unsafe fn end_edit(overlay: HWND, save: bool) {
         if state.was_minimized {
             let _ = ShowWindow(hwnd, SW_MINIMIZE);
         }
+    }
+    if state.main_was_visible {
+        crate::show_root_after_overlay();
     }
 }
 
@@ -663,167 +796,190 @@ unsafe fn on_down(l: LPARAM) {
     if w <= 0 || h <= 0 {
         return;
     }
-    let _ = SetCapture(HWND(EDITOR_HWND.load(Ordering::Relaxed) as *mut _));
+    let overlay = HWND(EDITOR_HWND.load(Ordering::Relaxed) as *mut _);
+    let bar = bar_layout(w);
+    if y < bar.height {
+        match hit_bar(x, y, w) {
+            1 => {
+                ES.with(|e| e.borrow_mut().tool = Tool::Rect);
+                redraw();
+            }
+            2 => {
+                ES.with(|e| e.borrow_mut().tool = Tool::Ellipse);
+                redraw();
+            }
+            3 => {
+                ES.with(|e| e.borrow_mut().tool = Tool::Free);
+                redraw();
+            }
+            4 => confirm_edit(overlay),
+            5 => end_edit(overlay, false),
+            6 => {
+                ES.with(|e| {
+                    let mut st = e.borrow_mut();
+                    st.pending = None;
+                    st.free.clear();
+                });
+                redraw();
+            }
+            _ => {}
+        }
+        return;
+    }
+    let _ = SetCapture(overlay);
     ES.with(|e| {
         let mut st = e.borrow_mut();
-        st.drawing.clear();
-        st.drawing_px.clear();
-        st.drawing.push((x as f32 / w as f32, y as f32 / h as f32));
-        st.drawing_px.push((x, y));
+        st.dragging = true;
+        st.drag_from = (x, y);
+        st.drag_to = (x, y);
+        st.pending = None;
+        st.free.clear();
+        st.free.push((x, y));
     });
     redraw();
 }
 
 unsafe fn on_move(l: LPARAM) {
     let (x, y) = mouse_xy(l);
-    let added = ES.with(|e| {
-        let mut st = e.borrow_mut();
-        if st.drawing_px.is_empty() {
-            return false;
+    let (w, h, dragging, tool) = ES.with(|e| {
+        let st = e.borrow();
+        (st.screen.2, st.screen.3, st.dragging, st.tool)
+    });
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    if !dragging {
+        let hv = if y < bar_layout(w).height {
+            hit_bar(x, y, w)
+        } else {
+            0
+        };
+        let changed = ES.with(|e| {
+            let mut st = e.borrow_mut();
+            if st.hover != hv {
+                st.hover = hv;
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
+            redraw();
         }
-        if let Some((lx, ly)) = st.drawing_px.last() {
-            if (x - lx).abs() + (y - ly).abs() < 3 {
-                return false;
+        return;
+    }
+    let changed = ES.with(|e| {
+        let mut st = e.borrow_mut();
+        match tool {
+            Tool::Free => {
+                if let Some((lx, ly)) = st.free.last() {
+                    if (x - lx).abs() + (y - ly).abs() < 2 {
+                        return false;
+                    }
+                }
+                st.free.push((x, y));
+            }
+            _ => {
+                if st.drag_to == (x, y) {
+                    return false;
+                }
+                st.drag_to = (x, y);
             }
         }
-        let (w, h) = (st.screen.2, st.screen.3);
-        if w <= 0 || h <= 0 {
-            return false;
-        }
-        st.drawing.push((x as f32 / w as f32, y as f32 / h as f32));
-        st.drawing_px.push((x, y));
         true
     });
-    if added {
+    if changed {
         redraw();
     }
 }
 
 unsafe fn on_up() {
-    let added = ES.with(|e| {
-        let mut st = e.borrow_mut();
-        if st.drawing_px.len() < 3 {
-            st.drawing.clear();
-            st.drawing_px.clear();
-            false
-        } else {
-            let pts = st.drawing.drain(..).collect::<Vec<_>>();
-            st.drawing_px.clear();
-            // 每个封闭选区 = 一个独立蒙版，新画的追加
-            st.regions.push(Region {
-                pts,
-                invert: false,
-                opacity: 100,
-                enabled: true,
-            });
-            st.selected = Some(st.regions.len() - 1);
-            true
-        }
-    });
     let _ = ReleaseCapture();
-    if added {
-        redraw();
-    }
+    ES.with(|e| {
+        let mut st = e.borrow_mut();
+        if !st.dragging {
+            return;
+        }
+        st.dragging = false;
+        let (w, h) = (st.screen.2, st.screen.3);
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let (x0, y0) = st.drag_from;
+        let (x1, y1) = st.drag_to;
+        let shape = match st.tool {
+            Tool::Rect => {
+                if (x1 - x0).abs() >= 4 && (y1 - y0).abs() >= 4 {
+                    Some(rect_norm(x0, y0, x1, y1, w, h))
+                } else {
+                    None
+                }
+            }
+            Tool::Ellipse => {
+                if (x1 - x0).abs() >= 4 && (y1 - y0).abs() >= 4 {
+                    Some(ellipse_norm(x0, y0, x1, y1, w, h))
+                } else {
+                    None
+                }
+            }
+            Tool::Free => {
+                let pts = std::mem::take(&mut st.free);
+                if pts.len() >= 3 {
+                    Some(
+                        pts.iter()
+                            .map(|(x, y)| normalize(*x, *y, w, h))
+                            .collect(),
+                    )
+                } else {
+                    None
+                }
+            }
+        };
+        st.pending = shape;
+    });
+    redraw();
 }
 
 unsafe fn on_key(vk: u32) {
     let overlay = HWND(EDITOR_HWND.load(Ordering::Relaxed) as *mut _);
-    match vk {
-        v if v == VK_RETURN.0 as u32 => {
-            if ES.with(|e| e.borrow().drawing_px.len() >= 3) {
-                on_up();
-            }
-            end_edit(overlay, true);
-        }
-        v if v == VK_ESCAPE.0 as u32 => {
-            end_edit(overlay, false);
-        }
-        v if v == VK_BACK.0 as u32 => {
-            let changed = ES.with(|e| {
-                let mut st = e.borrow_mut();
-                if !st.drawing_px.is_empty() {
-                    st.drawing.clear();
-                    st.drawing_px.clear();
-                    true
-                } else {
-                    remove_selected(&mut st)
-                }
-            });
-            if changed {
-                redraw();
-            }
-        }
-        v if v == VK_DELETE.0 as u32 => {
-            let changed = ES.with(|e| remove_selected(&mut e.borrow_mut()));
-            if changed {
-                redraw();
-            }
-        }
-        v if v == VK_TAB.0 as u32 => {
-            let changed = ES.with(|e| {
-                let mut st = e.borrow_mut();
-                if st.regions.is_empty() {
-                    return false;
-                }
-                let next = match st.selected {
-                    Some(i) => (i + 1) % st.regions.len(),
-                    None => 0,
-                };
-                st.selected = Some(next);
-                true
-            });
-            if changed {
-                redraw();
-            }
-        }
-        v if v == VK_I.0 as u32 => {
-            let changed = ES.with(|e| {
-                let mut st = e.borrow_mut();
-                let Some(i) = st.selected else { return false };
-                if let Some(r) = st.regions.get_mut(i) {
-                    r.invert = !r.invert;
-                    true
-                } else {
-                    false
-                }
-            });
-            if changed {
-                redraw();
-            }
-        }
-        v if v == VK_OEM_4.0 as u32 || v == VK_OEM_6.0 as u32 => {
-            let delta: i32 = if v == VK_OEM_4.0 as u32 { -10 } else { 10 };
-            let changed = ES.with(|e| {
-                let mut st = e.borrow_mut();
-                let Some(i) = st.selected else { return false };
-                if let Some(r) = st.regions.get_mut(i) {
-                    let next = (r.opacity as i32 + delta).clamp(0, 100);
-                    r.opacity = next as u8;
-                    true
-                } else {
-                    false
-                }
-            });
-            if changed {
-                redraw();
-            }
-        }
-        _ => {}
+    if vk == VK_RETURN.0 as u32 {
+        confirm_edit(overlay);
+    } else if vk == VK_ESCAPE.0 as u32 {
+        end_edit(overlay, false);
+    } else if vk == VK_BACK.0 as u32 || vk == VK_DELETE.0 as u32 {
+        ES.with(|e| {
+            let mut st = e.borrow_mut();
+            st.pending = None;
+            st.free.clear();
+        });
+        redraw();
     }
 }
 
-fn remove_selected(st: &mut EditState) -> bool {
-    let Some(i) = st.selected else { return false };
-    if i >= st.regions.len() {
-        return false;
+/// 把当前画好的图形写成一个蒙版并关闭编辑器
+unsafe fn confirm_edit(overlay: HWND) {
+    let ok = ES.with(|e| {
+        let mut st = e.borrow_mut();
+        let Some(pts) = st.pending.take() else {
+            return false;
+        };
+        if pts.len() < 3 {
+            return false;
+        }
+        st.regions.push(Region {
+            pts,
+            invert: false,
+            // 新蒙版默认只做「点击穿透」，不改变窗口外观：
+            // 视觉洞贴的是下层快照，默认打开会让人看到别的窗口文字叠在本窗口文字上，像"文字错位"。
+            // 想要视觉洞到列表里把透明度拉起来即可（会有提示）。
+            opacity: 0,
+            enabled: true,
+        });
+        true
+    });
+    if ok {
+        end_edit(overlay, true);
     }
-    st.regions.remove(i);
-    st.selected = if st.regions.is_empty() {
-        None
-    } else {
-        Some(i.min(st.regions.len() - 1))
-    };
-    true
 }
 
 unsafe fn redraw() {
@@ -837,6 +993,65 @@ fn mouse_xy(l: LPARAM) -> (i32, i32) {
     let x = (l.0 & 0xFFFF) as u16 as i16 as i32;
     let y = ((l.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
     (x, y)
+}
+
+unsafe fn draw_bar_button(
+    buf: &mut [u8],
+    mem: HDC,
+    w: i32,
+    h: i32,
+    r: (i32, i32, i32, i32),
+    label: &str,
+    selected: bool,
+    primary: bool,
+    enabled: bool,
+    hover: bool,
+    font: HFONT,
+) {
+    let (x0, y0, x1, y1) = (r.0, r.1, r.2.min(w), r.3.min(h));
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let bg = if !enabled {
+        (236, 238, 240)
+    } else if primary || selected {
+        (47, 194, 124)
+    } else if hover {
+        (236, 245, 240)
+    } else {
+        (255, 255, 255)
+    };
+    fill_rect(buf, w, x0, y0, x1, y1, bg, 255);
+    let edge = if primary || selected {
+        (39, 166, 105)
+    } else {
+        (210, 214, 220)
+    };
+    fill_rect(buf, w, x0, y0, x1, y0 + 1, edge, 255);
+    fill_rect(buf, w, x0, y1 - 1, x1, y1, edge, 255);
+    fill_rect(buf, w, x0, y0, x0 + 1, y1, edge, 255);
+    fill_rect(buf, w, x1 - 1, y0, x1, y1, edge, 255);
+    let color = if !enabled {
+        (150, 154, 160)
+    } else if primary || selected {
+        (255, 255, 255)
+    } else {
+        (40, 44, 50)
+    };
+    let mut rc = RECT {
+        left: x0,
+        top: y0,
+        right: x1,
+        bottom: y1,
+    };
+    draw_text(
+        mem,
+        label,
+        &mut rc,
+        color,
+        font,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
 }
 
 unsafe fn draw_editor(overlay: HWND) {
@@ -862,105 +1077,153 @@ unsafe fn draw_editor(overlay: HWND) {
     let old = SelectObject(mem, HGDIOBJ(dib.0));
     let buf = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
 
+    // 整块压暗；框内再擦亮，形成微信截图那种“选区亮、周围暗”的效果
     for px in buf.chunks_exact_mut(4) {
         px[0] = 0;
         px[1] = 0;
         px[2] = 0;
-        px[3] = 100;
+        px[3] = 118;
     }
 
-    let (regions, drawing, selected) = ES.with(|e| {
+    let (tool, pending, free, dragging, from, to, hover, regions) = ES.with(|e| {
         let st = e.borrow();
-        (st.regions.clone(), st.drawing.clone(), st.selected)
+        (
+            st.tool,
+            st.pending.clone(),
+            st.free.clone(),
+            st.dragging,
+            st.drag_from,
+            st.drag_to,
+            st.hover,
+            st.regions.clone(),
+        )
     });
 
-    for (i, r) in regions.iter().enumerate() {
+    // 已有蒙版：细灰框参考
+    for r in &regions {
         let pts: Vec<(i32, i32)> = r
             .pts
             .iter()
             .map(|(x, y)| ((x * w as f32) as i32, (y * h as f32) as i32))
             .collect();
-        let (rgb, fill) = if !r.enabled {
-            ((110, 110, 110), 18)
-        } else if r.invert {
-            ((76, 126, 220), 34)
-        } else {
-            ((47, 194, 124), 42)
-        };
-        let fa = ((fill as u32 * (10 + r.opacity as u32)) / 110) as u8;
-        fill_poly(buf, w, h, &pts, rgb, fa.max(8));
-        stroke_poly(buf, w, h, &pts, rgb, 2);
-        if selected == Some(i) {
-            stroke_poly(buf, w, h, &pts, (235, 180, 60), 3);
-        }
+        stroke_poly(buf, w, h, &pts, (128, 130, 136), 1);
     }
-    if !drawing.is_empty() {
-        let pts: Vec<(i32, i32)> = drawing
+
+    // 当前形状：已画好的 pending，或正在拖的实时预览
+    let live: Option<Vec<(f32, f32)>> = if let Some(p) = &pending {
+        Some(p.clone())
+    } else if dragging {
+        match tool {
+            Tool::Rect => Some(rect_norm(from.0, from.1, to.0, to.1, w, h)),
+            Tool::Ellipse => Some(ellipse_norm(from.0, from.1, to.0, to.1, w, h)),
+            Tool::Free => {
+                if free.len() >= 2 {
+                    Some(
+                        free.iter()
+                            .map(|(x, y)| normalize(*x, *y, w, h))
+                            .collect(),
+                    )
+                } else {
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(shape) = &live {
+        let pts: Vec<(i32, i32)> = shape
             .iter()
             .map(|(x, y)| ((x * w as f32) as i32, (y * h as f32) as i32))
             .collect();
-        stroke_open(buf, w, h, &pts, (255, 140, 70), 2);
+        if pts.len() >= 3 {
+            fill_poly(buf, w, h, &pts, (0, 0, 0), 0);
+            fill_poly(buf, w, h, &pts, (47, 194, 124), 44);
+        }
+        stroke_poly(buf, w, h, &pts, (47, 194, 124), 2);
     }
 
-    // 顶部提示条（两行）
-    fill_rect(buf, w, 0, 0, w, 56, (255, 255, 255), 248);
-    fill_rect(buf, w, 0, 54, w, 56, (226, 230, 235), 255);
+    // 顶部工具栏
+    let bar = bar_layout(w);
+    fill_rect(buf, w, 0, 0, w, bar.height, (250, 251, 252), 255);
+    fill_rect(
+        buf,
+        w,
+        0,
+        bar.height - 1,
+        w,
+        bar.height,
+        (214, 218, 224),
+        255,
+    );
 
     let font = create_font(13, 700);
     let font_small = create_font(11, 400);
-    let mut rc = RECT {
-        left: 14,
-        top: 4,
-        right: w - 14,
-        bottom: 28,
-    };
-    draw_text(
-        mem,
-        "拖动画选区 · Tab 选择 · I 反向 · [ ] 透明度 · Enter 保存 · Backspace/Delete 删 · Esc 取消",
-        &mut rc,
-        (30, 30, 30),
-        font,
-        DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+    for (i, r) in bar.tools.iter().enumerate() {
+        draw_bar_button(
+            buf,
+            mem,
+            w,
+            h,
+            *r,
+            ["矩形", "椭圆", "自由"][i],
+            tool.index() == i,
+            false,
+            true,
+            hover == 1 + i as u8,
+            font,
+        );
+    }
+    let has_pending = pending.is_some();
+    draw_bar_button(
+        buf, mem, w, h, bar.redraw, "重画", false, false, true, hover == 6, font,
     );
-    let info = if let Some(i) = selected {
-        let r = &regions[i];
-        format!(
-            "第 {}/{} 个 · {} · 透明度 {}%",
-            i + 1,
-            regions.len(),
-            if r.invert { "反向（圈内保留、圈外穿透）" } else { "洞（圈内穿透）" },
-            r.opacity
-        )
-    } else if regions.is_empty() {
-        "还没有选区，拖动画一圈".to_string()
-    } else {
-        format!("共 {} 个选区 · Tab 选择一个", regions.len())
-    };
-    let mut rc = RECT {
-        left: 14,
-        top: 28,
-        right: w - 14,
-        bottom: 52,
-    };
-    draw_text(
+    draw_bar_button(
+        buf, mem, w, h, bar.cancel, "取消", false, false, true, hover == 5, font,
+    );
+    draw_bar_button(
+        buf,
         mem,
-        &info,
-        &mut rc,
-        (105, 110, 116),
-        font_small,
-        DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+        w,
+        h,
+        bar.ok,
+        "确定",
+        false,
+        true,
+        has_pending,
+        hover == 4,
+        font,
     );
 
-    for y in 0..56.min(h) {
-        let row = (y * w) as usize;
-        for x in 0..w {
-            buf[(row + x as usize) * 4 + 3] = 255;
-        }
+    if bar.redraw.0 - 232 > 100 {
+        let mut rc = RECT {
+            left: 224,
+            top: 8,
+            right: bar.redraw.0 - 8,
+            bottom: 40,
+        };
+        draw_text(
+            mem,
+            "框内 = 点透（洞） · 框外仍可操作 · Enter 确定 · Esc 取消",
+            &mut rc,
+            (95, 100, 106),
+            font_small,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+        );
     }
 
     let _ = SelectObject(mem, GetStockObject(DEFAULT_GUI_FONT));
     let _ = DeleteObject(HGDIOBJ(font.0));
     let _ = DeleteObject(HGDIOBJ(font_small.0));
+
+    // GDI 画文字不写 alpha（文字像素 alpha 会变成 0，分层窗口里就是"透明的字"）。
+    // 工具栏是整块不透明底，直接把这行 alpha 补满。
+    for y in 0..bar.height.min(h) {
+        let row = (y * w) as usize;
+        for x in 0..w {
+            buf[(row + x as usize) * 4 + 3] = 255;
+        }
+    }
 
     let pos = POINT { x: cx, y: cy };
     let size = SIZE { cx: w, cy: h };
@@ -1070,6 +1333,7 @@ unsafe extern "system" fn visual_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             if target != 0 {
                 capture_visual(hwnd, target);
             }
+            VISUAL_SEQ.fetch_add(1, Ordering::Relaxed);
             LRESULT(0)
         }
         WM_VISUAL_MASK => {
@@ -1117,7 +1381,7 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
                 .map(|(_, r)| r.clone())
         })
         .unwrap_or_default();
-    if regions.iter().all(|r| r.opacity == 0) || regions.is_empty() {
+    if regions.is_empty() {
         VS.with(|v| *v.borrow_mut() = VisualState::default());
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
@@ -1132,6 +1396,26 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
         return;
     };
     let was_foreground = GetForegroundWindow() == hwnd;
+
+    // 主界面也不能出现在洞里：抓下层快照前先把它藏起来，抓到干净的桌面/下层窗口。
+    // 只在主界面确实压在目标客户区上时才藏，避免目标窗口拖动时反复闪主界面。
+    let root = crate::main_window_handle();
+    let root_hwnd = HWND(root as *mut _);
+    let mut main_hidden = false;
+    let mut main_was_foreground = false;
+    if root != 0 && IsWindowVisible(root_hwnd).as_bool() && !IsIconic(root_hwnd).as_bool() {
+        let mut rr = RECT::default();
+        if GetWindowRect(root_hwnd, &mut rr).is_ok()
+            && rr.left < cx + w
+            && rr.right > cx
+            && rr.top < cy + h
+            && rr.bottom > cy
+        {
+            main_was_foreground = GetForegroundWindow() == root_hwnd;
+            let _ = ShowWindow(root_hwnd, SW_HIDE);
+            main_hidden = true;
+        }
+    }
 
     let _ = ShowWindow(overlay, SW_HIDE);
     let _ = ShowWindow(hwnd, SW_HIDE);
@@ -1170,6 +1454,12 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
     if was_foreground {
         let _ = SetForegroundWindow(hwnd);
     }
+    if main_hidden {
+        let _ = ShowWindow(root_hwnd, SW_SHOW);
+        if main_was_foreground {
+            let _ = SetForegroundWindow(root_hwnd);
+        }
+    }
 
     let Some(snapshot) = snapshot else {
         let _ = ShowWindow(overlay, SW_HIDE);
@@ -1190,11 +1480,18 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
 }
 
 unsafe fn follow_visual(overlay: HWND) {
-    let (target, rect, w, h, has_snapshot) = VS.with(|v| {
+    let (target, rect, w, h, has_snapshot, has_visual) = VS.with(|v| {
         let st = v.borrow();
-        (st.target, st.rect, st.w, st.h, st.snapshot.is_some())
+        (
+            st.target,
+            st.rect,
+            st.w,
+            st.h,
+            st.snapshot.is_some(),
+            st.regions.iter().any(|r| r.enabled && r.opacity > 0),
+        )
     });
-    if target == 0 || !has_snapshot {
+    if target == 0 || !has_snapshot || !has_visual {
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
     }
@@ -1374,12 +1671,6 @@ fn fill_poly(buf: &mut [u8], w: i32, h: i32, pts: &[(i32, i32)], rgb: (u8, u8, u
                 blend_px(buf, w, x, y, rgb, a);
             }
         }
-    }
-}
-
-fn stroke_open(buf: &mut [u8], w: i32, h: i32, pts: &[(i32, i32)], rgb: (u8, u8, u8), t: i32) {
-    for pair in pts.windows(2) {
-        line(buf, w, h, pair[0], pair[1], rgb, t);
     }
 }
 

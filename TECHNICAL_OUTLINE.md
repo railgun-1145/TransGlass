@@ -108,12 +108,15 @@
 
 ### 4.6 自由形状点透选区（`regions.rs`）
 - **数据**：`Mutex<Vec<(hwnd, Vec<Region>)>>`，`Region { pts, invert, opacity }`；多边形按**客户区归一化 0..1**保存。每圈 `invert=false` 表示圈内是洞，`true` 表示圈内保留、客户区补集是洞；点击穿透 = 所有圈 mask 的并集（与透明度无关）。
-- **编辑器（2.18.0 起改直出）**：主界面右侧 `SidePanel::right("ps_panel")` → `App::ps_selection_panel(&mut self, ui, ctx)`：顶部 `self.thumbnail(ctx, target)` 拿目标窗口缩略图，`allocate_exact_size(canvas, Sense::click_and_drag())` 当画布，按住左键拖动把**归一化客户区坐标** push 进 `self.ps_points`；松开后出现「完成 / 取消」，点「完成」才 `regions::set_regions(target, all)`（列表/点击穿透/透明洞立刻生效）并把选中条设成新的那条，「取消」清空草稿。`ps_target` 记草稿属于哪个窗口，目标一换就作废。**缩略图是整窗、蒙版坐标按客户区归一化**：画之前用 `client_box_in_window()`（GetWindowRect + GetClientRect + `Gdi::ClientToScreen`）算客户区相对整窗的偏移（`ClientToScreen` 在 `Win32::Graphics::Gdi` 下，不在 WindowsAndMessaging）。列表每行 56×36 小预览复用同一个 `TextureHandle` + `paint_mask_on_thumb()`（≥3 点填充、2 点画线），点行会选中并把大缩略图上那条蒙版画成金框。
-- **旧全屏覆盖层编辑器**（`regions::open_editor/open_editor_at`）技术上还在（`editor_thread` + `editor_proc`，快捷键/键盘操作那套也在），但 2.18.0 起**所有界面入口都移除了**：右侧面板的「编辑当前蒙版/新建蒙版」、`selection_controls_ui` 右键子菜单、左侧窗口树子项都改成 `crate::show_root_window()` 打开主界面右侧面板。入口删干净后这两个函数只剩 `#[allow(dead_code)]`，留给后续「快捷键唤起老编辑器」。
+- **编辑器（2.19.0：窗口上直接画）**：`regions.rs` 的覆盖层线程 + `EditState` 重写成"画图式"：目标窗口客户区上一块压暗的 layered 覆盖层（`WS_EX_LAYERED|TOOLWINDOW|TOPMOST`），顶部 `bar_layout()` 算工具栏矩形（窗口窄时动作按钮换到第二行）、`hit_bar()` 命中。工具三个：矩形 / 椭圆（48 点）/ 自由（鼠标轨迹），拖出的形状存 `pending`（归一化客户区坐标），实时画成绿色高亮（`fill_poly` 先擦掉压暗再上绿色）。「确定」= `confirm_edit` 追加一个 `Region` → `end_edit(save=true)` → `set_regions`（同步 `refresh_visual_wait` 等下层快照抓完，再 `crate::show_root_after_overlay()` 把主界面放回来）。「重画/取消/Enter/Esc/Backspace」都在编辑器里处理。
+- **画布干净**：`begin_edit` 先 `crate::hide_root_for_overlay()` 把主界面藏起来（`end_edit` 再 `show_root_after_overlay()`），所以画的时候不会被主界面挡、抓下层快照也不会把主界面拍进去。
+- **右侧面板只做预览**：`SidePanel::right("ps_panel")` → `ps_selection_panel`（外层 `ScrollArea` + `ps_panel_body`）：目标缩略图 + 蒙版高亮 + 「在窗口上画选区」按钮 + 蒙版列表（56×36 小预览、眼睛/反向/透明度/删除）。缩略图是整窗、蒙版按客户区归一化，画高亮用 `client_box_in_window()`（GetWindowRect + GetClientRect + `Gdi::ClientToScreen`）补偏移（`ClientToScreen` 在 `Win32::Graphics::Gdi` 下）。
 - **点击穿透**：`mouse_hook_proc` 每条鼠标消息在 `hit_root_at` **之前**调 `regions::enforce_at`；对每个有选区的窗口，鼠标在客户区内且命中任一 `region_contains` 时给窗口加 `WS_EX_TRANSPARENT`，出洞/离开恢复。点透会话窗口 / 整窗点透窗口跳过。
-- **真·透明洞**：`regions_visual` 线程维护一个置顶、`WS_EX_TRANSPARENT|WS_EX_NOACTIVATE` 的分层覆盖层；刷新时 `SW_HIDE` 目标 → 屏幕 BitBlt 出客户区下方快照 → `SW_SHOW`；按每像素「包含该点的圈的最大透明度」写快照 alpha。只在该窗口是前台时显示。
-- **窗动洞动**：`follow_visual()` 每 150ms 读目标窗口矩形，**变了就直接 `refresh_visual(target)`**（重抓下层快照 + 重画覆盖层），洞跟着窗口走、像在布上开了个洞；以前是 `ShowWindow(SW_HIDE)` 等用户手动刷新。注意 `refresh_visual` 内部会 `SW_HIDE` 目标再 BitBlt，拖动时覆盖层会抖一帧；要真·丝滑跟随得改成"只挪覆盖层 + 复用旧快照"。
-- **入口**：主界面窗口卡片右键 / 左侧窗口行右键 →「选中控制」子菜单里的「在右侧面板圈蒙版」= `select_window_for_control(hwnd)` + `show_root_window()`；左侧树子项里同款按钮。菜单里仍有「刷新透明洞画面 / 清空选区」。`regions::open_editor(hwnd)` / `refresh_visual(hwnd)` 走 `PostMessage` 叫对应线程。
+- **视觉洞默认关**：`Region.opacity` 新建默认 **0**（只点透、不改外观）。`apply_regions` 即使透明度 0 也会抓一张下层快照存进 `VS`；之后 `update_region` 拉透明度只发 `WM_VISUAL_MASK` 重画 mask，不重抓（`follow_visual` 里 `has_visual = 有 enabled && opacity>0` 才显示覆盖层）。这样默认不会出现"下层窗口文字叠在本窗口文字上"的错位观感。
+- **真·透明洞**：`regions_visual` 线程维护置顶、`WS_EX_TRANSPARENT|WS_EX_NOACTIVATE` 的覆盖层；刷新时先藏主界面（**只在与目标客户区有交集时才藏**，避免目标拖动时主界面反复闪）、再藏目标、BitBlt 出客户区下层快照、恢复，然后按每像素「包含该点的启用圈的最大透明度」写快照 alpha。只在该窗口前台时显示。
+- **窗动洞动**：`follow_visual()` 每 150ms 读目标窗口矩形，**变了就直接 `refresh_visual(target)`**（重抓下层快照 + 重画覆盖层），洞跟着窗口走；以前是 `ShowWindow(SW_HIDE)` 等用户手动刷新。注意 `refresh_visual` 内部会 `SW_HIDE` 目标再 BitBlt，拖动时覆盖层会抖一帧；要真·丝滑跟随得改成"只挪覆盖层 + 复用旧快照"。
+- **入口**：面板「在窗口上画选区」= `regions::open_editor(target)`；卡片/左侧树子项/右键「选中控制」子菜单里的同款入口都直接 `select_window_for_control(hwnd)` + `regions::open_editor(hwnd)`。菜单里仍有「刷新透明洞画面 / 清空选区」。
+- **坑**：① GDI 文字画在 layered 窗口的 DIB 上不写 alpha（文字像素 alpha=0 → 变成"透明的字"），画完工具栏必须把工具栏整行 alpha 补 255；② 不要在编辑器里省掉"先藏主界面"，否则透明洞里会出现主界面文字；③ `Editor` 只接收自己窗口的鼠标消息，工具栏命中用客户区坐标，别用屏幕坐标。
 - **坑（2.18.0 新发现）**：`mouse_hook_proc` 里 `hit_root_at` 的 `HIT_CACHE` 按"点在矩形内"直接命中，点击主界面面板时会被上次点过的大窗口矩形抢走，导致 `TARGET_HWND` 跳到后面那个窗口、蒙版画到别处。点击落点必须用 `hit_root_at_fresh`（不吃缓存）；鼠标移动仍可用缓存。
 - **坑**：hook 的 fast-path 必须加 `regions::has_any()`，否则无单设备点透/注册表为空时提前返回，选区完全不生效；`UpdateLayeredWindow` 前不能把 DIB 从 mem DC 取消选中（否则 0x8007001F、窗口全透明）；窗口别用 0×0 创建；`SetWindowRgn` 会裁画面，不能用；任意窗口做不了逐像素 alpha，视觉洞只能靠下层快照覆盖层。
 - **限制**：快照静态（下方变了要刷新）；覆盖层只跟前台目标；选区只存内存；没有顶点编辑/持久化。
@@ -125,10 +128,11 @@
 - **右键子菜单**：`selection_controls_ui` 放进 `window_menu` 和左侧窗口行的右键菜单；内容：标记文字/颜色、显示选中框、逐圈反向/透明度/删除、编辑/清空/刷新透明洞。
 - **左侧树子项**：`nav_windows` 里对 TARGET/有选区的窗口挂 `CollapsingHeader`，展开调 `self.window_card`（窗口卡片，缩略图/状态/透明度），再点收起；`sel_set` 一次算出。
 - **关闭清理**：`selection_cleanup()` 在 `refresh_window_list` 每帧跑，TARGET 无效置 0，`regions::prune`/`selection::prune` 清无效窗口。
-- **右侧 PS 面板**：`SidePanel::right("ps_panel")`（固定 256 宽）→ `App::ps_selection_panel(&mut self, ui, ctx)`；顶部目标缩略图直接圈蒙版（详见 4.6），列表每行 56×36 小预览 + 眼睛启用/停用、反向、透明度、删除；`update_region` 只走 `WM_VISUAL_MASK`（不重抓下层快照），`set_regions` 才 `refresh_visual`。**不要把画布放进 `ScrollArea`**（拖动会被滚动抢走）。
+- **右侧 PS 面板**：`SidePanel::right("ps_panel")`（固定 256 宽）→ `ps_selection_panel`（`ScrollArea` + `ps_panel_body`）；顶部目标缩略图只做**预览**（不在这里画），按钮「在窗口上画选区」→ `regions::open_editor(target)`；列表每行 56×36 小预览 + 眼睛启用/停用、反向、透明度、删除；`update_region` 只走 `WM_VISUAL_MASK`（不重抓下层快照），编辑结束 `set_regions` 才同步重抓。面板没有拖动交互，所以可以安心套 `ScrollArea`。
 - **最小化残留**：主程序最小化时右侧面板跟着主窗口一起最小化，不再有独立覆盖层要藏；旧全屏编辑器（若以后用快捷键唤起）仍有 `WM_TIMER` 200ms 查 `main_window_handle()` 的隐藏逻辑。
 - **悬浮球气泡**：`BUBBLE_HWND` 独立 layered 窗口，`bubble_render` 画 **MC 网易版聊天框**——深色半透明底（`BUBBLE_BG (8,8,10)`，alpha 0.86）+ 外 2px 纯黑 + 内 1px 深灰像素边框 + 阶梯像素尾巴，文字用 `draw_chat_label`（白字 + 右下 1px 纯黑投影，靠"补 alpha"那步把文字阴影像素补成不透明；四向描边在小字号 CJK 上会糊，别用）；`WM_BALL_BUBBLE` 触发，**1800ms 保持、1800..2300 用 `SourceConstantAlpha` 渐隐、2300 隐藏**。`ball_bubble()` 在 `TARGET_HWND` 变化/`set_target_window` 后调用。
-- **多蒙版**：面板「完成」时 `st.regions.push(...)` 追加，每个封闭选区一个独立蒙版；点透/视觉取所有启用蒙版的并集。
+- **多蒙版**：编辑器「确定」时 `st.regions.push(...)` 追加，每个封闭图形一个独立蒙版；点透/视觉取所有启用蒙版的并集。新蒙版 `opacity` 默认 0（只点透、不改外观），要视觉洞手动拉透明度。
+- **气泡可点击（2.19.0）**：气泡去掉 `WS_EX_TRANSPARENT`，`bubble_proc` 处理 `WM_LBUTTONUP` → `crate::show_root_window()` + `bubble_hide()`，`WM_SETCURSOR` 换手型；保留 `WS_EX_NOACTIVATE`（不抢焦点）。第三行提示改成「点这里打开主界面」。
 - **气泡位置/渐隐/互斥**：`bubble_pos()` 放球正上方（球中心 - 42 - BUBBLE_H - 6）；`BUBBLE_SHOWN_AT` + 30ms `WM_TIMER`；`select_window_for_control` 不再开面板，`ball_set_expanded(true)` 里 `bubble_hide()`，`bubble_show` 遇 `BALL_EXPANDED` 直接返回，保证气泡和面板互斥。**拖动时立刻收起**：`ball_proc` 的 `WM_MOUSEMOVE` 里 `BALL_DRAGGING && BALL_MOVED` → `bubble_hide()`；`draw_titlebar` 的 `resp.dragged()` 也 `bubble_hide()`。
 - **气泡被重置的坑**：`spawn_device_tracking_ticker` 每 150ms 同步前台窗口当目标，**只能在目标真变化时才 `ball_bubble()`**（用 `TARGET_HWND.swap(v) != v` 判断）。之前无条件调用，气泡时间戳一直刷新，1.8s/3.2s 渐隐永远走不到（表现为气泡一直挂在屏幕上）。
 - **选区联动**：卡片的 `regions::update_region/remove_region` 走 `WM_VISUAL_MASK` 只重画覆盖层 mask，保留已抓的下层快照；编辑/保存才 `refresh_visual` 重新抓。
