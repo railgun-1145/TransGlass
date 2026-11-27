@@ -141,10 +141,23 @@ fn perf_dump() {
 static HIT_CACHE: std::sync::Mutex<Option<(isize, i32, i32, i32, i32)>> = std::sync::Mutex::new(None);
 
 unsafe fn hit_root_at(x: i32, y: i32) -> Option<HWND> {
-    if let Ok(cache) = HIT_CACHE.lock() {
-        if let Some((h, l, t, r, b)) = *cache {
-            if h != 0 && x >= l && x < r && y >= t && y < b {
-                return Some(HWND(h as *mut _));
+    hit_root_at_ex(x, y, true)
+}
+
+/// 点击落点用这个：不吃缓存。
+/// 缓存只按"矩形包含点"命中，可上次点过的大窗口（比如铺满屏幕的 PS）矩形会把之后
+/// 落在**主界面面板**上的点击也算成它，右侧面板一圈蒙版目标就跳到别的窗口去了。
+unsafe fn hit_root_at_fresh(x: i32, y: i32) -> Option<HWND> {
+    hit_root_at_ex(x, y, false)
+}
+
+unsafe fn hit_root_at_ex(x: i32, y: i32, use_cache: bool) -> Option<HWND> {
+    if use_cache {
+        if let Ok(cache) = HIT_CACHE.lock() {
+            if let Some((h, l, t, r, b)) = *cache {
+                if h != 0 && x >= l && x < r && y >= t && y < b {
+                    return Some(HWND(h as *mut _));
+                }
             }
         }
     }
@@ -406,8 +419,12 @@ fn spawn_device_tracking_ticker() {
         unsafe {
             let fg = GetForegroundWindow();
             if !fg.0.is_null() && !is_own_hwnd(fg) && !is_shell_hwnd(fg) {
-                TARGET_HWND.store(fg.0 as isize, Ordering::Relaxed);
-                ball_bubble();
+                // 只有目标真变了才弹气泡：之前这里每 150ms 无条件 ball_bubble()，
+                // 气泡时间戳一直被重置，1.8s 渐隐永远走不到（旧版 3.2s 也长到看不出来）。
+                let v = fg.0 as isize;
+                if TARGET_HWND.swap(v, Ordering::Relaxed) != v {
+                    ball_bubble();
+                }
             }
         }
         perf_dump();
@@ -914,7 +931,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
         // 记录"最后点过的非自身窗口"，供悬浮球当遥控目标
         if msg == WM_LBUTTONDOWN {
-            if let Some(root) = hit_root_at(info.pt.x, info.pt.y) {
+            if let Some(root) = hit_root_at_fresh(info.pt.x, info.pt.y) {
                 if !is_own_hwnd(root) && !is_shell_hwnd(root) {
                     TARGET_HWND.store(root.0 as isize, Ordering::Relaxed);
                     ball_bubble();
@@ -1559,6 +1576,12 @@ struct TransGlassApp {
     selected: Option<isize>,
     settings_open: bool,
     ps_selected: usize,
+    /// 正在右侧面板的缩略图上圈蒙版
+    ps_draw: bool,
+    /// 正在圈的草稿点（归一化客户区坐标 0..1）
+    ps_points: Vec<(f32, f32)>,
+    /// 草稿属于哪个窗口；目标一换就作废
+    ps_target: isize,
     /// 设置页当前分类
     settings_tab: usize,
     /// 设置页淡入起点（切分类/刚打开时重置）
@@ -1690,6 +1713,9 @@ impl TransGlassApp {
             selected: None,
             settings_open: std::env::var_os("TRANSGLASS_OPEN_SETTINGS").is_some(),
             ps_selected: 0,
+            ps_draw: false,
+            ps_points: Vec::new(),
+            ps_target: 0,
             settings_tab: 0,
             settings_fade: None,
             mini_mode: false,
@@ -1936,8 +1962,9 @@ impl TransGlassApp {
                                     if ui.button("选中并显示").clicked() {
                                         crate::select_window_for_control(*hwnd);
                                                                     }
-                                    if ui.button("编辑当前蒙版").clicked() {
-                                        crate::regions::open_editor(*hwnd);
+                                    if ui.button("圈蒙版（右侧面板）").clicked() {
+                                        crate::select_window_for_control(*hwnd);
+                                        crate::show_root_window();
                                     }
                                     if ui.button("清空蒙版").clicked() {
                                         crate::regions::clear(*hwnd);
@@ -3273,7 +3300,7 @@ impl eframe::App for TransGlassApp {
             .resizable(false)
             .default_width(256.0)
             .show(ctx, |ui| {
-                ps_selection_panel(ui, &mut self.ps_selected);
+                self.ps_selection_panel(ui, ctx);
             });
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.mini_mode {
@@ -4938,155 +4965,113 @@ unsafe fn control_window(hwnd: HWND) {
     set_window_alpha(hwnd, 230);
 }
 
-fn ps_selection_panel(ui: &mut egui::Ui, selected: &mut usize) {
-    let target = crate::current_target();
-    let all = crate::regions::snapshot_all();
-    let regions = all
-        .iter()
-        .find(|(h, _)| *h == target)
-        .map(|(_, r)| r.clone())
-        .unwrap_or_default();
-    ui.label(
-        egui::RichText::new("蒙版 / 点透")
-            .font(font_title(16.0))
-            .color(TEXT_PRIMARY),
+/// 缩略图等比居中：在 outer 里放一张 size 比例的画面（不拉伸）
+fn fit_rect(outer: egui::Rect, size: egui::Vec2) -> egui::Rect {
+    if size.x <= 0.5 || size.y <= 0.5 || outer.width() <= 0.5 || outer.height() <= 0.5 {
+        return outer;
+    }
+    let s = (outer.width() / size.x).min(outer.height() / size.y);
+    egui::Rect::from_center_size(outer.center(), egui::vec2(size.x * s, size.y * s))
+}
+
+/// 目标窗口里客户区相对整窗的位置和大小（物理像素）。
+/// 缩略图截的是整窗（含标题栏/边框），而蒙版坐标按客户区归一化，
+/// 画到缩略图上要先把这个偏移补回来，圈的位置和真正生效的洞才对得上。
+unsafe fn client_box_in_window(hwnd: isize) -> Option<(f32, f32, f32, f32)> {
+    let win = HWND(hwnd as *mut _);
+    let mut wr = RECT::default();
+    if GetWindowRect(win, &mut wr).is_err() {
+        return None;
+    }
+    let mut cr = RECT::default();
+    if GetClientRect(win, &mut cr).is_err() {
+        return None;
+    }
+    let cw = (cr.right - cr.left) as f32;
+    let ch = (cr.bottom - cr.top) as f32;
+    if cw <= 1.0 || ch <= 1.0 {
+        return None;
+    }
+    let mut pt = POINT::default();
+    if !windows::Win32::Graphics::Gdi::ClientToScreen(win, &mut pt).as_bool() {
+        return None;
+    }
+    Some(((pt.x - wr.left) as f32, (pt.y - wr.top) as f32, cw, ch))
+}
+
+/// 归一化客户区坐标 → 缩略图上的点。thumb 是整窗画面在界面上的矩形。
+fn thumb_point(
+    thumb: egui::Rect,
+    win: egui::Vec2,
+    cb: (f32, f32, f32, f32),
+    nx: f32,
+    ny: f32,
+) -> egui::Pos2 {
+    let sx = thumb.width() / win.x.max(1.0);
+    let sy = thumb.height() / win.y.max(1.0);
+    let cw = cb.2.max(1.0);
+    let ch = cb.3.max(1.0);
+    egui::pos2(
+        thumb.left() + (cb.0 + nx * cw) * sx,
+        thumb.top() + (cb.1 + ny * ch) * sy,
+    )
+}
+
+/// 蒙版在面板里的配色：(填充, 描边, 线宽)。选中的那条用金色框标出来。
+fn mask_style(r: &crate::regions::Region, selected: bool) -> (egui::Color32, egui::Color32, f32) {
+    let base = if !r.enabled {
+        // 眼睛关掉：灰
+        egui::Color32::from_rgb(0x96, 0x9B, 0xA3)
+    } else if r.invert {
+        // 反向（保留区）：蓝
+        egui::Color32::from_rgb(0x46, 0x82, 0xDC)
+    } else {
+        // 洞：绿
+        egui::Color32::from_rgb(0x2F, 0xC2, 0x7C)
+    };
+    let line = if selected {
+        egui::Color32::from_rgb(0xF0, 0xAA, 0x28)
+    } else {
+        base
+    };
+    let fill = egui::Color32::from_rgba_unmultiplied(
+        line.r(),
+        line.g(),
+        line.b(),
+        if selected { 64 } else { 34 },
     );
-    ui.add_space(4.0);
-    if target == 0 && regions.is_empty() {
-        ui.label(
-            egui::RichText::new("右键窗口卡片/左侧窗口，或右键悬浮球选中窗口后，这里显示选区和蒙版图层")
-                .small()
-                .weak(),
-        );
+    (fill, line, if selected { 2.4 } else { 1.2 })
+}
+
+/// 把一组归一化点画到缩略图上（≥3 点填充 + 描边，2 点画线）
+fn paint_mask_on_thumb(
+    painter: &egui::Painter,
+    pts: &[(f32, f32)],
+    thumb: egui::Rect,
+    win: egui::Vec2,
+    cb: (f32, f32, f32, f32),
+    fill: egui::Color32,
+    line: egui::Color32,
+    width: f32,
+) {
+    if pts.len() < 2 {
         return;
     }
-    let hwnd = HWND(target as *mut _);
-    let app = unsafe { cached_app_name(hwnd) };
-    let win_title = unsafe { get_window_title(hwnd) };
-    ui.label(egui::RichText::new(format!("{app}  ·  {win_title}")).size(12.0).weak());
-    ui.add_space(4.0);
-
-    let (tag, color) = crate::selection::mark_for(target).unwrap_or_else(|| {
-        (if app.trim().is_empty() { "窗口".to_string() } else { app.clone() }, (47u8, 194u8, 124u8))
-    });
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("标记").small().weak());
-        let mut edit = tag.clone();
-        if ui
-            .add(egui::TextEdit::singleline(&mut edit).desired_width(110.0))
-            .changed()
-        {
-            crate::selection::set_mark(target, edit, color);
-        }
-        for c in [
-            (47u8, 194u8, 124u8),
-            (70u8, 130u8, 220u8),
-            (240u8, 150u8, 60u8),
-            (180u8, 80u8, 200u8),
-        ] {
-            let btn = egui::Button::new(
-                egui::RichText::new("●").color(egui::Color32::from_rgb(c.0, c.1, c.2)),
-            )
-            .frame(false);
-            if ui.add(btn).clicked() {
-                crate::selection::set_mark(target, tag.clone(), c);
-            }
-        }
-    });
-    ui.separator();
-    ui.label(egui::RichText::new("蒙版列表").small().strong());
-    if regions.is_empty() {
-        ui.label(egui::RichText::new("还没有蒙版").small().weak());
+    let screen: Vec<egui::Pos2> = pts
+        .iter()
+        .map(|(x, y)| thumb_point(thumb, win, cb, *x, *y))
+        .collect();
+    if screen.len() >= 3 {
+        painter.add(egui::Shape::convex_polygon(
+            screen,
+            fill,
+            egui::Stroke::new(width, line),
+        ));
     } else {
-        if *selected >= regions.len() {
-            *selected = regions.len() - 1;
-        }
-        for (i, r) in regions.iter().enumerate() {
-            let is_sel = i == *selected;
-            let bg = if is_sel {
-                egui::Color32::from_rgb(0xE8, 0xF7, 0xEE)
-            } else {
-                egui::Color32::TRANSPARENT
-            };
-            let f = egui::Frame::none()
-                .fill(bg)
-                .rounding(6.0)
-                .inner_margin(egui::Margin::symmetric(4.0, 3.0));
-            f.show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let mut en = r.enabled;
-                    if ui
-                        .checkbox(&mut en, "")
-                        .on_hover_text("眼睛：启用/停用这个圈")
-                        .changed()
-                    {
-                        crate::regions::update_region(target, i, None, None, Some(en));
-                    }
-                    let name = format!("蒙版 {}  {}", i + 1, if r.invert { "反向" } else { "洞" });
-                    if ui.selectable_label(is_sel, egui::RichText::new(name).size(12.0)).clicked() {
-                        *selected = i;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("×").clicked() {
-                            crate::regions::remove_region(target, i);
-                        }
-                        ui.label(egui::RichText::new(format!("{}%", r.opacity)).small().weak());
-                    });
-                });
-            });
-        }
-    }
-    ui.separator();
-    if let Some(r) = regions.get(*selected) {
-        ui.label(egui::RichText::new("属性").small().strong());
-        let mut inv = r.invert;
-        if ui.checkbox(&mut inv, "反向（圈内保留、圈外穿透）").changed() {
-            crate::regions::update_region(target, *selected, Some(inv), None, None);
-        }
-        let mut op = r.opacity as i32;
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("透明度").small().weak());
-            if ui
-                .add(egui::Slider::new(&mut op, 0..=100).suffix("%"))
-                .changed()
-            {
-                crate::regions::update_region(target, *selected, None, Some(op as u8), None);
-            }
-        });
-    }
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        if ui.button("编辑当前蒙版").clicked() {
-            crate::regions::open_editor_at(target, Some(*selected));
-        }
-        if ui.button("新建蒙版").clicked() {
-            crate::regions::open_editor_at(target, None);
-        }
-    });
-    ui.horizontal(|ui| {
-        if ui.button("清空蒙版").clicked() {
-            crate::regions::clear(target);
-        }
-        if ui.button("刷新透明洞").clicked() {
-            crate::regions::refresh_visual(target);
-        }
-    });
-    ui.separator();
-    if let Some(st) = GLOBAL_REGISTRY.get(&target) {
-        let pct = (st.current_alpha as f32 / 255.0 * 100.0).round();
-        ui.label(
-            egui::RichText::new(format!(
-                "窗口：透明度 {}% · 置顶 {} · 鼠标点透 {} · 笔点透 {}",
-                pct,
-                if st.user_pref_topmost { "开" } else { "关" },
-                if st.mouse_passthrough { "开" } else { "关" },
-                if st.pen_passthrough { "开" } else { "关" }
-            ))
-            .small()
-            .weak(),
-        );
-    } else {
-        ui.label(egui::RichText::new("窗口未管理（右键卡片可控制）").small().weak());
+        painter.add(egui::Shape::closed_line(
+            screen,
+            egui::Stroke::new(width, line),
+        ));
     }
 }
 
@@ -5170,12 +5155,13 @@ fn selection_controls_ui(ui: &mut egui::Ui, hwnd: isize) {
         }
     }
     ui.horizontal(|ui| {
-        if ui.button("编辑当前蒙版").clicked() {
-            crate::regions::open_editor(hwnd);
-            ui.close_menu();
-        }
-        if ui.button("新建蒙版").clicked() {
-            crate::regions::open_editor_at(hwnd, None);
+        if ui
+            .button("在右侧面板圈蒙版")
+            .on_hover_text("打开主界面，在「蒙版 / 点透」面板的缩略图上直接圈")
+            .clicked()
+        {
+            crate::select_window_for_control(hwnd);
+            crate::show_root_window();
             ui.close_menu();
         }
         if ui.button("清空选区").clicked() {
@@ -5440,6 +5426,10 @@ const WM_BALL_POPUP: u32 = WM_APP + 0x5A;
 const WM_BALL_BUBBLE: u32 = WM_APP + 0x5B;
 const BUBBLE_W: i32 = 260;
 const BUBBLE_H: i32 = 112;
+/// MC 网易版聊天框配色：深色半透明底 + 深灰像素边框 + 白字黑影
+const BUBBLE_BG: (u8, u8, u8) = (8, 8, 10);
+const BUBBLE_EDGE: (u8, u8, u8) = (62, 62, 70);
+const BUBBLE_BG_A: f32 = 0.86;
 static BALL_REQ_MINI: AtomicBool = AtomicBool::new(false);
 static BALL_REQ_RESTORE: AtomicBool = AtomicBool::new(false);
 /// 面板上的状态变了（输入模式 / Alt 会话状态 / 目标窗口）时，叫 ticker 重画一次，
@@ -5805,6 +5795,39 @@ unsafe fn draw_mc_label(
     let flags = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
     let mut v: Vec<u16> = text.encode_utf16().collect();
     let _ = SetTextColor(mem, COLORREF(0x003F_3F3F));
+    let mut sr = RECT {
+        left: r.0 + 1,
+        top: r.1 + 1,
+        right: r.2 + 1,
+        bottom: r.3 + 1,
+    };
+    let _ = DrawTextW(mem, &mut v, &mut sr, flags);
+    let c = (color.0 as u32) | ((color.1 as u32) << 8) | ((color.2 as u32) << 16);
+    let _ = SetTextColor(mem, COLORREF(c));
+    let mut tr = RECT {
+        left: r.0,
+        top: r.1,
+        right: r.2,
+        bottom: r.3,
+    };
+    let _ = DrawTextW(mem, &mut v, &mut tr, flags);
+}
+
+/// MC 网易版聊天框的白字：正文 + 四向 1px 纯黑暗影（游戏里白字带黑边的观感）。
+/// 阴影用纯黑：后面"补 alpha"那一步会把 rgb 非零但 alpha=0 的阴影像素补成不透明。
+unsafe fn draw_chat_label(
+    mem: windows::Win32::Graphics::Gdi::HDC,
+    text: &str,
+    r: (i32, i32, i32, i32),
+    color: (u8, u8, u8),
+) {
+    use windows::Win32::Graphics::Gdi::{
+        DrawTextW, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
+    };
+    let flags = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
+    let mut v: Vec<u16> = text.encode_utf16().collect();
+    // 只往右下投 1px 黑影：±1 四向描边在小字号 CJK 上会糊成一团（实测发虚）
+    let _ = SetTextColor(mem, COLORREF(0));
     let mut sr = RECT {
         left: r.0 + 1,
         top: r.1 + 1,
@@ -6367,6 +6390,10 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                     BALL_MOVED.store(true, Ordering::Relaxed);
                 }
                 if BALL_MOVED.load(Ordering::Relaxed) {
+                    // 拖球的时候立刻收掉气泡，别让它跟着挡视线
+                    if BUBBLE_SHOWN_AT.lock().map(|t| t.is_some()).unwrap_or(false) {
+                        bubble_hide();
+                    }
                     let nx = BALL_POS_X.load(Ordering::Relaxed) + (p.x - ox);
                     let ny = BALL_POS_Y.load(Ordering::Relaxed) + (p.y - oy);
                     BALL_POS_X.store(nx, Ordering::Relaxed);
@@ -6629,10 +6656,10 @@ unsafe extern "system" fn bubble_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 let e = started
                     .map(|s| s.elapsed().as_millis() as i32)
                     .unwrap_or(99999);
-                if e < 3200 {
+                if e < 1800 {
                     return LRESULT(0);
                 }
-                if e >= 3800 {
+                if e >= 2300 {
                     let _ = KillTimer(hwnd, 3);
                     let _ = ShowWindow(hwnd, SW_HIDE);
                     if let Ok(mut t) = BUBBLE_SHOWN_AT.lock() {
@@ -6640,7 +6667,7 @@ unsafe extern "system" fn bubble_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     }
                     return LRESULT(0);
                 }
-                let a = (255 * (3800 - e) / 600).clamp(0, 255) as u8;
+                let a = (255 * (2300 - e) / 500).clamp(0, 255) as u8;
                 let (x, y) = bubble_pos();
                 let _ = bubble_render(x, y, a);
             }
@@ -6746,13 +6773,39 @@ unsafe fn bubble_render(x: i32, y: i32, alpha: u8) -> bool {
     let buf = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
     buf.fill(0);
 
-    // MC 面板 + 像素尾巴
-    draw_mc_panel(buf, w, h, (4, 4, w - 8, h - 8 - tail), 1.0);
+    // ---- MC 网易版聊天框：深色半透明底 + 像素边框 + 像素尾巴 ----
+    let x0 = 4;
+    let x1 = w - 4;
+    let y0 = 4;
+    let y1 = h - 8 - tail;
     let cx = w / 2;
-    for (i, half) in [(0, 18i32), (1, 13), (2, 8), (3, 4)] {
-        let y0 = h - 8 - tail + i * (tail / 4);
-        mc_fill(buf, w, h, cx - half, y0, cx + half, y0 + tail / 4, (0, 0, 0), 1.0);
+    // 底色：深色半透明（透出一点桌面/窗口，像游戏里的聊天面板）
+    mc_fill(buf, w, h, x0, y0, x1, y1, BUBBLE_BG, BUBBLE_BG_A);
+    // 像素边框：外 2px 纯黑 + 内 1px 深灰（MC 面板那种厚边）
+    mc_frame(buf, w, h, (x0, y0, x1, y1), MC_BLACK, 2, 0.82);
+    mc_frame(buf, w, h, (x0 + 2, y0 + 2, x1 - 2, y1 - 2), BUBBLE_EDGE, 1, 0.92);
+    // 底边中间给尾巴留口（擦掉那一段边框，尾巴才连得上）
+    let gap = 22;
+    mc_fill(buf, w, h, cx - gap, y1 - 4, cx + gap, y1, BUBBLE_BG, BUBBLE_BG_A);
+    // 像素尾巴：一级级收窄的方块，斜边和台阶都描 1px 黑
+    let halves = [22i32, 17, 12, 7, 2];
+    let tail_top = y1 - 4;
+    let step_h = ((tail - 1) / halves.len() as i32).max(1);
+    let mut prev_half = gap;
+    for (i, &half) in halves.iter().enumerate() {
+        let ry0 = tail_top + i as i32 * step_h;
+        let ry1 = ry0 + step_h;
+        mc_fill(buf, w, h, cx - half, ry0, cx + half, ry1, BUBBLE_BG, BUBBLE_BG_A);
+        mc_fill(buf, w, h, cx - half - 1, ry0, cx - half, ry1, MC_BLACK, 0.82);
+        mc_fill(buf, w, h, cx + half, ry0, cx + half + 1, ry1, MC_BLACK, 0.82);
+        if half < prev_half {
+            mc_fill(buf, w, h, cx - prev_half - 1, ry0, cx - half, ry0 + 1, MC_BLACK, 0.82);
+            mc_fill(buf, w, h, cx + half, ry0, cx + prev_half + 1, ry0 + 1, MC_BLACK, 0.82);
+        }
+        prev_half = half;
     }
+    let tail_end = tail_top + halves.len() as i32 * step_h;
+    mc_fill(buf, w, h, cx - 3, tail_end, cx + 3, tail_end + 1, MC_BLACK, 0.82);
 
     let app = cached_app_name(HWND(current_target() as *mut _));
     let (tag, color) = crate::selection::mark_for(current_target()).unwrap_or_else(|| {
@@ -6787,13 +6840,34 @@ unsafe fn bubble_render(x: i32, y: i32, alpha: u8) -> bool {
     SetBkMode(mem, TRANSPARENT);
     // 标记色方块
     mc_fill(buf, w, h, 14, 16, 24, 26, color, 1.0);
-    draw_mc_label(mem, &format!("已选中 · {}", tag), (30, 8, w - 14, 34), (43, 43, 43));
-    draw_mc_label(mem, &format!("{} · 蒙版 {} 个", app, n), (16, 34, w - 16, 54), (60, 60, 60));
-    draw_mc_label(mem, "右键悬浮球管理", (16, 56, w - 16, 80), (90, 90, 90));
+    // 名字太长会把气泡撑爆（DT_SINGLELINE 居中会两边裁掉），先自己截断
+    let clip_text = |s: &str, n: usize| -> String {
+        let mut out: String = s.chars().take(n).collect();
+        if s.chars().count() > n {
+            out.push('…');
+        }
+        out
+    };
+    draw_chat_label(
+        mem,
+        &format!("已选中 · {}", clip_text(&tag, 13)),
+        (30, 8, w - 14, 34),
+        (255, 255, 255),
+    );
+    draw_chat_label(
+        mem,
+        &format!("{} · 蒙版 {} 个", clip_text(&app, 11), n),
+        (16, 34, w - 16, 56),
+        (222, 222, 226),
+    );
+    draw_chat_label(mem, "右键悬浮球管理", (16, 58, w - 16, 82), (152, 152, 158));
 
-    // 文字 alpha 补齐 + 预乘
+    // 文字 alpha 补齐 + 白字提亮 + 预乘
     for px in buf.chunks_exact_mut(4) {
         if px[3] == 0 && (px[0] != 0 || px[1] != 0 || px[2] != 0) {
+            px[3] = 255;
+        } else if px[3] < 255 && px[0] > 190 && px[1] > 190 && px[2] > 190 {
+            // 白字压在半透明底上时把底色的 alpha 吃掉，字才不跟着发灰
             px[3] = 255;
         }
     }
@@ -7076,6 +7150,400 @@ impl TransGlassApp {
         self.hotkey_editor_inline(ui);
     }
 
+    /// PS 风格「蒙版 / 点透」面板：顶部是目标窗口缩略图，直接在缩略图上圈。
+    /// 圈完出现「完成 / 取消」，完成立即写入蒙版（不再开全屏覆盖层编辑器、也不用按 Enter）。
+    fn ps_selection_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let target = crate::current_target();
+        // 目标换人了：草稿作废、选中条回到第一条
+        if target != self.ps_target {
+            self.ps_target = target;
+            self.ps_draw = false;
+            self.ps_points.clear();
+            self.ps_selected = 0;
+        }
+        let mut regions: Vec<crate::regions::Region> = crate::regions::snapshot_all()
+            .into_iter()
+            .find(|(h, _)| *h == target)
+            .map(|(_, r)| r)
+            .unwrap_or_default();
+        if !regions.is_empty() && self.ps_selected >= regions.len() {
+            self.ps_selected = regions.len() - 1;
+        }
+        ui.label(
+            egui::RichText::new("蒙版 / 点透")
+                .font(font_title(16.0))
+                .color(TEXT_PRIMARY),
+        );
+        ui.add_space(4.0);
+        if target == 0 {
+            ui.label(
+                egui::RichText::new(
+                    "右键窗口卡片/左侧窗口，或右键悬浮球选中窗口后，这里直接在缩略图上圈点透蒙版",
+                )
+                .small()
+                .weak(),
+            );
+            return;
+        }
+        let hwnd = HWND(target as *mut _);
+        let app = unsafe { cached_app_name(hwnd) };
+        let win_title = unsafe { get_window_title(hwnd) };
+        ui.label(
+            egui::RichText::new(format!("{app}  ·  {win_title}"))
+                .size(12.0)
+                .weak(),
+        );
+        ui.add_space(4.0);
+
+        // ---------- 目标窗口缩略图：直接在上面圈 ----------
+        let tex = self.thumbnail(ctx, target);
+        let win = tex
+            .as_ref()
+            .map(|t| t.size_vec2())
+            .unwrap_or_else(|| egui::vec2(16.0, 9.0));
+        let avail_w = ui.available_width().max(120.0);
+        let scale = (avail_w / win.x).min(210.0 / win.y).max(0.001);
+        let canvas = egui::vec2((win.x * scale).max(80.0), (win.y * scale).max(45.0));
+        let (rect, resp) = ui.allocate_exact_size(canvas, egui::Sense::click_and_drag());
+        let painter = ui.painter().with_clip_rect(rect.expand(2.0));
+        let cb = unsafe { client_box_in_window(target) }.unwrap_or((0.0, 0.0, win.x, win.y));
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        match &tex {
+            Some(t) => {
+                painter.image(t.id(), rect, uv, egui::Color32::WHITE);
+            }
+            None => {
+                painter.rect_filled(
+                    rect,
+                    egui::Rounding::same(4.0),
+                    egui::Color32::from_rgb(0xF2, 0xF3, 0xF5),
+                );
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "无预览（窗口最小化或预览已关闭）",
+                    egui::FontId::proportional(11.0),
+                    TEXT_SECONDARY,
+                );
+            }
+        }
+        // 已有蒙版全部画出来，选中的那条金色粗框（和列表联动）
+        for (i, r) in regions.iter().enumerate() {
+            let (fill, line, width) = mask_style(r, i == self.ps_selected);
+            paint_mask_on_thumb(&painter, &r.pts, rect, win, cb, fill, line, width);
+        }
+        // 正在圈的草稿（橙线 + 起点方块）
+        if self.ps_draw && self.ps_points.len() >= 2 {
+            paint_mask_on_thumb(
+                &painter,
+                &self.ps_points,
+                rect,
+                win,
+                cb,
+                egui::Color32::from_rgba_unmultiplied(0xF5, 0x96, 0x32, 56),
+                egui::Color32::from_rgb(0xF5, 0x96, 0x32),
+                2.0,
+            );
+            let s = thumb_point(rect, win, cb, self.ps_points[0].0, self.ps_points[0].1);
+            painter.rect_filled(
+                egui::Rect::from_center_size(s, egui::vec2(6.0, 6.0)),
+                egui::Rounding::same(1.0),
+                egui::Color32::from_rgb(0xF5, 0x96, 0x32),
+            );
+        }
+        painter.rect_stroke(
+            rect,
+            egui::Rounding::same(4.0),
+            egui::Stroke::new(1.0, BORDER),
+        );
+
+        // 圈选交互：按住左键在缩略图上拖一圈，点全程收进 self.ps_points（归一化客户区）
+        if tex.is_some() {
+            if resp.drag_started() {
+                self.ps_draw = true;
+                self.ps_points.clear();
+            }
+            if self.ps_draw {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let px = ((p.x - rect.left()) / rect.width().max(1.0)) * win.x;
+                    let py = ((p.y - rect.top()) / rect.height().max(1.0)) * win.y;
+                    let nx = ((px - cb.0) / cb.2.max(1.0)).clamp(0.0, 1.0);
+                    let ny = ((py - cb.1) / cb.3.max(1.0)).clamp(0.0, 1.0);
+                    let last = self.ps_points.last().copied();
+                    let far = last.map_or(true, |(lx, ly)| {
+                        thumb_point(rect, win, cb, lx, ly)
+                            .distance(thumb_point(rect, win, cb, nx, ny))
+                            >= 2.5
+                    });
+                    if far && self.ps_points.len() < 800 {
+                        self.ps_points.push((nx, ny));
+                    }
+                }
+                if resp.drag_stopped() && self.ps_points.len() < 3 {
+                    // 只是点了一下，不算一圈
+                    self.ps_draw = false;
+                    self.ps_points.clear();
+                }
+            }
+        }
+        if tex.is_none() {
+            ui.label(
+                egui::RichText::new("恢复目标窗口或调高预览帧率后，才能在这里圈")
+                    .small()
+                    .weak(),
+            );
+        }
+        if self.ps_draw {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("已圈 {} 个点", self.ps_points.len()))
+                        .small()
+                        .weak(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let ok = ui.add_enabled(
+                        self.ps_points.len() >= 3,
+                        egui::Button::new("完成"),
+                    );
+                    if ok.clicked() && self.ps_points.len() >= 3 {
+                        let pts = std::mem::take(&mut self.ps_points);
+                        regions.push(crate::regions::Region {
+                            pts,
+                            invert: false,
+                            opacity: 100,
+                            enabled: true,
+                        });
+                        // 立即写入：列表、点击穿透、透明洞全都马上按新蒙版走
+                        crate::regions::set_regions(target, regions.clone());
+                        self.ps_selected = regions.len() - 1;
+                        self.ps_draw = false;
+                    }
+                    if ui.button("取消").clicked() {
+                        self.ps_draw = false;
+                        self.ps_points.clear();
+                    }
+                });
+            });
+        } else {
+            ui.label(
+                egui::RichText::new("按住左键在缩略图上圈一圈，点「完成」立即生效")
+                    .small()
+                    .weak(),
+            );
+        }
+        ui.separator();
+
+        // ---------- 标记 ----------
+        let (tag, color) = crate::selection::mark_for(target).unwrap_or_else(|| {
+            (
+                if app.trim().is_empty() {
+                    "窗口".to_string()
+                } else {
+                    app.clone()
+                },
+                (47u8, 194u8, 124u8),
+            )
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("标记").small().weak());
+            let mut edit = tag.clone();
+            if ui
+                .add(egui::TextEdit::singleline(&mut edit).desired_width(96.0))
+                .changed()
+            {
+                crate::selection::set_mark(target, edit, color);
+            }
+            for c in [
+                (47u8, 194u8, 124u8),
+                (70u8, 130u8, 220u8),
+                (240u8, 150u8, 60u8),
+                (180u8, 80u8, 200u8),
+            ] {
+                let btn = egui::Button::new(
+                    egui::RichText::new("●").color(egui::Color32::from_rgb(c.0, c.1, c.2)),
+                )
+                .frame(false);
+                if ui.add(btn).clicked() {
+                    crate::selection::set_mark(target, tag.clone(), c);
+                }
+            }
+        });
+        ui.separator();
+        ui.label(egui::RichText::new("蒙版列表").small().strong());
+        if regions.is_empty() {
+            ui.label(
+                egui::RichText::new("还没有蒙版：在上面缩略图上圈一圈")
+                    .small()
+                    .weak(),
+            );
+        }
+        // ---------- 蒙版列表：每行一张小预览 + 眼睛/反向/透明度/删除 ----------
+        let mut pick: Option<usize> = None;
+        let mut del: Option<usize> = None;
+        let mut set_en: Option<(usize, bool)> = None;
+        let mut set_inv: Option<(usize, bool)> = None;
+        let mut set_op: Option<(usize, i32)> = None;
+        for (i, r) in regions.iter().enumerate() {
+            let is_sel = i == self.ps_selected;
+            let bg = if is_sel {
+                egui::Color32::from_rgb(0xE8, 0xF7, 0xEE)
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            egui::Frame::none()
+                .fill(bg)
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(4.0, 3.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (prev, prev_resp) =
+                            ui.allocate_exact_size(egui::vec2(56.0, 36.0), egui::Sense::click());
+                        let pp = ui.painter().with_clip_rect(prev);
+                        let inner = fit_rect(prev, win);
+                        match &tex {
+                            Some(t) => {
+                                pp.image(t.id(), inner, uv, egui::Color32::WHITE);
+                            }
+                            None => {
+                                pp.rect_filled(
+                                    inner,
+                                    egui::Rounding::same(3.0),
+                                    egui::Color32::from_rgb(0xEC, 0xEE, 0xF1),
+                                );
+                            }
+                        }
+                        let (fill, line, width) = mask_style(r, is_sel);
+                        paint_mask_on_thumb(&pp, &r.pts, inner, win, cb, fill, line, width);
+                        pp.rect_stroke(
+                            prev,
+                            egui::Rounding::same(3.0),
+                            egui::Stroke::new(1.0, BORDER),
+                        );
+                        if prev_resp.clicked() {
+                            pick = Some(i);
+                        }
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        is_sel,
+                                        egui::RichText::new(format!("蒙版 {}", i + 1)).size(12.0),
+                                    )
+                                    .clicked()
+                                {
+                                    pick = Some(i);
+                                }
+                                let mut en = r.enabled;
+                                if ui
+                                    .checkbox(&mut en, "")
+                                    .on_hover_text("眼睛：启用/停用这个蒙版")
+                                    .changed()
+                                {
+                                    set_en = Some((i, en));
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button("×")
+                                            .on_hover_text("删除这个蒙版")
+                                            .clicked()
+                                        {
+                                            del = Some(i);
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(if r.invert {
+                                                "反向"
+                                            } else {
+                                                "洞"
+                                            })
+                                            .small()
+                                            .weak(),
+                                        );
+                                    },
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                let mut inv = r.invert;
+                                if ui
+                                    .checkbox(&mut inv, "反向")
+                                    .on_hover_text("圈内保留、圈外穿透")
+                                    .changed()
+                                {
+                                    set_inv = Some((i, inv));
+                                }
+                                let mut op = r.opacity as i32;
+                                ui.spacing_mut().slider_width = 68.0;
+                                if ui
+                                    .add(egui::Slider::new(&mut op, 0..=100).suffix("%"))
+                                    .changed()
+                                {
+                                    set_op = Some((i, op));
+                                }
+                            });
+                        });
+                    });
+                });
+        }
+        if let Some(i) = pick {
+            self.ps_selected = i;
+        }
+        if let Some((i, en)) = set_en {
+            crate::regions::update_region(target, i, None, None, Some(en));
+        }
+        if let Some((i, inv)) = set_inv {
+            crate::regions::update_region(target, i, Some(inv), None, None);
+        }
+        if let Some((i, op)) = set_op {
+            crate::regions::update_region(target, i, None, Some(op.clamp(0, 100) as u8), None);
+        }
+        if let Some(i) = del {
+            crate::regions::remove_region(target, i);
+            if self.ps_selected > i {
+                self.ps_selected = self.ps_selected.saturating_sub(1);
+            }
+        }
+        let n = crate::regions::count(target);
+        if n == 0 {
+            self.ps_selected = 0;
+        } else if self.ps_selected >= n {
+            self.ps_selected = n - 1;
+        }
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            if ui.button("清空蒙版").clicked() {
+                crate::regions::clear(target);
+                self.ps_selected = 0;
+                self.ps_draw = false;
+                self.ps_points.clear();
+            }
+            if ui.button("刷新透明洞").clicked() {
+                crate::regions::refresh_visual(target);
+            }
+        });
+        ui.separator();
+        if let Some(st) = GLOBAL_REGISTRY.get(&target) {
+            let pct = (st.current_alpha as f32 / 255.0 * 100.0).round();
+            ui.label(
+                egui::RichText::new(format!(
+                    "窗口：透明度 {}% · 置顶 {} · 鼠标点透 {} · 笔点透 {}",
+                    pct,
+                    if st.user_pref_topmost { "开" } else { "关" },
+                    if st.mouse_passthrough { "开" } else { "关" },
+                    if st.pen_passthrough { "开" } else { "关" }
+                ))
+                .small()
+                .weak(),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("窗口未管理（右键卡片可控制）")
+                    .small()
+                    .weak(),
+            );
+        }
+    }
+
     /// 设置页：直接作为主界面内容（不再弹二级窗口）
     /// 自绘标题栏：图标 + 标题 + 最小化/最大化/关闭；空白处可拖动、双击最大化
     fn draw_titlebar(&mut self, ctx: &egui::Context) {
@@ -7150,6 +7618,8 @@ impl TransGlassApp {
                 if resp.double_clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                 } else if resp.dragged() {
+                    // 拖主界面的时候把气泡收掉（气泡是置顶的，会挡在拖动路径上）
+                    unsafe { bubble_hide() };
                     ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                 }
                 // 底部一条分隔线

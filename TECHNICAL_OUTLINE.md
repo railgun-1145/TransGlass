@@ -108,10 +108,13 @@
 
 ### 4.6 自由形状点透选区（`regions.rs`）
 - **数据**：`Mutex<Vec<(hwnd, Vec<Region>)>>`，`Region { pts, invert, opacity }`；多边形按**客户区归一化 0..1**保存。每圈 `invert=false` 表示圈内是洞，`true` 表示圈内保留、客户区补集是洞；点击穿透 = 所有圈 mask 的并集（与透明度无关）。
-- **编辑器**：独立线程 + 客户区大小的分层窗口（`WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_TOPMOST`）；目标先 `SW_RESTORE`（如果最小化）并 `SetWindowPos(HWND_TOP)` 提顶、记录上方同层级窗口；GDI 画压暗层 + 两行指令条 + 已有区域（正常绿/反向蓝，选中金框）+ 当前套索（橙线）。鼠标收集点；`Enter` 保存、`Backspace/Delete` 删、`Esc` 取消；`Tab` 选圈、`I` 反向、`[` `]` 调该圈透明度。结束隐藏覆盖层、恢复 z 序和最小化。
+- **编辑器（2.18.0 起改直出）**：主界面右侧 `SidePanel::right("ps_panel")` → `App::ps_selection_panel(&mut self, ui, ctx)`：顶部 `self.thumbnail(ctx, target)` 拿目标窗口缩略图，`allocate_exact_size(canvas, Sense::click_and_drag())` 当画布，按住左键拖动把**归一化客户区坐标** push 进 `self.ps_points`；松开后出现「完成 / 取消」，点「完成」才 `regions::set_regions(target, all)`（列表/点击穿透/透明洞立刻生效）并把选中条设成新的那条，「取消」清空草稿。`ps_target` 记草稿属于哪个窗口，目标一换就作废。**缩略图是整窗、蒙版坐标按客户区归一化**：画之前用 `client_box_in_window()`（GetWindowRect + GetClientRect + `Gdi::ClientToScreen`）算客户区相对整窗的偏移（`ClientToScreen` 在 `Win32::Graphics::Gdi` 下，不在 WindowsAndMessaging）。列表每行 56×36 小预览复用同一个 `TextureHandle` + `paint_mask_on_thumb()`（≥3 点填充、2 点画线），点行会选中并把大缩略图上那条蒙版画成金框。
+- **旧全屏覆盖层编辑器**（`regions::open_editor/open_editor_at`）技术上还在（`editor_thread` + `editor_proc`，快捷键/键盘操作那套也在），但 2.18.0 起**所有界面入口都移除了**：右侧面板的「编辑当前蒙版/新建蒙版」、`selection_controls_ui` 右键子菜单、左侧窗口树子项都改成 `crate::show_root_window()` 打开主界面右侧面板。入口删干净后这两个函数只剩 `#[allow(dead_code)]`，留给后续「快捷键唤起老编辑器」。
 - **点击穿透**：`mouse_hook_proc` 每条鼠标消息在 `hit_root_at` **之前**调 `regions::enforce_at`；对每个有选区的窗口，鼠标在客户区内且命中任一 `region_contains` 时给窗口加 `WS_EX_TRANSPARENT`，出洞/离开恢复。点透会话窗口 / 整窗点透窗口跳过。
-- **真·透明洞**：`regions_visual` 线程维护一个置顶、`WS_EX_TRANSPARENT|WS_EX_NOACTIVATE` 的分层覆盖层；刷新时 `SW_HIDE` 目标 → 屏幕 BitBlt 出客户区下方快照 → `SW_SHOW`；按每像素「包含该点的圈的最大透明度」写快照 alpha。只在该窗口是前台时显示；目标移动/缩放后快照位置不对就隐藏，等刷新。菜单「刷新透明洞画面」重新抓取。
-- **入口**：主界面窗口卡片右键菜单 →「编辑自由形状选区…」/「刷新透明洞画面」/「清空选区」，显示当前数量；`regions::open_editor(hwnd)` / `refresh_visual(hwnd)` 通过 `PostMessage` 叫对应线程。
+- **真·透明洞**：`regions_visual` 线程维护一个置顶、`WS_EX_TRANSPARENT|WS_EX_NOACTIVATE` 的分层覆盖层；刷新时 `SW_HIDE` 目标 → 屏幕 BitBlt 出客户区下方快照 → `SW_SHOW`；按每像素「包含该点的圈的最大透明度」写快照 alpha。只在该窗口是前台时显示。
+- **窗动洞动**：`follow_visual()` 每 150ms 读目标窗口矩形，**变了就直接 `refresh_visual(target)`**（重抓下层快照 + 重画覆盖层），洞跟着窗口走、像在布上开了个洞；以前是 `ShowWindow(SW_HIDE)` 等用户手动刷新。注意 `refresh_visual` 内部会 `SW_HIDE` 目标再 BitBlt，拖动时覆盖层会抖一帧；要真·丝滑跟随得改成"只挪覆盖层 + 复用旧快照"。
+- **入口**：主界面窗口卡片右键 / 左侧窗口行右键 →「选中控制」子菜单里的「在右侧面板圈蒙版」= `select_window_for_control(hwnd)` + `show_root_window()`；左侧树子项里同款按钮。菜单里仍有「刷新透明洞画面 / 清空选区」。`regions::open_editor(hwnd)` / `refresh_visual(hwnd)` 走 `PostMessage` 叫对应线程。
+- **坑（2.18.0 新发现）**：`mouse_hook_proc` 里 `hit_root_at` 的 `HIT_CACHE` 按"点在矩形内"直接命中，点击主界面面板时会被上次点过的大窗口矩形抢走，导致 `TARGET_HWND` 跳到后面那个窗口、蒙版画到别处。点击落点必须用 `hit_root_at_fresh`（不吃缓存）；鼠标移动仍可用缓存。
 - **坑**：hook 的 fast-path 必须加 `regions::has_any()`，否则无单设备点透/注册表为空时提前返回，选区完全不生效；`UpdateLayeredWindow` 前不能把 DIB 从 mem DC 取消选中（否则 0x8007001F、窗口全透明）；窗口别用 0×0 创建；`SetWindowRgn` 会裁画面，不能用；任意窗口做不了逐像素 alpha，视觉洞只能靠下层快照覆盖层。
 - **限制**：快照静态（下方变了要刷新）；覆盖层只跟前台目标；选区只存内存；没有顶点编辑/持久化。
 
@@ -122,11 +125,12 @@
 - **右键子菜单**：`selection_controls_ui` 放进 `window_menu` 和左侧窗口行的右键菜单；内容：标记文字/颜色、显示选中框、逐圈反向/透明度/删除、编辑/清空/刷新透明洞。
 - **左侧树子项**：`nav_windows` 里对 TARGET/有选区的窗口挂 `CollapsingHeader`，展开调 `self.window_card`（窗口卡片，缩略图/状态/透明度），再点收起；`sel_set` 一次算出。
 - **关闭清理**：`selection_cleanup()` 在 `refresh_window_list` 每帧跑，TARGET 无效置 0，`regions::prune`/`selection::prune` 清无效窗口。
-- **右侧 PS 面板**：`SidePanel::right("ps_panel")` → `ps_selection_panel(ui, &mut App::ps_selected)`；`Region.enabled` 眼睛；`update_region(hwnd, idx, invert, opacity, enabled)`；`open_editor_at(hwnd, Some(idx))` 用 `PENDING_SELECTED` 按选中圈打开。
-- **最小化残留**：区域编辑器 `WM_TIMER` 200ms 查 `main_window_handle()`，主窗口 `IsIconic`/不可见就隐藏覆盖层，恢复再显示；`SetTimer`/`KillTimer` 在 `begin_edit`/`end_edit`。
-- **悬浮球气泡**：`BUBBLE_HWND` 独立 layered 窗口，`bubble_render` 用 `draw_mc_panel/mc_fill/draw_mc_label` 画 MC 面板 + 像素尾，`WM_BALL_BUBBLE` 触发，3500ms `WM_TIMER` 收起；`ball_bubble()` 在 `TARGET_HWND` 变化/`set_target_window` 后调用。
-- **多蒙版**：编辑器 `on_up` 用 `st.regions.push(...)` 追加，每个封闭选区一个独立蒙版；面板/右键「新建蒙版」= 只 `open_editor_at`（不 clear）；「编辑当前蒙版」按选中条打开；点透/视觉取所有启用蒙版的并集。
-- **气泡位置/渐隐/互斥**：`bubble_pos()` 放球正上方（球中心 - 42 - BUBBLE_H - 6）；`BUBBLE_SHOWN_AT` + 30ms `WM_TIMER`，3.2s 保持、0.6s `SourceConstantAlpha` 渐隐、3.8s 隐藏；`select_window_for_control` 不再开面板，`ball_set_expanded(true)` 里 `bubble_hide()`，`bubble_show` 遇 `BALL_EXPANDED` 直接返回，保证气泡和面板互斥。
+- **右侧 PS 面板**：`SidePanel::right("ps_panel")`（固定 256 宽）→ `App::ps_selection_panel(&mut self, ui, ctx)`；顶部目标缩略图直接圈蒙版（详见 4.6），列表每行 56×36 小预览 + 眼睛启用/停用、反向、透明度、删除；`update_region` 只走 `WM_VISUAL_MASK`（不重抓下层快照），`set_regions` 才 `refresh_visual`。**不要把画布放进 `ScrollArea`**（拖动会被滚动抢走）。
+- **最小化残留**：主程序最小化时右侧面板跟着主窗口一起最小化，不再有独立覆盖层要藏；旧全屏编辑器（若以后用快捷键唤起）仍有 `WM_TIMER` 200ms 查 `main_window_handle()` 的隐藏逻辑。
+- **悬浮球气泡**：`BUBBLE_HWND` 独立 layered 窗口，`bubble_render` 画 **MC 网易版聊天框**——深色半透明底（`BUBBLE_BG (8,8,10)`，alpha 0.86）+ 外 2px 纯黑 + 内 1px 深灰像素边框 + 阶梯像素尾巴，文字用 `draw_chat_label`（白字 + 右下 1px 纯黑投影，靠"补 alpha"那步把文字阴影像素补成不透明；四向描边在小字号 CJK 上会糊，别用）；`WM_BALL_BUBBLE` 触发，**1800ms 保持、1800..2300 用 `SourceConstantAlpha` 渐隐、2300 隐藏**。`ball_bubble()` 在 `TARGET_HWND` 变化/`set_target_window` 后调用。
+- **多蒙版**：面板「完成」时 `st.regions.push(...)` 追加，每个封闭选区一个独立蒙版；点透/视觉取所有启用蒙版的并集。
+- **气泡位置/渐隐/互斥**：`bubble_pos()` 放球正上方（球中心 - 42 - BUBBLE_H - 6）；`BUBBLE_SHOWN_AT` + 30ms `WM_TIMER`；`select_window_for_control` 不再开面板，`ball_set_expanded(true)` 里 `bubble_hide()`，`bubble_show` 遇 `BALL_EXPANDED` 直接返回，保证气泡和面板互斥。**拖动时立刻收起**：`ball_proc` 的 `WM_MOUSEMOVE` 里 `BALL_DRAGGING && BALL_MOVED` → `bubble_hide()`；`draw_titlebar` 的 `resp.dragged()` 也 `bubble_hide()`。
+- **气泡被重置的坑**：`spawn_device_tracking_ticker` 每 150ms 同步前台窗口当目标，**只能在目标真变化时才 `ball_bubble()`**（用 `TARGET_HWND.swap(v) != v` 判断）。之前无条件调用，气泡时间戳一直刷新，1.8s/3.2s 渐隐永远走不到（表现为气泡一直挂在屏幕上）。
 - **选区联动**：卡片的 `regions::update_region/remove_region` 走 `WM_VISUAL_MASK` 只重画覆盖层 mask，保留已抓的下层快照；编辑/保存才 `refresh_visual` 重新抓。
 - **右键悬浮球**：`WindowFromPoint` 在球中心拿到球自己；沿 `GW_HWNDNEXT` 跳过 own/shell，检查矩形包含，`GetAncestor(GA_ROOT)`；找到就 `select_window_for_control`（切目标 + 弹面板），找不到只弹当前面板。
 - **坑**：选择框是 transient cue，不要永久置顶；topmost 目标会遮住主界面/标签，auto-hide 兜底；卡片的透明度滑条不能触发重新抓快照；`ball_set_expanded` 在主线程跑 200ms 动画，别重入。

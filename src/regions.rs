@@ -63,10 +63,14 @@ pub fn init() {
     });
 }
 
+/// 全屏覆盖层编辑器。2.18.0 起主界面改成在右侧面板缩略图上直接圈（PS 风格直出），
+/// 这里保留给后续「快捷键唤起老编辑器」用，不再挂界面入口。
+#[allow(dead_code)]
 pub fn open_editor(hwnd: isize) {
     open_editor_at(hwnd, None);
 }
 
+#[allow(dead_code)]
 pub fn open_editor_at(hwnd: isize, selected: Option<usize>) {
     if hwnd == 0 {
         return;
@@ -1208,8 +1212,8 @@ unsafe fn follow_visual(overlay: HWND) {
         return;
     };
     if (rect.0, rect.1, rect.2, rect.3) != (cx, cy, cw, ch) || w != cw || h != ch {
-        // 窗口动了/缩放了，快照位置已不对；等用户刷新
-        let _ = ShowWindow(overlay, SW_HIDE);
+        // 窗动洞动：窗口拖动/缩放后按新位置重新抓下层快照，洞跟着窗口走（像布上开洞）
+        refresh_visual(target);
         return;
     }
     let _ = SetWindowPos(
