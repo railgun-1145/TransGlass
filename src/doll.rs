@@ -691,6 +691,65 @@ pub fn render(
         }
     }
 
+    // ---- 去掉孤立的覆盖杂点 ----
+    // 光栅化/皮肤采样偶尔会在轮廓外留下 1~2 个子采样的小飞点（皮肤纹理在面边界
+    // 取整时尤其明显）。3×3 超采样下它们几乎看不见，但描边会沿它们膨胀一圈，
+    // 放大成后脑勺外面的"黑刺"。这里把小于 12 个子采样的连通块直接清掉。
+    {
+        const MIN_COMPONENT: usize = 12;
+        let n = sw * sh;
+        let mut seen = vec![false; n];
+        let mut stack: Vec<usize> = Vec::new();
+        let mut comp: Vec<usize> = Vec::new();
+        for start in 0..n {
+            if seen[start] || col[start][3] <= 0.002 {
+                continue;
+            }
+            stack.push(start);
+            seen[start] = true;
+            comp.clear();
+            while let Some(i) = stack.pop() {
+                comp.push(i);
+                let x = i % sw;
+                let y = i / sw;
+                // 4 邻域就够了：飞点是孤立的，模型本体是实心的
+                if x > 0 {
+                    let k = i - 1;
+                    if !seen[k] && col[k][3] > 0.002 {
+                        seen[k] = true;
+                        stack.push(k);
+                    }
+                }
+                if x + 1 < sw {
+                    let k = i + 1;
+                    if !seen[k] && col[k][3] > 0.002 {
+                        seen[k] = true;
+                        stack.push(k);
+                    }
+                }
+                if y > 0 {
+                    let k = i - sw;
+                    if !seen[k] && col[k][3] > 0.002 {
+                        seen[k] = true;
+                        stack.push(k);
+                    }
+                }
+                if y + 1 < sh {
+                    let k = i + sw;
+                    if !seen[k] && col[k][3] > 0.002 {
+                        seen[k] = true;
+                        stack.push(k);
+                    }
+                }
+            }
+            if comp.len() < MIN_COMPONENT {
+                for &i in &comp {
+                    col[i] = [0.0; 4];
+                }
+            }
+        }
+    }
+
     // ---- 1 目标像素描边：在超采样域膨胀覆盖遮罩，再跟模型一起降采样 ----
     //
     // 旧版在降采样后的 mask 上取 8 邻域最大值、alpha = 0.42 × 邻居覆盖，

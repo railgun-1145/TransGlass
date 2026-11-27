@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.7.4**
+> 归档时间：2026-11-28　·　对应版本：**v2.7.5**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.7.4** |
+| 当前版本 | **v2.7.5** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -50,7 +50,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 
 ---
 
-## 3. 当前功能清单（v2.7.4）
+## 3. 当前功能清单（v2.7.5）
 
 **窗口控制**：逐窗透明度（滑条/热键）、置顶、鼠标点透、笔点透、全部还原、右键卡片菜单。
 **悬浮球**：左键展开/收起、双击纸娃娃开主界面、拖动移动、面板 4 按钮（置顶/穿透/模式/还原）+ 透明度滑条、标题栏 MC 风格 ×（关闭）、**显示当前目标软件名【Photoshop】**、**最近输入（鼠标/笔）**。
@@ -61,7 +61,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 
 ---
 
-## 4. 版本历史（本次会话 1.4.2 → 2.7.4）
+## 4. 版本历史（本次会话 1.4.2 → 2.7.5）
 
 | 版本 | 关键改动 |
 | :--- | :--- |
@@ -83,6 +83,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.7.2 | 纸娃娃垂直也改为只按舞台中心（彻底去掉包围盒平移）；静置重绘 0.12s |
 | 2.7.3 | 待机浮动回到亚像素定位（取整会变 1px 台阶） |
 | 2.7.4 | 纸娃娃描边改到超采样域（去掉半透明灰圈 + 双层描边）；热键冲突提示点名占用软件与解决办法 |
+| 2.7.5 | 描边前清掉轮廓外的孤立覆盖飞点，修后脑勺外的"黑刺" |
 
 ---
 
@@ -104,6 +105,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 14. **性能坑**：窗口列表里查进程名（`OpenProcess`+`QueryFullProcessImageNameW`）必须缓存（现为 3s / 96 条），否则每帧每张卡都查一次。
 15. **热键 1409**：`RegisterHotKey` 失败时 Windows 只给 1409，**没有任何接口能查出占用者**（API 只告诉你失败，查不出是谁）。实测 `ALT+R`、`ALT+SHIFT+R` 被 **NVIDIA App 的游戏内叠加层**（`NVIDIA Overlay.exe`）默认占着：前者开关性能统计、后者轮换指标。现在按「进程在跑 + 默认键位」表提示占用者（NVIDIA/AMD/微信/QQ/Snipaste），并引导「快捷键优先」或换绑；优先模式用 `WH_KEYBOARD_LL` 抢在对方前面生效（代价是那个键对对方失效）。UI 里不要再写 `Win32 1409` 这种码。
 16. **纸娃娃描边**：旧写法是在降采样后的 mask 上取 8 邻域最大值、`alpha = 0.42 × 邻居覆盖`，结果是一条 1~2px、透明度忽高忽低的半透明灰圈，缩到 3px/皮肤像素时就是"毛边"；`ball_render` 末尾还又套了一层 1px 深色描边。现在描边在**超采样域**膨胀覆盖遮罩（半径 = ss 子采样 = 1 目标像素）、跟模型一起降采样，`alpha = 0.85`，并删掉 `ball_render` 里那一层。单帧多约 0.5ms（30fps 下约 +1.5% 单核）。
+17. **纸娃娃孤立飞点**：光栅化 / 皮肤纹理在面边界取整时，偶尔会在轮廓外留下 1~2 个子采样的覆盖点。3×3 超采样下几乎看不见，但 1px 描边会沿它膨胀一圈，放大成后脑勺外面的"黑刺"（调淡描边没用，飞点还在）。修法：描边前对超采样覆盖做 4 邻域连通块标记，**小于 12 个子采样**的块直接清零（`doll.rs` 的 `MIN_COMPONENT`）。每帧约 +0.5–1ms（30fps 下约 +2% 单核）。
 
 ---
 
@@ -161,6 +163,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.7.2 | `dist\installer\TransGlass_2.7.2_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.7.2.zip` | ✅ |
 | v2.7.3 | `dist\installer\TransGlass_2.7.3_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.7.3.zip` | ✅ |
 | v2.7.4 | `dist\installer\TransGlass_2.7.4_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.7.4.zip` | ✅ |
+| v2.7.5 | `dist\installer\TransGlass_2.7.5_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.7.5.zip` | ✅ |
 
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
@@ -189,6 +192,8 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | 悬浮球显示、静置（0.12s 重绘） | **2–2.5%** |
 | 悬浮球 + 鼠标持续移动（30fps） | +9% 左右 |
 | 主界面窗口预览（15fps × 每窗 PrintWindow） | **6–12%（真正的 CPU 大头）** |
+
+> 2.7.5 的孤立飞点清理每帧约 +0.5ms（悬浮球单核占用大约 +1~2%）。
 
 嫌吵就把「窗口与预览 → 预览帧率」调低或设 0；悬浮球待机动画两个都关掉后静置完全不重绘。
 
