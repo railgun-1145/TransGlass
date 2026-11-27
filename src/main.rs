@@ -24,6 +24,7 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+mod selector;
 mod selftest;
 mod doll;
 
@@ -1077,27 +1078,31 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
             };
 
             let root_val = root.0 as isize;
-            if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
-                if state.mouse_passthrough != state.pen_passthrough {
-                    let is_pen = match get_input_mode() {
-                        InputMode::Auto => effective_is_pen(&info),
-                        InputMode::ForceMouse => false,
-                        InputMode::ForcePen => true,
-                    };
-                    let dev = if is_pen { 1 } else { 0 };
-                    let passthrough = if is_pen {
-                        state.pen_passthrough
-                    } else {
-                        state.mouse_passthrough
-                    };
-                    // 只有"设备或窗口变了"才改扩展样式：以前每个鼠标移动都改一次，笔悬停时会疯狂抖动
-                    let same = LAST_DEVICE.load(Ordering::Relaxed) == dev
-                        && LAST_DEVICE_HWND.load(Ordering::Relaxed) == root_val;
-                    if !same {
-                        LAST_DEVICE.store(dev, Ordering::Relaxed);
-                        LAST_DEVICE_HWND.store(root_val, Ordering::Relaxed);
-                        set_hwnd_mouse_transparent(root, passthrough);
-                        PERF_STYLE_FLIPS.fetch_add(1, Ordering::Relaxed);
+            // 点透会话期间选中的窗口临时不点透：别让单设备逻辑按鼠标/笔把
+            // WS_EX_TRANSPARENT 又加回去，否则选中后还是点不动。
+            if !crate::selector::is_session_window(root_val) {
+                if let Some(state) = GLOBAL_REGISTRY.get(&root_val) {
+                    if state.mouse_passthrough != state.pen_passthrough {
+                        let is_pen = match get_input_mode() {
+                            InputMode::Auto => effective_is_pen(&info),
+                            InputMode::ForceMouse => false,
+                            InputMode::ForcePen => true,
+                        };
+                        let dev = if is_pen { 1 } else { 0 };
+                        let passthrough = if is_pen {
+                            state.pen_passthrough
+                        } else {
+                            state.mouse_passthrough
+                        };
+                        // 只有"设备或窗口变了"才改扩展样式：以前每个鼠标移动都改一次，笔悬停时会疯狂抖动
+                        let same = LAST_DEVICE.load(Ordering::Relaxed) == dev
+                            && LAST_DEVICE_HWND.load(Ordering::Relaxed) == root_val;
+                        if !same {
+                            LAST_DEVICE.store(dev, Ordering::Relaxed);
+                            LAST_DEVICE_HWND.store(root_val, Ordering::Relaxed);
+                            set_hwnd_mouse_transparent(root, passthrough);
+                            PERF_STYLE_FLIPS.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -1153,7 +1158,7 @@ fn hide_root_window() {
 
 // --- 底层核心逻辑 ---
 
-unsafe fn get_window_title(hwnd: HWND) -> String {
+pub(crate) unsafe fn get_window_title(hwnd: HWND) -> String {
     let mut text: [u16; 512] = [0; 512];
     let len = GetWindowTextW(hwnd, &mut text);
     if len > 0 {
@@ -1262,10 +1267,29 @@ unsafe fn apply_transparency_to_hwnd(
     Ok(())
 }
 
+/// 会话结束时按管理状态重放样式：临时摘掉的 WS_EX_TRANSPARENT 要还回去。
+/// 单设备点透（只鼠标或只笔）的样式由钩子下一次事件决定，这里只负责恢复 alpha/置顶。
+pub(crate) unsafe fn reapply_managed_state(hwnd: HWND) -> bool {
+    let v = hwnd.0 as isize;
+    let values = GLOBAL_REGISTRY
+        .get(&v)
+        .map(|st| (st.current_alpha, st.user_pref_topmost, st.mouse_passthrough, st.pen_passthrough));
+    if let Some((alpha, top, mouse, pen)) = values {
+        let _ = apply_transparency_to_hwnd(hwnd, alpha, top, mouse, pen);
+        true
+    } else {
+        false
+    }
+}
+
+/// 让鼠标钩子下一次事件重新判断单设备点透样式（会话结束后必须调一次）。
+pub(crate) fn reset_passthrough_tracking() {
+    LAST_DEVICE_HWND.store(0, Ordering::Relaxed);
+}
+
 /// 只有存在"单设备点透"的窗口时，钩子才需要逐事件判断笔/鼠标；否则一律走快路径。
 /// 只在用户操作（改透明度/开关/还原）时调用，不在每条鼠标消息里扫描。
-fn refresh_device_tracking() {
-    let need = GLOBAL_REGISTRY
+fn refresh_device_tracking() {    let need = GLOBAL_REGISTRY
         .iter()
         .any(|kv| kv.value().mouse_passthrough != kv.value().pen_passthrough);
     DEVICE_TRACKING.store(need, Ordering::Relaxed);
@@ -1427,7 +1451,7 @@ unsafe fn restore_all_windows() {
     request_ui_repaint();
 }
 
-unsafe fn is_shell_hwnd(hwnd: HWND) -> bool {
+pub(crate) unsafe fn is_shell_hwnd(hwnd: HWND) -> bool {
     if hwnd.0.is_null() {
         return false;
     }
@@ -1464,7 +1488,7 @@ unsafe fn is_shell_hwnd(hwnd: HWND) -> bool {
     )
 }
 
-unsafe fn is_own_hwnd(hwnd: HWND) -> bool {
+pub(crate) unsafe fn is_own_hwnd(hwnd: HWND) -> bool {
     if hwnd.0.is_null() {
         return false;
     }
@@ -1487,6 +1511,7 @@ enum HotkeyCaptureTarget {
     ResetAll,
     Update,
     Reload,
+    SelectSession,
 }
 
 struct TransGlassApp {
@@ -2378,6 +2403,7 @@ impl TransGlassApp {
         }
         check("还原当前窗口", &cfg.reset_current)?;
         check("还原所有窗口", &cfg.reset_all)?;
+        check("选择/控制窗口", &cfg.select_session)?;
         if let Some(spec) = cfg.reload.as_ref() {
             check("重载配置", spec)?;
         }
@@ -2402,6 +2428,7 @@ impl TransGlassApp {
                 HotkeyCaptureTarget::ResetAll => self.hotkey_draft.reset_all = spec,
                 HotkeyCaptureTarget::Update => self.hotkey_draft.update = spec,
                 HotkeyCaptureTarget::Reload => self.hotkey_draft.reload = Some(spec),
+                HotkeyCaptureTarget::SelectSession => self.hotkey_draft.select_session = spec,
             }
             self.hotkey_message = Some("已录入快捷键".into());
         }
@@ -3484,6 +3511,9 @@ fn main() -> Result<(), eframe::Error> {
 
     let tray_icon = create_tray_icon();
 
+    // 点透会话选择器：独立线程 + 分层窗口，热键只往它投消息
+    selector::init();
+
     thread::spawn(|| unsafe {
         HOTKEY_THREAD_ID.store(GetCurrentThreadId(), Ordering::Relaxed);
         let mut init = MSG::default();
@@ -3528,6 +3558,9 @@ fn main() -> Result<(), eframe::Error> {
                     }
                     10 => {
                         cycle_input_mode();
+                    }
+                    11 => {
+                        crate::selector::toggle();
                     }
                     _ => {}
                 }
@@ -3641,10 +3674,17 @@ struct HotkeyConfig {
     reset_all: HotkeySpec,
     update: HotkeySpec,
     reload: Option<HotkeySpec>,
+    /// 点透会话：Alt+Tab 式选窗口，临时关点透，选中后可拖动/控制，Esc 恢复
+    #[serde(default = "default_select_session_spec")]
+    select_session: HotkeySpec,
     mouse: Option<MouseBindingsSpec>,
     /// true = 用低级键盘钩子强占组合键（即使被其它程序占用也能生效）
     #[serde(default)]
     hotkey_priority: Option<bool>,
+}
+
+fn default_select_session_spec() -> HotkeySpec {
+    HotkeySlot::SelectSession.default_spec()
 }
 
 fn default_config() -> HotkeyConfig {
@@ -3659,6 +3699,7 @@ fn default_config() -> HotkeyConfig {
         reset_all: HotkeySlot::ResetAll.default_spec(),
         update: HotkeySpec { modifiers: "ALT".to_string(), key: "U".to_string() },
         reload: Some(HotkeySlot::Reload.default_spec()),
+        select_session: HotkeySlot::SelectSession.default_spec(),
         mouse: Some(MouseBindingsSpec {
             xbutton1: Some("decrease".into()),
             xbutton2: Some("increase".into()),
@@ -3866,7 +3907,7 @@ fn save_ui_state(state: &UiState) {
 }
 
 /// 所有热键槽位的 id 分配。新增功能必须在这里登记，否则重载时会漏注销。
-pub(crate) const HOTKEY_IDS: [i32; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+pub(crate) const HOTKEY_IDS: [i32; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
 unsafe fn parse_vk(s: &str) -> Option<u32> {
     let up = s.trim().to_uppercase();
@@ -4157,10 +4198,11 @@ pub(crate) enum HotkeySlot {
     ResetCurrent,
     ResetAll,
     Reload,
+    SelectSession,
 }
 
 impl HotkeySlot {
-    pub(crate) const ALL: [HotkeySlot; 9] = [
+    pub(crate) const ALL: [HotkeySlot; 10] = [
         HotkeySlot::Increase,
         HotkeySlot::Decrease,
         HotkeySlot::ToggleTop,
@@ -4170,6 +4212,7 @@ impl HotkeySlot {
         HotkeySlot::ResetCurrent,
         HotkeySlot::ResetAll,
         HotkeySlot::Reload,
+        HotkeySlot::SelectSession,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -4183,6 +4226,7 @@ impl HotkeySlot {
             HotkeySlot::ResetCurrent => "还原当前窗口",
             HotkeySlot::ResetAll => "还原全部窗口",
             HotkeySlot::Reload => "重载热键配置",
+            HotkeySlot::SelectSession => "选择/控制窗口",
         }
     }
 
@@ -4197,6 +4241,7 @@ impl HotkeySlot {
             HotkeySlot::ResetCurrent => "reset_current",
             HotkeySlot::ResetAll => "reset_all",
             HotkeySlot::Reload => "reload",
+            HotkeySlot::SelectSession => "select_session",
         }
     }
 
@@ -4222,6 +4267,7 @@ impl HotkeySlot {
             HotkeySlot::ResetCurrent => ("ALT", "R"),
             HotkeySlot::ResetAll => ("ALT+SHIFT", "R"),
             HotkeySlot::Reload => ("ALT+SHIFT", "C"),
+            HotkeySlot::SelectSession => ("ALT", "`"),
         };
         HotkeySpec {
             modifiers: mods.into(),
@@ -4240,6 +4286,7 @@ impl HotkeySlot {
             HotkeySlot::ResetAll => 7,
             HotkeySlot::Reload => 9,
             HotkeySlot::CycleInputMode => 10,
+            HotkeySlot::SelectSession => 11,
         }
     }
 
@@ -4291,6 +4338,7 @@ impl HotkeySlot {
             HotkeySlot::ResetCurrent => cfg.reset_current.clone(),
             HotkeySlot::ResetAll => cfg.reset_all.clone(),
             HotkeySlot::Reload => cfg.reload.clone().unwrap_or_else(|| self.default_spec()),
+            HotkeySlot::SelectSession => cfg.select_session.clone(),
         }
     }
 
@@ -4305,6 +4353,7 @@ impl HotkeySlot {
             HotkeySlot::ResetCurrent => cfg.reset_current = spec,
             HotkeySlot::ResetAll => cfg.reset_all = spec,
             HotkeySlot::Reload => cfg.reload = Some(spec),
+            HotkeySlot::SelectSession => cfg.select_session = spec,
         }
     }
 
@@ -4319,6 +4368,7 @@ impl HotkeySlot {
             HotkeySlot::ResetCurrent => HotkeyCaptureTarget::ResetCurrent,
             HotkeySlot::ResetAll => HotkeyCaptureTarget::ResetAll,
             HotkeySlot::Reload => HotkeyCaptureTarget::Reload,
+            HotkeySlot::SelectSession => HotkeyCaptureTarget::SelectSession,
         }
     }
 }

@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.7.6**
+> 归档时间：2026-11-28　·　对应版本：**v2.8.0**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.7.6** |
+| 当前版本 | **v2.8.0** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -26,6 +26,7 @@
 ```
 src/main.rs      ~6000 行：Win32 窗口控制 / 托盘 / 热键 / 悬浮球 / egui 主界面 都在这里
 src/doll.rs      MC 3D 纸娃娃软件光栅器（6 个 box + 皮肤 UV + 背面剔除 + 画家算法 + z-buffer + 3×3 超采样 + 超采样域 1px 描边）
+src/selector.rs  点透会话：Alt+Tab 式全屏窗口选择器（分层窗口 + GDI）、临时关点透、提顶、退出恢复
 build.rs         embed-manifest（清单）+ embed-resource（exe 图标 icon.ico）
 TransGlass.iss   Inno Setup 安装脚本
 docs/            使用教程 + 截图
@@ -40,6 +41,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 窗口透明 | `WS_EX_LAYERED` + `SetLayeredWindowAttributes(LWA_ALPHA)`；改前存 `original_ex_style`，还原时整份恢复 |
 | 点透 | `WS_EX_TRANSPARENT`；鼠标/笔分开靠**低级鼠标钩子**按设备判定（`is_pen_input` + RawInput 上报） |
 | 热键 | 普通模式：`RegisterHotKey`；优先模式：`WH_KEYBOARD_LL` 抢键后 `PostThreadMessage(WM_HOTKEY)`；**鼠标键热键**由 `WH_MOUSE_LL` 派发 |
+| 点透会话 | `selector.rs`：默认 Alt+反引号 唤出全屏选择器；选中后临时摘 `WS_EX_TRANSPARENT`、提到最上层、激活（可拖动），Esc/再按热键按会话前快照恢复 z 序 + 最小化 + 点透 |
 | 输入设备 | RawInput 枚举（鼠标 0x01/0x02、笔 0x0D/0x02、触摸 0x0D/0x04）+ `RIDEV_INPUTSINK` 旁听线程，按设备判断笔/鼠标 |
 | 悬浮球 | 独立分层窗口（`UpdateLayeredWindow`）+ CPU 渲染；展开面板是 **MC 背包/设置界面风格**（`#C6C6C6` 底 + 黑框 + 斜面 + `#8B8B8B` 按钮） |
 | 纸娃娃 | `doll.rs` 直接写 BGRA 到内存位图；朝向跟光标，yaw 限幅 ±62°，永不露背面 |
@@ -50,7 +52,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 
 ---
 
-## 3. 当前功能清单（v2.7.6）
+## 3. 当前功能清单（v2.8.0）
 
 **窗口控制**：逐窗透明度（滑条/热键）、置顶、鼠标点透、笔点透、全部还原、右键卡片菜单。
 **悬浮球**：左键展开/收起、双击纸娃娃开主界面、拖动移动、面板 4 按钮（置顶/穿透/模式/还原）+ 透明度滑条、标题栏 MC 风格 ×（关闭）、**显示当前目标软件名【Photoshop】**、**最近输入（鼠标/笔）**。
@@ -58,10 +60,11 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 **设置**：快捷键（战争雷霆式绑定，支持鼠标键）、输入（模式 + 鼠标/笔/数位板三下拉）、窗口与预览、悬浮球与纸娃娃（皮肤/模型/大小/待机动画/显示开关/双击开关）、维护（自检/更新/**开机自启动**/配置目录）。
 **兼容**：PS 家族（photoshop/illustrator/aftereffects/lightroom/indesign/premiere）、画世界类（huashijie/artworld/painter/画世界）、OBS/VLC/PotPlayer/Office —— 改完 alpha 追加 `DwmFlush` + `RedrawWindow`，避免留旧帧。
 **热键冲突提示**：注册失败（1409）时直接点名最可能的占用软件（实测 ALT+R / ALT+SHIFT+R = NVIDIA App 的游戏内叠加层），并给出「快捷键优先」/换绑两条路，不再只甩 Win32 错误码。
+**点透会话**：默认 Alt+反引号 唤出 Alt+Tab 式全屏选择器（←/→/Tab 切换，Enter/点击选中，Esc 取消）；选中后临时关闭该窗口的点透、提到最上层并激活，可正常拖动/操作；Esc 或再按热键结束，恢复点透、最小化状态和原 z 序。热键可在「设置 → 快捷键 → 选择/控制窗口」改。
 
 ---
 
-## 4. 版本历史（本次会话 1.4.2 → 2.7.6）
+## 4. 版本历史（本次会话 1.4.2 → 2.8.0）
 
 | 版本 | 关键改动 |
 | :--- | :--- |
@@ -85,6 +88,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.7.4 | 纸娃娃描边改到超采样域（去掉半透明灰圈 + 双层描边）；热键冲突提示点名占用软件与解决办法 |
 | 2.7.5 | 描边前清掉轮廓外的孤立覆盖飞点，修后脑勺外的"黑刺" |
 | 2.7.6 | 最小化窗口保留最后一帧预览（采集失败也回退旧帧）+ 「已最小化」标注 |
+| 2.8.0 | **点透会话**：Alt+反引号 全屏选窗口、临时关点透、提顶/拖动、Esc 恢复 z 序/最小化/点透 |
 
 ---
 
@@ -108,6 +112,10 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 16. **纸娃娃描边**：旧写法是在降采样后的 mask 上取 8 邻域最大值、`alpha = 0.42 × 邻居覆盖`，结果是一条 1~2px、透明度忽高忽低的半透明灰圈，缩到 3px/皮肤像素时就是"毛边"；`ball_render` 末尾还又套了一层 1px 深色描边。现在描边在**超采样域**膨胀覆盖遮罩（半径 = ss 子采样 = 1 目标像素）、跟模型一起降采样，`alpha = 0.85`，并删掉 `ball_render` 里那一层。单帧多约 0.5ms（30fps 下约 +1.5% 单核）。
 17. **纸娃娃孤立飞点**：光栅化 / 皮肤纹理在面边界取整时，偶尔会在轮廓外留下 1~2 个子采样的覆盖点。3×3 超采样下几乎看不见，但 1px 描边会沿它膨胀一圈，放大成后脑勺外面的"黑刺"（调淡描边没用，飞点还在）。修法：描边前对超采样覆盖做 4 邻域连通块标记，**小于 12 个子采样**的块直接清零（`doll.rs` 的 `MIN_COMPONENT`）。每帧约 +0.5–1ms（30fps 下约 +2% 单核）。
 18. **最小化窗口的缩略图**：最小化后 `GetWindowRect` 只剩 160×28，`PrintWindow` 只给黑帧（CEF 的 KOOK/Edge 实测）。别在最小化时重抓，直接返回 `self.thumbs` 里的上一帧；采集失败也保留旧帧，别回退成「无预览」。卡片/列表用 `IsIconic` 标「已最小化」。注意：**启动时已经最小化**的窗口没有历史帧，只能显示「已最小化」占位；恢复一下再最小化就有图。
+19. **选择器不要"失焦即取消"**：`AttachThreadInput` + `SetForegroundWindow` 抢前台时会收到一次瞬时的 `WM_ACTIVATE(WA_INACTIVE)`。如果在 `WM_ACTIVATE` 里 `cancel_chooser()`，刚显示的选择器会立刻被隐藏（表现为前台是 `TransGlassSelector`、`IsWindowVisible` 却是 false）。失焦不取消，靠 Esc / 再按热键 / 点空白退出。
+20. **会话 z 序还原**：选中前记录"上方最近的**同层级**可见窗口"（跳过隐藏窗口和另一个 topmost 分组），结束时 `SetWindowPos` 插回它下面。非 topmost 窗口如果以悬浮球（topmost）为锚点，会被一起顶成 topmost（实测 Notepad 会话结束后 `WS_EX_TOPMOST` 多了一位）。原来最小化的窗口结束时要 `SW_MINIMIZE` 回去。
+21. **单设备点透**：会话选中的窗口要临时摘 `WS_EX_TRANSPARENT`，同时 `mouse_hook_proc` 必须跳过它的单设备翻转（`selector::is_session_window`），否则下一次鼠标移动又把透明加回去，选中后还是点不动。结束调 `reset_passthrough_tracking()`，让钩子按当前设备重新判一次。
+22. **选择器初选**：唤出时记录光标位置，移动 <6px 不改选中；否则光标刚好压在卡片上会把初始选中（前台窗口）改掉（实测开了选择器就跳到 KOOK）。
 
 ---
 
@@ -167,6 +175,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.7.4 | `dist\installer\TransGlass_2.7.4_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.7.4.zip` | ✅ |
 | v2.7.5 | `dist\installer\TransGlass_2.7.5_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.7.5.zip` | ✅ |
 | v2.7.6 | `dist\installer\TransGlass_2.7.6_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.7.6.zip` | ✅ |
+| v2.8.0 | `dist\installer\TransGlass_2.8.0_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.8.0.zip` | ✅ |
 
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
@@ -212,6 +221,9 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 - [ ] 爱发电发布需人工
 - [ ] 纸娃娃按 3× 超采样 + 每帧约 2MB 中间缓冲（col / z-buffer / 描边膨胀）；如还要压性能，可改 thread_local 复用缓冲
 - [ ] 缩略图预览对 GPU 应用（PS/AE）截图有时是黑帧（PrintWindow 限制），可考虑改 DXGI 抓取（2.7.6 起会保留上一帧，不会变「无预览」）
+- [ ] **自由形状区域点透（Phase 2）还没做**：2.8.0 只有整窗级的点透会话；下一步才是「每窗口多个自由形状选区（点透洞）+ 套索编辑」
+- [ ] 选择器 v1 只覆盖主屏，高 DPI 下 GDI 尺寸没按 DPI 缩放（100% 缩放下正常）；多显示器/高 DPI 可再适配
+- [ ] 选择器默认热键 Alt+反引号 可在「设置 → 快捷键 → 选择/控制窗口」改；若被系统/输入法占用，按冲突提示换绑或开快捷键优先
 
 ---
 

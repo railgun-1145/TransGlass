@@ -97,6 +97,15 @@
 - **悬停高亮**：由 ticker 用 `GetCursorPos` 统一算（`BALL_HOVER`），不依赖 `WM_MOUSEMOVE`——分层窗口在没有捕获时不一定收得到移动消息。
 - **支持**：经典（4 宽手臂）/ 纤细 Alex（3 宽）两套 UV，按皮肤自动判定（右臂纹理区最右两列是否为空），可在设置里强制；第二层皮肤（帽子/外套/袖子）按 MC 规则外扩 0.5 / 0.25 像素叠加；HD 皮肤按边长缩放 UV。
 
+### 4.5 点透会话选择器（`selector.rs`）
+- **线程/窗口**：独立线程 + 全屏 `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST` 窗口；`UpdateLayeredWindow` 贴 BGRA 预乘缓冲，主线程只 `PostMessage(WM_APP+0x41)` 触发，不碰 UI。
+- **候选窗口**：`EnumWindows` + `IsWindowVisible`（最小化也算）、排除自身/Shell/工具窗/`WS_EX_NOACTIVATE`/被 DWM cloaked（其它虚拟桌面）/过小窗；`GetClassLongPtr` 取类图标，标题 + `cached_app_name`。
+- **绘制**：整屏压暗（黑 alpha 92）+ 居中 880×340 白面板；5 张卡片（图标 + 软件名 + 标题 + 「已最小化」），GDI 文字/`DrawIconEx` 画在 32bpp DIB 上，面板区域内 alpha 统一 255；卡片矩形存 `State.cards` 供鼠标命中。
+- **状态机**：`IDLE → CHOOSING → ACTIVE`。CHOOSING 时点透不动（全屏层自己吃鼠标）；确认后先记会话快照（原 `WS_EX_TRANSPARENT`、是否最小化、上方最近的同层级可见窗口），再摘透明位、`SetWindowPos(HWND_TOP)`、`SetForegroundWindow`，进入 ACTIVE。
+- **退出**：Esc（临时 `WH_KEYBOARD_LL` 钩子 → `PostMessage(WM_APP+0x42)`）或再按热键；按注册表重放样式（`reapply_managed_state`）、`reset_passthrough_tracking()`、插回原 z 序、原来最小化的 `SW_MINIMIZE` 回去。
+- **主线程配合**：`mouse_hook_proc` 对 `selector::is_session_window(root)` 跳过单设备点透翻转；热键槽 `HotkeySlot::SelectSession`（默认 ALT+反引号，id 11）→ `selector::toggle()`。
+- **坑**：`WM_ACTIVATE(WA_INACTIVE)` 在 `AttachThreadInput` 抢前台时会瞬时报一次，不能当取消；非 topmost 窗口的 z 序锚点要跳过 topmost 分组，否则结束会被顶成 topmost。
+
 ## 5. 构建与打包流程
 1. **环境准备**: 安装 Rust 工具链 (MSVC) 及 Inno Setup。
 2. **编译源码**: 
