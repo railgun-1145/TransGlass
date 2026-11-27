@@ -705,14 +705,14 @@ unsafe fn on_up() {
         } else {
             let pts = st.drawing.drain(..).collect::<Vec<_>>();
             st.drawing_px.clear();
-            // 一次一个封闭选区：新画的直接替换旧的（类似蒙版，新建选择）
-            st.regions = vec![Region {
+            // 每个封闭选区 = 一个独立蒙版，新画的追加
+            st.regions.push(Region {
                 pts,
                 invert: false,
                 opacity: 100,
                 enabled: true,
-            }];
-            st.selected = Some(0);
+            });
+            st.selected = Some(st.regions.len() - 1);
             true
         }
     });

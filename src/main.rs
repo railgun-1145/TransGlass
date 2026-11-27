@@ -1936,10 +1936,10 @@ impl TransGlassApp {
                                     if ui.button("选中并显示").clicked() {
                                         crate::select_window_for_control(*hwnd);
                                                                     }
-                                    if ui.button("编辑当前选区").clicked() {
+                                    if ui.button("编辑当前蒙版").clicked() {
                                         crate::regions::open_editor(*hwnd);
                                     }
-                                    if ui.button("清空选区").clicked() {
+                                    if ui.button("清空蒙版").clicked() {
                                         crate::regions::clear(*hwnd);
                                     }
                                 });
@@ -4947,7 +4947,7 @@ fn ps_selection_panel(ui: &mut egui::Ui, selected: &mut usize) {
         .map(|(_, r)| r.clone())
         .unwrap_or_default();
     ui.label(
-        egui::RichText::new("选区 / 点透")
+        egui::RichText::new("蒙版 / 点透")
             .font(font_title(16.0))
             .color(TEXT_PRIMARY),
     );
@@ -4994,9 +4994,9 @@ fn ps_selection_panel(ui: &mut egui::Ui, selected: &mut usize) {
         }
     });
     ui.separator();
-    ui.label(egui::RichText::new("选区图层").small().strong());
+    ui.label(egui::RichText::new("蒙版列表").small().strong());
     if regions.is_empty() {
-        ui.label(egui::RichText::new("还没有点透选区").small().weak());
+        ui.label(egui::RichText::new("还没有蒙版").small().weak());
     } else {
         if *selected >= regions.len() {
             *selected = regions.len() - 1;
@@ -5022,7 +5022,7 @@ fn ps_selection_panel(ui: &mut egui::Ui, selected: &mut usize) {
                     {
                         crate::regions::update_region(target, i, None, None, Some(en));
                     }
-                    let name = format!("圈 {}  {}", i + 1, if r.invert { "反向" } else { "洞" });
+                    let name = format!("蒙版 {}  {}", i + 1, if r.invert { "反向" } else { "洞" });
                     if ui.selectable_label(is_sel, egui::RichText::new(name).size(12.0)).clicked() {
                         *selected = i;
                     }
@@ -5056,16 +5056,15 @@ fn ps_selection_panel(ui: &mut egui::Ui, selected: &mut usize) {
     }
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        if ui.button("编辑当前选区").clicked() {
+        if ui.button("编辑当前蒙版").clicked() {
             crate::regions::open_editor_at(target, Some(*selected));
         }
-        if ui.button("新建选择").clicked() {
-            crate::regions::clear(target);
+        if ui.button("新建蒙版").clicked() {
             crate::regions::open_editor_at(target, None);
         }
     });
     ui.horizontal(|ui| {
-        if ui.button("清空选区").clicked() {
+        if ui.button("清空蒙版").clicked() {
             crate::regions::clear(target);
         }
         if ui.button("刷新透明洞").clicked() {
@@ -5152,7 +5151,7 @@ fn selection_controls_ui(ui: &mut egui::Ui, hwnd: isize) {
                 {
                     crate::regions::update_region(hwnd, i, None, None, Some(en));
                 }
-                ui.label(format!("圈 {}", i + 1));
+                ui.label(format!("蒙版 {}", i + 1));
                 let mut inv = r.invert;
                 if ui.checkbox(&mut inv, "反向").changed() {
                     crate::regions::update_region(hwnd, i, Some(inv), None, None);
@@ -5171,12 +5170,11 @@ fn selection_controls_ui(ui: &mut egui::Ui, hwnd: isize) {
         }
     }
     ui.horizontal(|ui| {
-        if ui.button("编辑当前选区").clicked() {
+        if ui.button("编辑当前蒙版").clicked() {
             crate::regions::open_editor(hwnd);
             ui.close_menu();
         }
-        if ui.button("新建选择").clicked() {
-            crate::regions::clear(hwnd);
+        if ui.button("新建蒙版").clicked() {
             crate::regions::open_editor_at(hwnd, None);
             ui.close_menu();
         }
@@ -5419,6 +5417,7 @@ unsafe fn toggle_main_window() {
 // ---- 悬浮球：Win32 分层窗口（ARGB 逐像素透明）+ 自带点击处理 ----
 static BALL_HWND: AtomicIsize = AtomicIsize::new(0);
 static BUBBLE_HWND: AtomicIsize = AtomicIsize::new(0);
+static BUBBLE_SHOWN_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 /// 最后一次点击命中的（非自身的）窗口，悬浮球遥控的目标
 static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
 static BALL_EXPANDED: AtomicBool = AtomicBool::new(false);
@@ -6624,8 +6623,24 @@ unsafe extern "system" fn bubble_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
     match msg {
         WM_TIMER => {
             if w.0 == 3 {
-                let _ = KillTimer(hwnd, 3);
-                let _ = ShowWindow(hwnd, SW_HIDE);
+                let started = BUBBLE_SHOWN_AT.lock().ok().and_then(|t| *t);
+                let e = started
+                    .map(|s| s.elapsed().as_millis() as i32)
+                    .unwrap_or(99999);
+                if e < 3200 {
+                    return LRESULT(0);
+                }
+                if e >= 3800 {
+                    let _ = KillTimer(hwnd, 3);
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    if let Ok(mut t) = BUBBLE_SHOWN_AT.lock() {
+                        *t = None;
+                    }
+                    return LRESULT(0);
+                }
+                let a = (255 * (3800 - e) / 600).clamp(0, 255) as u8;
+                let (x, y) = bubble_pos();
+                let _ = bubble_render(x, y, a);
             }
             LRESULT(0)
         }
@@ -6645,6 +6660,19 @@ unsafe fn bubble_hide() {
         let _ = KillTimer(hwnd, 3);
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
+    if let Ok(mut t) = BUBBLE_SHOWN_AT.lock() {
+        *t = None;
+    }
+}
+
+fn bubble_pos() -> (i32, i32) {
+    let bx = BALL_POS_X.load(Ordering::Relaxed) + BALL_W - 42;
+    let by = BALL_POS_Y.load(Ordering::Relaxed);
+    let sw = unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN) };
+    let sh = unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN) };
+    let x = (bx - BUBBLE_W / 2).clamp(6, (sw - BUBBLE_W - 6).max(6));
+    let y = (by - BUBBLE_H - 4).clamp(6, (sh - BUBBLE_H - 6).max(6));
+    (x, y)
 }
 
 unsafe fn bubble_show() {
@@ -6659,13 +6687,8 @@ unsafe fn bubble_show() {
     if h == 0 {
         return;
     }
-    let bx = BALL_POS_X.load(Ordering::Relaxed) + BALL_W - 42;
-    let by = BALL_POS_Y.load(Ordering::Relaxed) + BALL_H / 2;
-    let sw = GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN);
-    let sh = GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN);
-    let x = (bx - BUBBLE_W / 2).clamp(6, (sw - BUBBLE_W - 6).max(6));
-    let y = (by - 42 - BUBBLE_H).clamp(6, (sh - BUBBLE_H - 6).max(6));
-    if !bubble_render(x, y) {
+    let (x, y) = bubble_pos();
+    if !bubble_render(x, y, 255) {
         return;
     }
     let hwnd = HWND(h as *mut _);
@@ -6680,10 +6703,13 @@ unsafe fn bubble_show() {
             | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
     );
     let _ = ShowWindow(hwnd, SW_SHOWNA);
-    SetTimer(hwnd, 3, 3500, None);
+    SetTimer(hwnd, 3, 30, None);
+    if let Ok(mut t) = BUBBLE_SHOWN_AT.lock() {
+        *t = Some(std::time::Instant::now());
+    }
 }
 
-unsafe fn bubble_render(x: i32, y: i32) -> bool {
+unsafe fn bubble_render(x: i32, y: i32, alpha: u8) -> bool {
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, GetDC,
         ReleaseDC, SelectObject, SetBkMode, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BI_RGB,
@@ -6757,7 +6783,7 @@ unsafe fn bubble_render(x: i32, y: i32) -> bool {
     // 标记色方块
     mc_fill(buf, w, h, 14, 16, 24, 26, color, 1.0);
     draw_mc_label(mem, &format!("已选中 · {}", tag), (30, 8, w - 14, 34), (43, 43, 43));
-    draw_mc_label(mem, &format!("{} · 选区 {} 个", app, n), (16, 34, w - 16, 54), (60, 60, 60));
+    draw_mc_label(mem, &format!("{} · 蒙版 {} 个", app, n), (16, 34, w - 16, 54), (60, 60, 60));
     draw_mc_label(mem, "右键悬浮球管理", (16, 56, w - 16, 80), (90, 90, 90));
 
     // 文字 alpha 补齐 + 预乘
@@ -6789,7 +6815,7 @@ unsafe fn bubble_render(x: i32, y: i32) -> bool {
     let blend = BLENDFUNCTION {
         BlendOp: 0,
         BlendFlags: 0,
-        SourceConstantAlpha: 255,
+        SourceConstantAlpha: alpha,
         AlphaFormat: 1,
     };
     let _ = windows::Win32::UI::WindowsAndMessaging::UpdateLayeredWindow(

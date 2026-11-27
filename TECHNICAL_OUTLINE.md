@@ -125,7 +125,8 @@
 - **右侧 PS 面板**：`SidePanel::right("ps_panel")` → `ps_selection_panel(ui, &mut App::ps_selected)`；`Region.enabled` 眼睛；`update_region(hwnd, idx, invert, opacity, enabled)`；`open_editor_at(hwnd, Some(idx))` 用 `PENDING_SELECTED` 按选中圈打开。
 - **最小化残留**：区域编辑器 `WM_TIMER` 200ms 查 `main_window_handle()`，主窗口 `IsIconic`/不可见就隐藏覆盖层，恢复再显示；`SetTimer`/`KillTimer` 在 `begin_edit`/`end_edit`。
 - **悬浮球气泡**：`BUBBLE_HWND` 独立 layered 窗口，`bubble_render` 用 `draw_mc_panel/mc_fill/draw_mc_label` 画 MC 面板 + 像素尾，`WM_BALL_BUBBLE` 触发，3500ms `WM_TIMER` 收起；`ball_bubble()` 在 `TARGET_HWND` 变化/`set_target_window` 后调用。
-- **单选区**：编辑器 `on_up` 用 `st.regions = vec![new]` 替换；面板/右键「新建选择」= `clear` + `open_editor_at`；一次最多 1 个圈。
+- **多蒙版**：编辑器 `on_up` 用 `st.regions.push(...)` 追加，每个封闭选区一个独立蒙版；面板/右键「新建蒙版」= 只 `open_editor_at`（不 clear）；「编辑当前蒙版」按选中条打开；点透/视觉取所有启用蒙版的并集。
+- **气泡位置/渐隐**：`bubble_pos()` 放球窗口上方（`BALL_POS_Y - BUBBLE_H - 4`）；`BUBBLE_SHOWN_AT` + 30ms `WM_TIMER`，3.2s 保持、0.6s `SourceConstantAlpha` 渐隐、3.8s 隐藏；重复点 `bubble_show` 重置。
 - **选区联动**：卡片的 `regions::update_region/remove_region` 走 `WM_VISUAL_MASK` 只重画覆盖层 mask，保留已抓的下层快照；编辑/保存才 `refresh_visual` 重新抓。
 - **右键悬浮球**：`WindowFromPoint` 在球中心拿到球自己；沿 `GW_HWNDNEXT` 跳过 own/shell，检查矩形包含，`GetAncestor(GA_ROOT)`；找到就 `select_window_for_control`（切目标 + 弹面板），找不到只弹当前面板。
 - **坑**：选择框是 transient cue，不要永久置顶；topmost 目标会遮住主界面/标签，auto-hide 兜底；卡片的透明度滑条不能触发重新抓快照；`ball_set_expanded` 在主线程跑 200ms 动画，别重入。
