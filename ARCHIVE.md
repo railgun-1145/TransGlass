@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.13.0**
+> 归档时间：2026-11-28　·　对应版本：**v2.14.0**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.13.0** |
+| 当前版本 | **v2.14.0** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -45,7 +45,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 热键 | 普通模式：`RegisterHotKey`；优先模式：`WH_KEYBOARD_LL` 抢键后 `PostThreadMessage(WM_HOTKEY)`；**鼠标键热键**由 `WH_MOUSE_LL` 派发 |
 | 点透会话 | `selector.rs`：默认 Alt+反引号 唤出全屏选择器（窗口缩略图预览，再按热键切下一个）；选中后临时摘 `WS_EX_TRANSPARENT`、提到最上层、激活（可拖动），Esc/再按热键按会话前快照恢复 z 序 + 最小化 + 点透 |
 | 点透选区 | `regions.rs`：窗口卡片右键 → 套索编辑器画多个自由形状；**每个选区可单独反向、单独调 0–100% 透明度**；按客户区归一化保存；低级鼠标钩子在洞内临时加 `WS_EX_TRANSPARENT`、出洞恢复；真·透明洞用点击穿透的置顶覆盖层贴「下层快照」；整窗点透的窗口上不生效 |
-| 选择可视化 / 选中控制 | `selection.rs`：当前目标画选择框 + 可点击标签（4 秒自动收起）；主界面左侧窗口树下挂子项「选中控制」，点开就是窗口卡片（缩略图/状态/透明度），再点收起；卡片/窗口右键「选中控制」子菜单管理标记/颜色/选区/窗口参数；目标关闭自动清理 |
+| 选择可视化 / 选区面板 | `selection.rs` + 主界面右侧「选区 / 点透」面板（PS 图层风格）：目标/标记颜色、选区图层列表（眼睛/反向/透明度/删除）、属性、按选中圈编辑、新建/清空/刷新、显示选中框、窗口状态；左侧窗口树子项 + 右键子菜单；目标关闭自动清理；最小化主程序时区域编辑器自动隐藏 |
 | 输入设备 | RawInput 枚举（鼠标 0x01/0x02、笔 0x0D/0x02、触摸 0x0D/0x04）+ `RIDEV_INPUTSINK` 旁听线程，按设备判断笔/鼠标 |
 | 悬浮球 | 独立分层窗口（`UpdateLayeredWindow`）+ CPU 渲染；展开面板是 **MC 背包/设置界面风格**（`#C6C6C6` 底 + 黑框 + 斜面 + `#8B8B8B` 按钮） |
 | 纸娃娃 | `doll.rs` 直接写 BGRA 到内存位图；朝向跟光标，yaw 限幅 ±62°，永不露背面 |
@@ -56,7 +56,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 
 ---
 
-## 3. 当前功能清单（v2.13.0）
+## 3. 当前功能清单（v2.14.0）
 
 **窗口控制**：逐窗透明度（滑条/热键）、置顶、鼠标点透、笔点透、全部还原、右键卡片菜单。
 **悬浮球**：左键展开/收起、双击纸娃娃开主界面、拖动移动、面板 4 按钮（置顶/穿透/模式/还原）+ 透明度滑条、标题栏 MC 风格 ×（关闭）、**显示当前目标软件名【Photoshop】**、**最近输入（鼠标/笔）**、**模式按钮直接显示当前模式（自动/鼠标/笔）**、**右下「操作中」红字表示当前目标正被 Alt 会话操作**。
@@ -66,11 +66,11 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 **热键冲突提示**：注册失败（1409）时直接点名最可能的占用软件（实测 ALT+R / ALT+SHIFT+R = NVIDIA App 的游戏内叠加层），并给出「快捷键优先」/换绑两条路，不再只甩 Win32 错误码。
 **点透会话**：默认 Alt+反引号 唤出 Alt+Tab 式全屏选择器（窗口缩略图预览；←/→/Tab 或再按热键切下一个，Enter/点击选中，Esc 取消）；选中后临时关闭该窗口的点透、提到最上层并激活，可正常拖动/操作；Esc 或再按热键结束，恢复点透、最小化状态和原 z 序。热键可在「设置 → 快捷键 → 选择/控制窗口」改。
 **点透选区（自由形状）**：窗口卡片右键 →「编辑自由形状选区…」→ 在窗口客户区上拖动画多边形；`Enter` 保存、`Backspace/Delete` 删、`Esc` 取消；`Tab` 选圈、`I` 逐圈反向、`[` `]` 调该圈透明度（0–100%）。**每个选区可以单独反向**：正常 = 圈内穿透；反向 = 圈内保留、圈外整片穿透。真·透明洞用置顶且点击穿透的覆盖层贴「下层画面快照」，按洞 mask 与该圈透明度混合（0% 只点透不视觉透，100% 完全盖住目标内容显示下层）。快照是静态的，下方变了右键「刷新透明洞画面」重新抓；覆盖层只在该窗口前台时显示，窗口移动/缩放后先隐藏，刷新后再出现。需要窗口没有开整窗点透；选区只保存在本次运行，重启要重画。
-**选择可视化 / 选中控制**：当前目标窗口外圈出现选择框和「已选中 · 标记」标签，4 秒自动收起（标签/右键「显示选中框」可再开）。左侧窗口列表在选中的窗口下挂一个子项「选中控制 · 标记」：点开展开为窗口卡片（缩略图/状态/透明度），再点收起；卡片里可「选中并显示/编辑选区/清空」。卡片和左侧窗口的右键菜单都有「选中控制」子菜单：标记文字/颜色、显示选中框、逐圈反向/透明度/删除、编辑/清空/刷新透明洞。关闭被控制的窗口后自动清理目标/选区/标记/选择框，不再残留选中界面。**右键悬浮球**仍会选中球下面那个窗口并弹面板。
+**选择可视化 / 选区面板**：当前目标窗口外圈出现选择框和「已选中 · 标记」标签，4 秒自动收起（标签/右键「显示选中框」可再开）。左侧窗口列表在选中的窗口下挂一个子项「选中控制 · 标记」：点开展开为窗口卡片（缩略图/状态/透明度），再点收起；卡片里可「选中并显示/编辑选区/清空」。卡片和左侧窗口的右键菜单都有「选中控制」子菜单：标记文字/颜色、显示选中框、逐圈反向/透明度/删除、编辑/清空/刷新透明洞。关闭被控制的窗口后自动清理目标/选区/标记/选择框，不再残留选中界面。主界面右侧新增 PS 风格「选区 / 点透」面板：选区图层（眼睛启用/停用、反向、透明度、删除）、属性、从面板选中的圈打开编辑器、新建/清空/刷新、窗口状态；最小化主程序时区域编辑器覆盖层自动隐藏，恢复后自动回来，不再残留。**右键悬浮球**仍会选中球下面那个窗口并弹面板。
 
 ---
 
-## 4. 版本历史（本次会话 1.4.2 → 2.13.0）
+## 4. 版本历史（本次会话 1.4.2 → 2.14.0）
 
 | 版本 | 关键改动 |
 | :--- | :--- |
@@ -101,6 +101,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.11.0 | **选择可视化**：绿框 + 已选中标签；右键悬浮球选窗口并主动弹控制；卡片右键选中并显示控制；Alt 会话弹球 |
 | 2.12.0 | 选择框 4 秒自动收起/可点击关闭；主界面「选中控制」卡片堆叠：标记颜色、选区反向/透明度/删除、窗口参数全可操作 |
 | 2.13.0 | 选中控制移到右键子菜单；左侧窗口树子项展开窗口卡片；关闭目标自动清理；顶部选中控制 section 移除 |
+| 2.14.0 | 最小化时区域编辑器残留修复；右侧 PS 风格选区面板（图层/眼睛/属性/选中圈编辑）；选区 enabled 眼睛 |
 
 ---
 
@@ -141,6 +142,8 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 33. **选择框不要做成永久置顶**：4 秒自动收起；标签是独立 topmost 小窗（`WM_LBUTTONUP` 设置 `ENABLED=false`），主界面「显示选中框」或卡片「选中并显示」可重新打开。目标窗口自己如果是 topmost，会盖住主界面/标签，auto-hide 是兜底；不要为了关框去 `SetWindowRgn` 或吞输入。
 35. **选中控制移到右键 + 左侧树子项**：顶部「选中控制」section 已移除；卡片/左侧窗口的右键菜单加「选中控制」子菜单（`selection_controls_ui`）。左侧 `nav_windows` 在 TARGET/有选区的窗口下挂 `CollapsingHeader` 子项，展开直接调 `self.window_card`（就是第二张图那种卡片），再点收起；`sel_set` 在 `nav_windows` 里一次算出（target + regions），别放进别的函数。
 36. **关闭目标自动清理**：`selection_cleanup()` 在 `refresh_window_list` 开头每帧跑：TARGET_HWND 无效就置 0、`regions::prune` 清无效窗口的选区和 hole style、`selection::prune` 清标记；视觉洞/选择框随之隐藏，左侧子项消失。不清理的话窗口都关了选中界面还在。
+37. **最小化时编辑器残留**：区域编辑器是全屏置顶覆盖层；主窗口最小化/隐藏后它还在。`editor_proc` 加 `WM_TIMER`（`begin_edit` 里 `SetTimer(overlay, 2, 200, None)`，`end_edit` 里 `KillTimer`），每 200ms 查 `crate::main_window_handle()`：`IsIconic` 或 `!IsWindowVisible` 就 `ShowWindow(SW_HIDE)`，恢复就 `SW_SHOW` + 前台。
+38. **右侧 PS 风格选区面板**：`SidePanel::right("ps_panel")` → `ps_selection_panel`，状态在 `App::ps_selected`；`Region` 新增 `enabled`（图层眼睛），停用后 `region_contains` 返回 false、视觉洞也不画；`update_region` 增加 `enabled: Option<bool>`。`open_editor_at(hwnd, Some(idx))` 用 `PENDING_SELECTED` 从面板选中的圈打开编辑器。拖动/滑条只走 `WM_VISUAL_MASK`，别重抓下层快照。
 34. **选中控制卡片**：主界面 `selection_control_section` 列 `TARGET_HWND` + 所有有选区的窗口；卡片用 `CollapsingHeader` 堆叠，可展开/收起。选区反向/透明度/删除走 `regions::update_region/remove_region` → `WM_VISUAL_MASK` **只重画覆盖层 mask**，不重新抓下层快照（否则每拖一下滑条就 BitBlt/闪）。标记存在 `selection.rs::MARKS`（hwnd → 文字/颜色），`set_mark` 清 `LAST` 让选择框重画；卡片标题和选择框标签都显示标记。
 
 ---
@@ -208,6 +211,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.11.0 | `dist\installer\TransGlass_2.11.0_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.11.0.zip` | ✅ |
 | v2.12.0 | dist\installer\TransGlass_2.12.0_Setup.exe | D:\TransGlass-dist\TransGlass_2.12.0.zip | ✅ |
 | v2.13.0 | `dist\installer\TransGlass_2.13.0_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.13.0.zip` | ✅ |
+| v2.14.0 | `dist\installer\TransGlass_2.14.0_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.14.0.zip` | ✅ |
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
 ---

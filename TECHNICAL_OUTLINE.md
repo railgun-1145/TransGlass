@@ -122,6 +122,8 @@
 - **右键子菜单**：`selection_controls_ui` 放进 `window_menu` 和左侧窗口行的右键菜单；内容：标记文字/颜色、显示选中框、逐圈反向/透明度/删除、编辑/清空/刷新透明洞。
 - **左侧树子项**：`nav_windows` 里对 TARGET/有选区的窗口挂 `CollapsingHeader`，展开调 `self.window_card`（窗口卡片，缩略图/状态/透明度），再点收起；`sel_set` 一次算出。
 - **关闭清理**：`selection_cleanup()` 在 `refresh_window_list` 每帧跑，TARGET 无效置 0，`regions::prune`/`selection::prune` 清无效窗口。
+- **右侧 PS 面板**：`SidePanel::right("ps_panel")` → `ps_selection_panel(ui, &mut App::ps_selected)`；`Region.enabled` 眼睛；`update_region(hwnd, idx, invert, opacity, enabled)`；`open_editor_at(hwnd, Some(idx))` 用 `PENDING_SELECTED` 按选中圈打开。
+- **最小化残留**：区域编辑器 `WM_TIMER` 200ms 查 `main_window_handle()`，主窗口 `IsIconic`/不可见就隐藏覆盖层，恢复再显示；`SetTimer`/`KillTimer` 在 `begin_edit`/`end_edit`。
 - **选区联动**：卡片的 `regions::update_region/remove_region` 走 `WM_VISUAL_MASK` 只重画覆盖层 mask，保留已抓的下层快照；编辑/保存才 `refresh_visual` 重新抓。
 - **右键悬浮球**：`WindowFromPoint` 在球中心拿到球自己；沿 `GW_HWNDNEXT` 跳过 own/shell，检查矩形包含，`GetAncestor(GA_ROOT)`；找到就 `select_window_for_control`（切目标 + 弹面板），找不到只弹当前面板。
 - **坑**：选择框是 transient cue，不要永久置顶；topmost 目标会遮住主界面/标签，auto-hide 兜底；卡片的透明度滑条不能触发重新抓快照；`ball_set_expanded` 在主线程跑 200ms 动画，别重入。

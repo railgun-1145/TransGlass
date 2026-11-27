@@ -1556,6 +1556,7 @@ struct TransGlassApp {
     wins_at: Option<std::time::Instant>,
     selected: Option<isize>,
     settings_open: bool,
+    ps_selected: usize,
     /// 设置页当前分类
     settings_tab: usize,
     /// 设置页淡入起点（切分类/刚打开时重置）
@@ -1686,6 +1687,7 @@ impl TransGlassApp {
             wins_at: None,
             selected: None,
             settings_open: std::env::var_os("TRANSGLASS_OPEN_SETTINGS").is_some(),
+            ps_selected: 0,
             settings_tab: 0,
             settings_fade: None,
             mini_mode: false,
@@ -3266,6 +3268,12 @@ impl eframe::App for TransGlassApp {
 
         // 设置页占满主区域，这里不再画窗口列表
         if !self.settings_open {
+        egui::SidePanel::right("ps_panel")
+            .resizable(false)
+            .default_width(256.0)
+            .show(ctx, |ui| {
+                ps_selection_panel(ui, &mut self.ps_selected);
+            });
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.mini_mode {
                 ui.horizontal(|ui| {
@@ -4930,6 +4938,162 @@ unsafe fn control_window(hwnd: HWND) {
     set_window_alpha(hwnd, 230);
 }
 
+fn ps_selection_panel(ui: &mut egui::Ui, selected: &mut usize) {
+    let target = crate::current_target();
+    let all = crate::regions::snapshot_all();
+    let regions = all
+        .iter()
+        .find(|(h, _)| *h == target)
+        .map(|(_, r)| r.clone())
+        .unwrap_or_default();
+    ui.label(
+        egui::RichText::new("选区 / 点透")
+            .font(font_title(16.0))
+            .color(TEXT_PRIMARY),
+    );
+    ui.add_space(4.0);
+    if target == 0 && regions.is_empty() {
+        ui.label(
+            egui::RichText::new("右键窗口卡片/左侧窗口，或右键悬浮球选中窗口后，这里显示选区和蒙版图层")
+                .small()
+                .weak(),
+        );
+        return;
+    }
+    let hwnd = HWND(target as *mut _);
+    let app = unsafe { cached_app_name(hwnd) };
+    let win_title = unsafe { get_window_title(hwnd) };
+    ui.label(egui::RichText::new(format!("{app}  ·  {win_title}")).size(12.0).weak());
+    ui.add_space(4.0);
+
+    let (tag, color) = crate::selection::mark_for(target).unwrap_or_else(|| {
+        (if app.trim().is_empty() { "窗口".to_string() } else { app.clone() }, (47u8, 194u8, 124u8))
+    });
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("标记").small().weak());
+        let mut edit = tag.clone();
+        if ui
+            .add(egui::TextEdit::singleline(&mut edit).desired_width(110.0))
+            .changed()
+        {
+            crate::selection::set_mark(target, edit, color);
+        }
+        for c in [
+            (47u8, 194u8, 124u8),
+            (70u8, 130u8, 220u8),
+            (240u8, 150u8, 60u8),
+            (180u8, 80u8, 200u8),
+        ] {
+            let btn = egui::Button::new(
+                egui::RichText::new("●").color(egui::Color32::from_rgb(c.0, c.1, c.2)),
+            )
+            .frame(false);
+            if ui.add(btn).clicked() {
+                crate::selection::set_mark(target, tag.clone(), c);
+            }
+        }
+    });
+    ui.separator();
+    ui.label(egui::RichText::new("选区图层").small().strong());
+    if regions.is_empty() {
+        ui.label(egui::RichText::new("还没有点透选区").small().weak());
+    } else {
+        if *selected >= regions.len() {
+            *selected = regions.len() - 1;
+        }
+        for (i, r) in regions.iter().enumerate() {
+            let is_sel = i == *selected;
+            let bg = if is_sel {
+                egui::Color32::from_rgb(0xE8, 0xF7, 0xEE)
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            let f = egui::Frame::none()
+                .fill(bg)
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(4.0, 3.0));
+            f.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let mut en = r.enabled;
+                    if ui
+                        .checkbox(&mut en, "")
+                        .on_hover_text("眼睛：启用/停用这个圈")
+                        .changed()
+                    {
+                        crate::regions::update_region(target, i, None, None, Some(en));
+                    }
+                    let name = format!("圈 {}  {}", i + 1, if r.invert { "反向" } else { "洞" });
+                    if ui.selectable_label(is_sel, egui::RichText::new(name).size(12.0)).clicked() {
+                        *selected = i;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").clicked() {
+                            crate::regions::remove_region(target, i);
+                        }
+                        ui.label(egui::RichText::new(format!("{}%", r.opacity)).small().weak());
+                    });
+                });
+            });
+        }
+    }
+    ui.separator();
+    if let Some(r) = regions.get(*selected) {
+        ui.label(egui::RichText::new("属性").small().strong());
+        let mut inv = r.invert;
+        if ui.checkbox(&mut inv, "反向（圈内保留、圈外穿透）").changed() {
+            crate::regions::update_region(target, *selected, Some(inv), None, None);
+        }
+        let mut op = r.opacity as i32;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("透明度").small().weak());
+            if ui
+                .add(egui::Slider::new(&mut op, 0..=100).suffix("%"))
+                .changed()
+            {
+                crate::regions::update_region(target, *selected, None, Some(op as u8), None);
+            }
+        });
+    }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.button("编辑选区…").clicked() {
+            crate::regions::open_editor_at(target, Some(*selected));
+        }
+        if ui.button("新建").clicked() {
+            crate::regions::open_editor_at(target, None);
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.button("清空选区").clicked() {
+            crate::regions::clear(target);
+        }
+        if ui.button("刷新透明洞").clicked() {
+            crate::regions::refresh_visual(target);
+        }
+    });
+    let mut on = crate::selection::enabled();
+    if ui.checkbox(&mut on, "显示选中框").changed() {
+        crate::selection::set_enabled(on);
+    }
+    ui.separator();
+    if let Some(st) = GLOBAL_REGISTRY.get(&target) {
+        let pct = (st.current_alpha as f32 / 255.0 * 100.0).round();
+        ui.label(
+            egui::RichText::new(format!(
+                "窗口：透明度 {}% · 置顶 {} · 鼠标点透 {} · 笔点透 {}",
+                pct,
+                if st.user_pref_topmost { "开" } else { "关" },
+                if st.mouse_passthrough { "开" } else { "关" },
+                if st.pen_passthrough { "开" } else { "关" }
+            ))
+            .small()
+            .weak(),
+        );
+    } else {
+        ui.label(egui::RichText::new("窗口未管理（右键卡片可控制）").small().weak());
+    }
+}
+
 fn selection_controls_ui(ui: &mut egui::Ui, hwnd: isize) {
     let hwnd_h = HWND(hwnd as *mut _);
     let app = unsafe { cached_app_name(hwnd_h) };
@@ -4988,17 +5152,25 @@ fn selection_controls_ui(ui: &mut egui::Ui, hwnd: isize) {
     } else {
         for (i, r) in regions.iter().enumerate() {
             ui.horizontal(|ui| {
+                let mut en = r.enabled;
+                if ui
+                    .checkbox(&mut en, "")
+                    .on_hover_text("眼睛：启用/停用这个圈")
+                    .changed()
+                {
+                    crate::regions::update_region(hwnd, i, None, None, Some(en));
+                }
                 ui.label(format!("圈 {}", i + 1));
                 let mut inv = r.invert;
                 if ui.checkbox(&mut inv, "反向").changed() {
-                    crate::regions::update_region(hwnd, i, Some(inv), None);
+                    crate::regions::update_region(hwnd, i, Some(inv), None, None);
                 }
                 let mut op = r.opacity as i32;
                 if ui
                     .add(egui::Slider::new(&mut op, 0..=100).suffix("%"))
                     .changed()
                 {
-                    crate::regions::update_region(hwnd, i, None, Some(op as u8));
+                    crate::regions::update_region(hwnd, i, None, Some(op as u8), None);
                 }
                 if ui.button("删").clicked() {
                     crate::regions::remove_region(hwnd, i);
@@ -5284,6 +5456,10 @@ pub(crate) fn set_target_window(hwnd: isize) {
         TARGET_HWND.store(hwnd, Ordering::Relaxed);
         ball_mark_dirty();
     }
+}
+
+pub(crate) fn main_window_handle() -> isize {
+    ROOT_HWND.load(Ordering::Relaxed)
 }
 
 pub(crate) fn current_target() -> isize {

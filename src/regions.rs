@@ -36,6 +36,8 @@ pub struct Region {
     pub invert: bool,
     /// 视觉洞的透明度 0..=100（不影响点击穿透）
     pub opacity: u8,
+    /// 图层"眼睛"：停用后这个圈既不点透也不视觉透
+    pub enabled: bool,
 }
 
 static REGIONS: Mutex<Vec<(isize, Vec<Region>)>> = Mutex::new(Vec::new());
@@ -44,6 +46,7 @@ static HOLE_STYLES: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 static INIT: Once = Once::new();
 static EDITOR_HWND: AtomicIsize = AtomicIsize::new(0);
 static PENDING: Mutex<Option<isize>> = Mutex::new(None);
+static PENDING_SELECTED: Mutex<Option<usize>> = Mutex::new(None);
 
 static VISUAL_HWND: AtomicIsize = AtomicIsize::new(0);
 static VISUAL_REQ: Mutex<Option<isize>> = Mutex::new(None);
@@ -61,9 +64,20 @@ pub fn init() {
 }
 
 pub fn open_editor(hwnd: isize) {
+    open_editor_at(hwnd, None);
+}
+
+pub fn open_editor_at(hwnd: isize, selected: Option<usize>) {
     if hwnd == 0 {
         return;
     }
+    if let Ok(mut p) = PENDING_SELECTED.lock() {
+        *p = selected;
+    }
+    open_editor_post(hwnd);
+}
+
+fn open_editor_post(hwnd: isize) {
     if let Ok(mut p) = PENDING.lock() {
         *p = Some(hwnd);
     }
@@ -161,7 +175,13 @@ pub fn snapshot_all() -> Vec<(isize, Vec<Region>)> {
     REGIONS.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
-pub fn update_region(hwnd: isize, idx: usize, invert: Option<bool>, opacity: Option<u8>) {
+pub fn update_region(
+    hwnd: isize,
+    idx: usize,
+    invert: Option<bool>,
+    opacity: Option<u8>,
+    enabled: Option<bool>,
+) {
     let mut any_visual = false;
     if let Ok(mut v) = REGIONS.lock() {
         if let Some((_, regions)) = v.iter_mut().find(|(h, _)| *h == hwnd) {
@@ -172,8 +192,11 @@ pub fn update_region(hwnd: isize, idx: usize, invert: Option<bool>, opacity: Opt
                 if let Some(o) = opacity {
                     r.opacity = o.min(100);
                 }
+                if let Some(e) = enabled {
+                    r.enabled = e;
+                }
             }
-            any_visual = regions.iter().any(|r| r.opacity > 0);
+            any_visual = regions.iter().any(|r| r.enabled && r.opacity > 0);
         }
     }
     clear_hole_style(hwnd);
@@ -298,6 +321,9 @@ pub fn enforce_at(x: i32, y: i32) {
 }
 
 fn region_contains(r: &Region, x: f32, y: f32) -> bool {
+    if !r.enabled {
+        return false;
+    }
     let inside = point_in_poly(&r.pts, x, y);
     if r.invert {
         !inside
@@ -428,6 +454,24 @@ unsafe extern "system" fn editor_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             begin_edit(hwnd);
             LRESULT(0)
         }
+        WM_TIMER => {
+            if ES.with(|e| e.borrow().active) {
+                let root = crate::main_window_handle();
+                let hidden = root == 0
+                    || unsafe {
+                        !IsWindowVisible(HWND(root as *mut _)).as_bool()
+                            || IsIconic(HWND(root as *mut _)).as_bool()
+                    };
+                let vis = IsWindowVisible(hwnd).as_bool();
+                if hidden && vis {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                } else if !hidden && !vis {
+                    let _ = ShowWindow(hwnd, SW_SHOW);
+                    let _ = SetForegroundWindow(hwnd);
+                }
+            }
+            LRESULT(0)
+        }
         WM_SETCURSOR => {
             let _ = SetCursor(LoadCursorW(None, IDC_CROSS).unwrap_or_default());
             LRESULT(1)
@@ -491,7 +535,12 @@ unsafe fn begin_edit(overlay: HWND) {
     let selected = if regions.is_empty() {
         None
     } else {
-        Some(regions.len() - 1)
+        let wanted = PENDING_SELECTED
+            .lock()
+            .ok()
+            .and_then(|mut p| p.take())
+            .unwrap_or(regions.len() - 1);
+        Some(wanted.min(regions.len() - 1))
     };
 
     let _ = SetWindowPos(
@@ -521,6 +570,7 @@ unsafe fn begin_edit(overlay: HWND) {
     let _ = SetWindowPos(overlay, HWND_TOPMOST, cx, cy, w, h, SWP_NOACTIVATE);
     draw_editor(overlay);
     let _ = ShowWindow(overlay, SW_SHOW);
+    SetTimer(overlay, 2, 200, None);
     focus_editor(overlay);
 }
 
@@ -530,6 +580,7 @@ unsafe fn end_edit(overlay: HWND, save: bool) {
         return;
     }
     let _ = ShowWindow(overlay, SW_HIDE);
+    KillTimer(overlay, 2);
     let _ = ReleaseCapture();
     if save {
         set_regions(state.hwnd, state.regions.clone());
@@ -658,6 +709,7 @@ unsafe fn on_up() {
                 pts,
                 invert: false,
                 opacity: 100,
+                enabled: true,
             });
             st.selected = Some(st.regions.len() - 1);
             true
@@ -823,7 +875,9 @@ unsafe fn draw_editor(overlay: HWND) {
             .iter()
             .map(|(x, y)| ((x * w as f32) as i32, (y * h as f32) as i32))
             .collect();
-        let (rgb, fill) = if r.invert {
+        let (rgb, fill) = if !r.enabled {
+            ((110, 110, 110), 18)
+        } else if r.invert {
             ((76, 126, 220), 34)
         } else {
             ((47, 194, 124), 42)
