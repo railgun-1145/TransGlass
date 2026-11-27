@@ -24,6 +24,7 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+mod regions;
 mod selector;
 mod selftest;
 mod doll;
@@ -565,7 +566,7 @@ unsafe fn uninstall_mouse_hook() {
     }
 }
 
-unsafe fn set_hwnd_mouse_transparent(hwnd: HWND, enabled: bool) {
+pub(crate) unsafe fn set_hwnd_mouse_transparent(hwnd: HWND, enabled: bool) {
     let current = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
     let next = if enabled {
         current | WS_EX_TRANSPARENT.0
@@ -585,6 +586,14 @@ unsafe fn set_hwnd_mouse_transparent(hwnd: HWND, enabled: bool) {
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER,
     );
+}
+
+/// 这个窗口现在是不是"整窗点透"（鼠标或笔任一开）——点透选区在这种窗口上不生效。
+pub(crate) fn window_passthrough_active(hwnd: isize) -> bool {
+    GLOBAL_REGISTRY
+        .get(&hwnd)
+        .map(|s| s.mouse_passthrough || s.pen_passthrough)
+        .unwrap_or(false)
 }
 
 /// 输入设备类别：0 鼠标，1 笔/数位板，2 触摸，3 其它 HID
@@ -1035,8 +1044,11 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                 | WM_MOUSEHWHEEL
                 | WM_MOUSEMOVE
         ) {
-            // 快路径：面板不可见、也没有"单设备点透"窗口时，钩子里什么都不用做
-            if !WINDOW_VISIBLE.load(Ordering::Relaxed) && !DEVICE_TRACKING.load(Ordering::Relaxed) {
+            // 快路径：面板不可见、也没有"单设备点透"窗口、也没画过点透选区时，钩子里什么都不用做
+            if !WINDOW_VISIBLE.load(Ordering::Relaxed)
+                && !DEVICE_TRACKING.load(Ordering::Relaxed)
+                && !crate::regions::has_any()
+            {
                 PERF_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
                 return CallNextHookEx(
                     HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
@@ -1055,8 +1067,10 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                 }
             }
 
-            // 没有单设备点透的窗口 → 后面的 WindowFromPoint / 注册表查询全部跳过
-            if !DEVICE_TRACKING.load(Ordering::Relaxed) || GLOBAL_REGISTRY.is_empty() {
+            // 没有单设备点透的窗口、也没有选区 → 后面的 WindowFromPoint / 注册表查询全部跳过
+            if (!DEVICE_TRACKING.load(Ordering::Relaxed) || GLOBAL_REGISTRY.is_empty())
+                && !crate::regions::has_any()
+            {
                 PERF_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
                 return CallNextHookEx(
                     HHOOK(MOUSE_HOOK.load(Ordering::SeqCst) as *mut _),
@@ -1065,6 +1079,10 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                     lparam,
                 );
             }
+
+            // 点透选区：按当前坐标维护临时 WS_EX_TRANSPARENT，必须早于 hit_root_at，
+            // 否则选区里的窗口被判定成"下层"后就走不到这里了
+            crate::regions::enforce_at(info.pt.x, info.pt.y);
 
             PERF_TRACK_CALLS.fetch_add(1, Ordering::Relaxed);
             let root = match hit_root_at(info.pt.x, info.pt.y) {
@@ -3515,6 +3533,7 @@ fn main() -> Result<(), eframe::Error> {
 
     // 点透会话选择器：独立线程 + 分层窗口，热键只往它投消息
     selector::init();
+    regions::init();
 
     thread::spawn(|| unsafe {
         HOTKEY_THREAD_ID.store(GetCurrentThreadId(), Ordering::Relaxed);
@@ -4908,6 +4927,21 @@ fn window_menu(ui: &mut egui::Ui, hwnd: isize, title: &str) {
         }
     } else if ui.button("控制（90% 透明）").clicked() {
         unsafe { control_window(HWND(hwnd as *mut _)) };
+    }
+    ui.separator();
+    let n_regions = crate::regions::count(hwnd);
+    ui.label(
+        egui::RichText::new(format!("点透选区：{n_regions} 个"))
+            .small()
+            .weak(),
+    );
+    if ui.button("编辑自由形状选区…").clicked() {
+        crate::regions::open_editor(hwnd);
+        ui.close_menu();
+    }
+    if n_regions > 0 && ui.button("清空选区").clicked() {
+        crate::regions::clear(hwnd);
+        ui.close_menu();
     }
 }
 
