@@ -5485,7 +5485,6 @@ pub(crate) fn select_window_for_control(hwnd: isize) {
         return;
     }
     set_target_window(hwnd);
-    ball_popup_panel();
 }
 
 /// 主动弹出悬浮球面板（必要时先显示悬浮球）。
@@ -6502,6 +6501,9 @@ unsafe fn ball_set_expanded(target: bool) {
         return;
     }
     BALL_EXPANDED.store(target, Ordering::Relaxed);
+    if target {
+        bubble_hide();
+    }
     // 12 步 × 16ms ≈ 200ms，三次方 ease-out：起手快、收尾慢
     let steps = 12;
     for i in 0..=steps {
@@ -6667,16 +6669,19 @@ unsafe fn bubble_hide() {
 
 fn bubble_pos() -> (i32, i32) {
     let bx = BALL_POS_X.load(Ordering::Relaxed) + BALL_W - 42;
-    let by = BALL_POS_Y.load(Ordering::Relaxed);
+    let by = BALL_POS_Y.load(Ordering::Relaxed) + BALL_H / 2;
     let sw = unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN) };
     let sh = unsafe { GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN) };
     let x = (bx - BUBBLE_W / 2).clamp(6, (sw - BUBBLE_W - 6).max(6));
-    let y = (by - BUBBLE_H - 4).clamp(6, (sh - BUBBLE_H - 6).max(6));
+    let y = (by - 42 - BUBBLE_H - 6).clamp(6, (sh - BUBBLE_H - 6).max(6));
     (x, y)
 }
 
 unsafe fn bubble_show() {
     if !BALL_SHOWN.load(Ordering::Relaxed) {
+        return;
+    }
+    if BALL_EXPANDED.load(Ordering::Relaxed) {
         return;
     }
     if current_target() == 0 {
