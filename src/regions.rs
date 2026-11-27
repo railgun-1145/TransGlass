@@ -1014,16 +1014,21 @@ unsafe fn draw_bar_button(
     }
     let bg = if !enabled {
         (236, 238, 240)
-    } else if primary || selected {
+    } else if primary {
         (47, 194, 124)
+    } else if selected {
+        // 选中的工具用浅绿底 + 深绿字，白字在绿底上太小会糊
+        (226, 245, 236)
     } else if hover {
         (236, 245, 240)
     } else {
         (255, 255, 255)
     };
     fill_rect(buf, w, x0, y0, x1, y1, bg, 255);
-    let edge = if primary || selected {
+    let edge = if primary {
         (39, 166, 105)
+    } else if selected {
+        (47, 194, 124)
     } else {
         (210, 214, 220)
     };
@@ -1033,8 +1038,10 @@ unsafe fn draw_bar_button(
     fill_rect(buf, w, x1 - 1, y0, x1, y1, edge, 255);
     let color = if !enabled {
         (150, 154, 160)
-    } else if primary || selected {
+    } else if primary {
         (255, 255, 255)
+    } else if selected {
+        (24, 120, 78)
     } else {
         (40, 44, 50)
     };
@@ -1157,8 +1164,9 @@ unsafe fn draw_editor(overlay: HWND) {
         255,
     );
 
-    let font = create_font(13, 700);
-    let font_small = create_font(11, 400);
+    // 13px 粗体 CJK 在 GDI 里会糊成空心块，用常规字重
+    let font = create_font(13, 400);
+    let font_small = create_font(12, 400);
     for (i, r) in bar.tools.iter().enumerate() {
         draw_bar_button(
             buf,
@@ -1729,7 +1737,9 @@ unsafe fn create_font(height: i32, weight: i32) -> HFONT {
         1,
         0,
         0,
-        4,
+        // 小字号 + 抗锯齿会把白字糊成半透明绿块（GDI AA 跟背景混合后再补 alpha）；
+        // 工具栏用非抗锯齿，笔画实心、白字清晰
+        3,
         0,
         windows::core::w!("Microsoft YaHei"),
     )

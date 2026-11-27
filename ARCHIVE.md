@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.19.0**
+> 归档时间：2026-11-28　·　对应版本：**v2.19.1**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.19.0** |
+| 当前版本 | **v2.19.1** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -108,6 +108,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.17.0 | 气泡贴近球（6px）；气泡与球面板互斥：选中只弹气泡，点球开面板气泡隐藏，面板展开不弹气泡 |
 | 2.18.0 | **编辑器改 PS 风格直出**：右侧面板顶部目标缩略图直接圈蒙版（完成/取消，完成即生效，去掉全屏覆盖层入口）；蒙版列表行内 56×36 小预览并与大缩略图联动；气泡改 MC 网易版聊天框（深色半透明底 + 像素边框 + 白字暗影 + 像素尾巴，1.8s + 0.5s 渐隐，拖动球/主界面立刻收起）；窗口动洞跟着动（follow_visual） |
 | 2.19.0 | **选区改回窗口上直接画**（微信截图/画图式）：压暗覆盖层 + 矩形/椭圆/自由工具 + 重画/取消/确定（Enter/Esc），确定生成一个蒙版；右侧面板只做预览；**新蒙版默认透明度 0%（只点透不改外观）**，修掉"透明处文字和本窗口文字错位"；抓下层快照时藏起主界面；气泡**可点击打开主界面**；面板加滚动条 |
+| 2.19.1 | **修左侧黑缝 + 压缩 UI**：长标题把侧栏内容撑宽（内容 478 > 面板 280），中央面板被迫右移、中间留一条黑缝——改成截断树/标题、侧栏固定 280 灰底、窗口 clear_color 改白色兜底；右侧面板去掉底部大按钮，清空/刷新挪到「蒙版列表」标题行，提示压到两行内，标题单行截断；编辑器工具栏文字改非抗锯齿 + 选中工具改浅绿底深绿字 |
 
 ---
 
@@ -160,6 +161,8 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 46. **命中缓存把面板点击算给别的窗口**：`hit_root_at` 有一份 `HIT_CACHE`（root hwnd + 矩形），鼠标钩子里按"点在缓存矩形内"直接返回。2.18.0 右侧面板要频繁点主界面，结果上次点过的大窗口（铺满屏幕的 PS/浏览器）矩形把面板上的点击也算成它，`TARGET_HWND` 被改走、画的蒙版跑到别的窗口上（实测目标突然跳成后面的浏览器）。修法：`hit_root_at_ex(x, y, use_cache)`，**点击落点走 `hit_root_at_fresh` 不吃缓存**，鼠标移动仍用缓存省 WindowFromPoint。
 47. **洞里的文字和本窗口文字"错位"**：透明洞贴的是**下层画面快照**，如果下层是别的窗口（哪怕只是浏览器/聊天框），洞内就会透出它的文字，叠在本窗口文字上，看起来就是"文字错位"。另外抓快照时如果 TransGlass 主界面压在目标上，主界面也会被拍进洞里。两处一起修：① `capture_visual` 抓之前，若主界面与目标客户区有交集就先 `SW_HIDE`，抓完再恢复（不交集就不动，避免目标拖动时反复闪）；② **新蒙版默认透明度 0%**（只点透、不改外观），要视觉洞才手动拉透明度（`apply_regions` 即使透明度 0 也先抓一张快照存着，之后拉滑块只走 `WM_VISUAL_MASK` 不重抓）。
 48. **气泡点了没反应**：气泡以前是 `WS_EX_TRANSPARENT` 的纯提示层，点它当然没反应。2.19.0 去掉 `WS_EX_TRANSPARENT`、`bubble_proc` 处理 `WM_LBUTTONUP` → `show_root_window()` + `bubble_hide()`，鼠标悬停换成手型；保留 `WS_EX_NOACTIVATE`，点气泡不抢焦点，只把主界面叫出来。第三行提示文字也从"右键悬浮球管理"改成"点这里打开主界面"。
+49. **侧栏长标题把面板撑宽 → 中间一条黑缝**：`SidePanel::left("nav_panel")` 里如果有超宽内容（比如「选中控制 · 完整窗口标题」的 `CollapsingHeader`，窗口标题一长就到 470+），egui 会把面板的 response rect 撑到内容宽度，下一个 `CentralPanel` 只能从被撑开的 x 开始，于是面板背景（280）和中央内容（478）之间露出窗口的 **clear color（默认透明黑）**，表现为一条几十像素的黑竖条，还白吃掉中央空间。修法：① 长标题截断（树里的子项/窗口行都截断到 12/18 个字）；② 左栏 `.resizable(false).exact_width(280)` 灰底；③ `eframe::App::clear_color` 改成白色兜底（万一还有缝也不会是黑的）。**以后往窄侧栏里加内容，都要保证不会把面板撑宽。**
+50. **编辑器工具栏白字变浅绿糊块**：13px 中文用 `ANTIALIASED_QUALITY` 时笔画像素是"白+背景绿"的中间色，补 alpha 后就变成不透明的浅绿，看起来像糊块。改成 `NONANTIALIASED_QUALITY`（3），笔画实心；选中的工具按钮也从"绿底白字"改成"浅绿底 + 深绿字 + 绿框"，小字号才看得清。
 34. **选中控制卡片**：主界面 `selection_control_section` 列 `TARGET_HWND` + 所有有选区的窗口；卡片用 `CollapsingHeader` 堆叠，可展开/收起。选区反向/透明度/删除走 `regions::update_region/remove_region` → `WM_VISUAL_MASK` **只重画覆盖层 mask**，不重新抓下层快照（否则每拖一下滑条就 BitBlt/闪）。标记存在 `selection.rs::MARKS`（hwnd → 文字/颜色），`set_mark` 清 `LAST` 让选择框重画；卡片标题和选择框标签都显示标记。
 
 ---
@@ -233,6 +236,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.17.0 | `dist\installer\TransGlass_2.17.0_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.17.0.zip` | ✅ |
 | v2.18.0 | `dist\installer\TransGlass_2.18.0_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.18.0.zip` | ✅ |
 | v2.19.0 | `dist\installer\TransGlass_2.19.0_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.19.0.zip` | ✅ |
+| v2.19.1 | `dist\installer\TransGlass_2.19.1_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.19.1.zip` | ✅ |
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
 ---

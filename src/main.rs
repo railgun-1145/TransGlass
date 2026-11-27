@@ -1897,7 +1897,14 @@ impl TransGlassApp {
                     for (hwnd, title, _) in &items {
                         let managed = GLOBAL_REGISTRY.contains_key(hwnd);
                         let mark = if managed { "●" } else { "○" };
-                        let label = format!("{mark} {title}");
+                        // 窗口标题可能很长；侧栏窄，截断避免文字溢出面板
+                        let short: String = title.chars().take(18).collect();
+                        let title_line = if title.chars().count() > 18 {
+                            format!("{short}…")
+                        } else {
+                            short
+                        };
+                        let label = format!("{mark} {title_line}");
                         let resp = nav_row(ui, cur_sel == Some(*hwnd), &label, !managed)
                             .on_hover_text(if managed {
                                 "点击复原这个窗口（再点一次重新控制）"
@@ -1960,7 +1967,14 @@ impl TransGlassApp {
                             let (tag, color) = crate::selection::mark_for(*hwnd).unwrap_or_else(|| {
                                 (title.clone(), (47u8, 194u8, 124u8))
                             });
-                            let header = format!("选中控制 · {tag}");
+                            // 左栏很窄：标题太长会把侧栏撑宽（内容溢出 → 中间留一条黑缝），截断一下
+                            let short: String = tag.chars().take(12).collect();
+                            let tag_line = if tag.chars().count() > 12 {
+                                format!("{short}…")
+                            } else {
+                                short
+                            };
+                            let header = format!("选中控制 · {tag_line}");
                             egui::CollapsingHeader::new(
                                 egui::RichText::new(header)
                                     .size(12.0)
@@ -3087,6 +3101,11 @@ fn egui_modifiers_to_string(m: egui::Modifiers) -> String {
 }
 
 impl eframe::App for TransGlassApp {
+    /// 窗口底色：默认 clear color 是透明黑，任何布局缝都会露成一条黑边
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [BG_BASE.r() as f32 / 255.0, BG_BASE.g() as f32 / 255.0, BG_BASE.b() as f32 / 255.0, 1.0]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 1. 处理托盘和菜单事件 (逻辑保持不变)
 
@@ -3275,10 +3294,16 @@ impl eframe::App for TransGlassApp {
         });
 
         egui::SidePanel::left("nav_panel")
-            .resizable(true)
-            .default_width(300.0)
-            .width_range(230.0..=460.0)
+            .resizable(false)
+            .exact_width(280.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(BG_SIDEBAR)
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0)),
+            )
             .show(ctx, |ui| {
+                // 内容再长也别把侧栏撑宽（会把右边的中央面板挤窄）
+                ui.set_max_width(ui.available_width());
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.label(
@@ -7223,10 +7248,14 @@ impl TransGlassApp {
         let hwnd = HWND(target as *mut _);
         let app = unsafe { cached_app_name(hwnd) };
         let win_title = unsafe { get_window_title(hwnd) };
-        ui.label(
-            egui::RichText::new(format!("{app}  ·  {win_title}"))
-                .size(12.0)
-                .weak(),
+        // 标题太长会换两行占地方，单行截断
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!("{app}  ·  {win_title}"))
+                    .size(12.0)
+                    .weak(),
+            )
+            .truncate(),
         );
         ui.add_space(4.0);
 
@@ -7281,22 +7310,18 @@ impl TransGlassApp {
             {
                 crate::regions::open_editor(target);
             }
-            if regions.is_empty() {
-                ui.label(egui::RichText::new("还没有蒙版").small().weak());
-            } else {
+            if !regions.is_empty() {
                 ui.label(
-                    egui::RichText::new(format!("{} 个蒙版", regions.len()))
+                    egui::RichText::new(format!("{} 个", regions.len()))
                         .small()
                         .weak(),
                 );
             }
         });
         ui.label(
-            egui::RichText::new(
-                "框内 = 点透的洞，框外仍可操作；新蒙版默认只点透（透明度 0%），想要视觉洞把列表里的透明度拉起来",
-            )
-            .small()
-            .weak(),
+            egui::RichText::new("框内 = 点透；新蒙版默认 0%（只点透、不改外观）")
+                .small()
+                .weak(),
         );
         ui.separator();
 
@@ -7336,13 +7361,30 @@ impl TransGlassApp {
             }
         });
         ui.separator();
-        ui.label(egui::RichText::new("蒙版列表").small().strong());
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("蒙版列表").small().strong());
+            if !regions.is_empty() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("刷新")
+                        .on_hover_text("重新抓下层快照（视觉洞用）")
+                        .clicked()
+                    {
+                        crate::regions::refresh_visual(target);
+                    }
+                    if ui
+                        .small_button("清空")
+                        .on_hover_text("清空这个窗口的所有蒙版")
+                        .clicked()
+                    {
+                        crate::regions::clear(target);
+                        self.ps_selected = 0;
+                    }
+                });
+            }
+        });
         if regions.is_empty() {
-            ui.label(
-                egui::RichText::new("还没有蒙版：点上面「在窗口上画选区」到窗口上画")
-                    .small()
-                    .weak(),
-            );
+            ui.label(egui::RichText::new("还没有蒙版").small().weak());
         }
         // ---------- 蒙版列表：每行一张小预览 + 眼睛/反向/透明度/删除 ----------
         let mut pick: Option<usize> = None;
@@ -7476,16 +7518,6 @@ impl TransGlassApp {
         } else if self.ps_selected >= n {
             self.ps_selected = n - 1;
         }
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            if ui.button("清空蒙版").clicked() {
-                crate::regions::clear(target);
-                self.ps_selected = 0;
-            }
-            if ui.button("刷新透明洞").clicked() {
-                crate::regions::refresh_visual(target);
-            }
-        });
         ui.separator();
         if let Some(st) = GLOBAL_REGISTRY.get(&target) {
             let pct = (st.current_alpha as f32 / 255.0 * 100.0).round();
