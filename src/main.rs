@@ -2000,6 +2000,7 @@ impl TransGlassApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (hwnd, title, desktop) in wins {
+                    let minimized = unsafe { IsIconic(HWND(*hwnd as *mut _)).as_bool() };
                     let (alpha, top) = GLOBAL_REGISTRY
                         .get(hwnd)
                         .map(|s| (s.current_alpha, s.user_pref_topmost))
@@ -2048,10 +2049,16 @@ impl TransGlassApp {
                                         .truncate(),
                                     );
                                     ui.label(
-                                        egui::RichText::new(format!(
-                                            "{}% ｜ {desktop}",
-                                            (alpha as f32 / 255.0 * 100.0).round() as i32
-                                        ))
+                                        egui::RichText::new({
+                                            let mut meta = format!(
+                                                "{}% ｜ {desktop}",
+                                                (alpha as f32 / 255.0 * 100.0).round() as i32
+                                            );
+                                            if minimized {
+                                                meta.push_str(" · 已最小化");
+                                            }
+                                            meta
+                                        })
                                         .small()
                                         .weak(),
                                     );
@@ -2118,6 +2125,7 @@ impl TransGlassApp {
         desktop: &str,
         toggle: &mut Option<isize>,
     ) {
+        let minimized = unsafe { IsIconic(HWND(hwnd as *mut _)).as_bool() };
         let managed = GLOBAL_REGISTRY
             .get(&hwnd)
             .map(|s| (s.current_alpha, s.user_pref_topmost, s.mouse_passthrough, s.pen_passthrough));
@@ -2189,7 +2197,13 @@ impl TransGlassApp {
                                 ui.painter().text(
                                     rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    if self.preview_fps == 0 { "预览已关闭" } else { "无预览" },
+                                    if self.preview_fps == 0 {
+                                        "预览已关闭"
+                                    } else if minimized {
+                                        "已最小化"
+                                    } else {
+                                        "无预览"
+                                    },
                                     egui::FontId::proportional(12.0),
                                     TEXT_SECONDARY,
                                 );
@@ -2233,7 +2247,11 @@ impl TransGlassApp {
                             }
                             None => badges.push_str("未管理"),
                         }
-                        ui.label(egui::RichText::new(format!("{badges} ｜ {desktop}")).small().weak());
+                        let mut meta = format!("{badges} ｜ {desktop}");
+                        if minimized {
+                            meta.push_str(" · 已最小化");
+                        }
+                        ui.label(egui::RichText::new(meta).small().weak());
                         ui.add_space(4.0);
                         let mut a = alpha as f32;
                         ui.horizontal(|ui| {
@@ -2271,16 +2289,23 @@ impl TransGlassApp {
         if self.preview_fps == 0 {
             return None;
         }
-        let is_fg = unsafe { GetForegroundWindow() == HWND(hwnd as *mut _) };
+        let win = HWND(hwnd as *mut _);
+        let minimized = unsafe { IsIconic(win).as_bool() };
+        let is_fg = unsafe { GetForegroundWindow() == win };
         let fg_ms = (1000 / self.preview_fps.max(1) as u64).max(16);
         let interval_ms = if is_fg { fg_ms } else { fg_ms * 4 };
         if let Some((tex, at)) = self.thumbs.get(&hwnd) {
-            if (now.duration_since(*at).as_millis() as u64) < interval_ms {
+            // 最小化时不要再抓：PrintWindow 对最小化窗口只会给黑帧，
+            // 保留上一帧比变回「无预览」有用得多。
+            if minimized || (now.duration_since(*at).as_millis() as u64) < interval_ms {
                 return Some(tex.clone());
             }
         }
+        if minimized {
+            return None;
+        }
         unsafe {
-            if let Some(img) = capture_window(HWND(hwnd as *mut _)) {
+            if let Some(img) = capture_window(win) {
                 let tex = ctx.load_texture(
                     format!("thumb_{hwnd}"),
                     img,
@@ -2288,6 +2313,13 @@ impl TransGlassApp {
                 );
                 self.thumbs.insert(hwnd, (tex.clone(), now));
                 return Some(tex);
+            }
+            // 抓取失败（GPU 黑帧 / 暂时不可见）时别把旧帧扔掉：
+            // 继续显示上一帧，等下个 interval 再重试。
+            if let Some((old, _)) = self.thumbs.get(&hwnd) {
+                let old = old.clone();
+                self.thumbs.insert(hwnd, (old.clone(), now));
+                return Some(old);
             }
         }
         None
