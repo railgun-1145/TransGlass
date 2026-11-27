@@ -3881,6 +3881,88 @@ pub(crate) fn is_mouse_vk(vk: u32) -> bool {
     matches!(vk, 0x01 | 0x02 | 0x04 | 0x05 | 0x06 | 0x20A | 0x20B)
 }
 
+/// Windows 没有"查询这个全局热键被谁注册了"的接口（RegisterHotKey 只返回
+/// 1409），所以冲突时只能按"进程在跑 + 它默认占这个键"给用户一个提示。
+/// 表里只放默认键位稳定、且真的会抢 Alt+R 这类组合的常见软件；
+/// 文案里写明是"很可能被谁占用"，而不是甩一个 Win32 错误码。
+struct KnownHotkeyOwner {
+    /// 小写 exe 名
+    exe: &'static str,
+    /// 给用户看的软件名
+    app: &'static str,
+    /// 对方默认用这个键做什么
+    feature: &'static str,
+    /// MOD_* 位
+    mods: u32,
+    /// 虚拟键码
+    vk: u32,
+}
+
+const KNOWN_HOTKEY_OWNERS: &[KnownHotkeyOwner] = &[
+    // NVIDIA App / GeForce 叠加层（ALT+R 性能统计、ALT+SHIFT+R 轮换指标）
+    KnownHotkeyOwner { exe: "nvidia overlay.exe", app: "NVIDIA App 的游戏内叠加层", feature: "打开/关闭性能统计", mods: 0x0001, vk: 0x52 },
+    KnownHotkeyOwner { exe: "nvidia overlay.exe", app: "NVIDIA App 的游戏内叠加层", feature: "轮换性能统计指标", mods: 0x0005, vk: 0x52 },
+    KnownHotkeyOwner { exe: "nvidia overlay.exe", app: "NVIDIA App 的游戏内叠加层", feature: "呼出叠加层", mods: 0x0001, vk: 0x5A },
+    KnownHotkeyOwner { exe: "nvidia share.exe", app: "NVIDIA GeForce 叠加层", feature: "打开/关闭性能统计", mods: 0x0001, vk: 0x52 },
+    KnownHotkeyOwner { exe: "nvidia share.exe", app: "NVIDIA GeForce 叠加层", feature: "轮换性能统计指标", mods: 0x0005, vk: 0x52 },
+    KnownHotkeyOwner { exe: "nvidia share.exe", app: "NVIDIA GeForce 叠加层", feature: "呼出叠加层", mods: 0x0001, vk: 0x5A },
+    // AMD Software 的覆盖层
+    KnownHotkeyOwner { exe: "radeonsoftware.exe", app: "AMD Software 的覆盖层", feature: "打开/关闭覆盖层", mods: 0x0001, vk: 0x52 },
+    // 微信 / QQ 的截图
+    KnownHotkeyOwner { exe: "weixin.exe", app: "微信", feature: "截图", mods: 0x0001, vk: 0x41 },
+    KnownHotkeyOwner { exe: "wechat.exe", app: "微信", feature: "截图", mods: 0x0001, vk: 0x41 },
+    KnownHotkeyOwner { exe: "qq.exe", app: "QQ", feature: "截图", mods: 0x0003, vk: 0x41 },
+    // Snipaste
+    KnownHotkeyOwner { exe: "snipaste.exe", app: "Snipaste", feature: "截图", mods: 0x0000, vk: 0x70 },
+    KnownHotkeyOwner { exe: "snipaste.exe", app: "Snipaste", feature: "贴图", mods: 0x0000, vk: 0x73 },
+];
+
+/// 当前进程的 exe 名（小写）。快照失败就返回空表，只影响提示文案。
+fn running_exe_names() -> Vec<String> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return out;
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                out.push(String::from_utf16_lossy(&entry.szExeFile[..end]).to_ascii_lowercase());
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    out
+}
+
+/// 猜测占用者：进程在跑、且这个组合键正好是它的默认键位。
+/// 返回 (软件名, 对方用这个键做什么)。Windows 不提供真实占用者，所以只作提示。
+pub(crate) fn hotkey_owner_hint(mods: u32, vk: u32) -> Option<(&'static str, &'static str)> {
+    let exes = running_exe_names();
+    if exes.is_empty() {
+        return None;
+    }
+    KNOWN_HOTKEY_OWNERS
+        .iter()
+        .find(|k| k.mods == mods && k.vk == vk && exes.iter().any(|e| e == k.exe))
+        .map(|k| (k.app, k.feature))
+}
+
 /// 注册单个热键；失败时把原因记进 `RUNTIME_ISSUES`，不再静默吞掉。
 unsafe fn try_register_hotkey(id: i32, spec: &HotkeySpec, name: &str) -> bool {
     let mods = parse_modifiers(&spec.modifiers);
@@ -3899,15 +3981,24 @@ unsafe fn try_register_hotkey(id: i32, spec: &HotkeySpec, name: &str) -> bool {
         Ok(()) => true,
         Err(e) => {
             let win32 = GetLastError().0;
-            let hint = if win32 == 1409 || e.code().is_err() {
-                "，可能已被其它程序占用"
+            let combo = format!(
+                "{}+{}",
+                spec.modifiers.trim().to_uppercase(),
+                spec.key.trim().to_uppercase()
+            );
+            if win32 == 1409 || e.code().is_err() {
+                let why = match hotkey_owner_hint(mods.0, vk) {
+                    Some((app, feature)) => format!("很可能被 {app}占用（它默认用这个键{feature}）"),
+                    None => "被另一个程序占用（Windows 不会告诉我们是谁）".to_string(),
+                };
+                push_issue(format!(
+                    "「{name}」{combo} {why}。可开启「设置 → 快捷键 → 快捷键优先」强制生效，或换绑其它组合键。"
+                ));
             } else {
-                ""
-            };
-            push_issue(format!(
-                "热键「{name}」({}+{}) 注册失败{}(Win32 {win32})，该功能快捷键不可用",
-                spec.modifiers, spec.key, hint
-            ));
+                push_issue(format!(
+                    "「{name}」{combo} 注册失败（系统错误 {win32}），该功能的快捷键暂时不可用。"
+                ));
+            }
             false
         }
     }
@@ -5525,31 +5616,9 @@ unsafe fn ball_render() {
         BALL_DOLL_RECT.store(doll_rect, Ordering::Relaxed);
     }
 
-    // 给纸娃娃加 1px 深色描边（无方块时靠它从桌面里跳出来）
-    {
-        let snapshot = buf.to_vec();
-        for yy in 1..(h - 1) {
-            for xx in 1..(w - 1) {
-                let o = ((yy * w + xx) * 4) as usize;
-                if snapshot[o + 3] != 0 {
-                    continue;
-                }
-                let mut hit = false;
-                for (nx, ny) in [(xx - 1, yy), (xx + 1, yy), (xx, yy - 1), (xx, yy + 1)] {
-                    let ni = ((ny * w + nx) * 4) as usize;
-                    if snapshot[ni + 3] > 120 {
-                        hit = true;
-                    }
-                }
-                if hit {
-                    buf[o] = 8;
-                    buf[o + 1] = 10;
-                    buf[o + 2] = 14;
-                    buf[o + 3] = 190;
-                }
-            }
-        }
-    }
+    // 纸娃娃的 1px 描边现在由 `doll::render` 在超采样域里画（和模型边缘一起
+    // 降采样，边缘干净、粗细稳定）。这里不要再套一圈：两层描边叠起来又粗又毛。
+    // 面板本身有 2px 黑框（draw_mc_panel / draw_mc_stage），也不需要这层。
 
     // 文字（GDI 只写 RGB，最后统一补 alpha）
     let _ = SetBkMode(mem, TRANSPARENT);

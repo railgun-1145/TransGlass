@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-27　·　对应版本：**v2.7.3**
+> 归档时间：2026-11-28　·　对应版本：**v2.7.4**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.7.3** |
+| 当前版本 | **v2.7.4** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -25,7 +25,7 @@
 
 ```
 src/main.rs      ~6000 行：Win32 窗口控制 / 托盘 / 热键 / 悬浮球 / egui 主界面 都在这里
-src/doll.rs      MC 3D 纸娃娃软件光栅器（6 个 box + 皮肤 UV + 背面剔除 + 画家算法 + z-buffer + 3×3 超采样 + 1px 描边）
+src/doll.rs      MC 3D 纸娃娃软件光栅器（6 个 box + 皮肤 UV + 背面剔除 + 画家算法 + z-buffer + 3×3 超采样 + 超采样域 1px 描边）
 build.rs         embed-manifest（清单）+ embed-resource（exe 图标 icon.ico）
 TransGlass.iss   Inno Setup 安装脚本
 docs/            使用教程 + 截图
@@ -50,17 +50,18 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 
 ---
 
-## 3. 当前功能清单（v2.7.3）
+## 3. 当前功能清单（v2.7.4）
 
 **窗口控制**：逐窗透明度（滑条/热键）、置顶、鼠标点透、笔点透、全部还原、右键卡片菜单。
 **悬浮球**：左键展开/收起、双击纸娃娃开主界面、拖动移动、面板 4 按钮（置顶/穿透/模式/还原）+ 透明度滑条、标题栏 MC 风格 ×（关闭）、**显示当前目标软件名【Photoshop】**、**最近输入（鼠标/笔）**。
 **主界面**：窗口卡片网格（缩略图 + `【软件名】标题` + 透明滑条 + 置顶）、虚拟桌面胶囊筛选、缩略图预览（帧率可调）、小窗模式、设置页（5 分类）。
 **设置**：快捷键（战争雷霆式绑定，支持鼠标键）、输入（模式 + 鼠标/笔/数位板三下拉）、窗口与预览、悬浮球与纸娃娃（皮肤/模型/大小/待机动画/显示开关/双击开关）、维护（自检/更新/**开机自启动**/配置目录）。
 **兼容**：PS 家族（photoshop/illustrator/aftereffects/lightroom/indesign/premiere）、画世界类（huashijie/artworld/painter/画世界）、OBS/VLC/PotPlayer/Office —— 改完 alpha 追加 `DwmFlush` + `RedrawWindow`，避免留旧帧。
+**热键冲突提示**：注册失败（1409）时直接点名最可能的占用软件（实测 ALT+R / ALT+SHIFT+R = NVIDIA App 的游戏内叠加层），并给出「快捷键优先」/换绑两条路，不再只甩 Win32 错误码。
 
 ---
 
-## 4. 版本历史（本次会话 1.4.2 → 2.7.3）
+## 4. 版本历史（本次会话 1.4.2 → 2.7.4）
 
 | 版本 | 关键改动 |
 | :--- | :--- |
@@ -81,6 +82,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.7.1 | 「帮助」挪到最小化左边 |
 | 2.7.2 | 纸娃娃垂直也改为只按舞台中心（彻底去掉包围盒平移）；静置重绘 0.12s |
 | 2.7.3 | 待机浮动回到亚像素定位（取整会变 1px 台阶） |
+| 2.7.4 | 纸娃娃描边改到超采样域（去掉半透明灰圈 + 双层描边）；热键冲突提示点名占用软件与解决办法 |
 
 ---
 
@@ -100,6 +102,8 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 12. **安装包漏资源**：`[Files]` 只写了 exe 和 manifest 时，装完会没有玻璃图标/皮肤 → 补 `icon.png/icon.ico/ball_glass.png/skin.png/skins\*.png` + `SetupIconFile`。
 13. **旧卸载器图标**：老版本装出来的 `unins000.exe` 是 Inno 默认图标；不改安装的话，把开始菜单快捷方式的 `IconLocation` 指到 `transglass.exe,0` 再 `ie4uinit -show` 刷缓存。
 14. **性能坑**：窗口列表里查进程名（`OpenProcess`+`QueryFullProcessImageNameW`）必须缓存（现为 3s / 96 条），否则每帧每张卡都查一次。
+15. **热键 1409**：`RegisterHotKey` 失败时 Windows 只给 1409，**没有任何接口能查出占用者**（API 只告诉你失败，查不出是谁）。实测 `ALT+R`、`ALT+SHIFT+R` 被 **NVIDIA App 的游戏内叠加层**（`NVIDIA Overlay.exe`）默认占着：前者开关性能统计、后者轮换指标。现在按「进程在跑 + 默认键位」表提示占用者（NVIDIA/AMD/微信/QQ/Snipaste），并引导「快捷键优先」或换绑；优先模式用 `WH_KEYBOARD_LL` 抢在对方前面生效（代价是那个键对对方失效）。UI 里不要再写 `Win32 1409` 这种码。
+16. **纸娃娃描边**：旧写法是在降采样后的 mask 上取 8 邻域最大值、`alpha = 0.42 × 邻居覆盖`，结果是一条 1~2px、透明度忽高忽低的半透明灰圈，缩到 3px/皮肤像素时就是"毛边"；`ball_render` 末尾还又套了一层 1px 深色描边。现在描边在**超采样域**膨胀覆盖遮罩（半径 = ss 子采样 = 1 目标像素）、跟模型一起降采样，`alpha = 0.85`，并删掉 `ball_render` 里那一层。单帧多约 0.5ms（30fps 下约 +1.5% 单核）。
 
 ---
 
@@ -156,6 +160,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.7.1 | `dist\installer\TransGlass_2.7.1_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.7.1.zip` | ✅ |
 | v2.7.2 | `dist\installer\TransGlass_2.7.2_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.7.2.zip` | ✅ |
 | v2.7.3 | `dist\installer\TransGlass_2.7.3_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.7.3.zip` | ✅ |
+| v2.7.4 | `dist\installer\TransGlass_2.7.4_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.7.4.zip` | ✅ |
 
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
@@ -197,7 +202,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 - [ ] 无边框窗口没有系统圆角/投影/Alt+Space 菜单（可以做，Win11 可用 DWM 圆角）
 - [ ] PS 内置面板（UXP 插件）没做；「帮助」目前跳 GitHub 上的 `docs/使用教程.md`
 - [ ] 爱发电发布需人工
-- [ ] 纸娃娃按 3× 超采样 + 每帧 250KB 中间图层；如还要压性能，可改 thread_local 复用缓冲
+- [ ] 纸娃娃按 3× 超采样 + 每帧约 2MB 中间缓冲（col / z-buffer / 描边膨胀）；如还要压性能，可改 thread_local 复用缓冲
 - [ ] 缩略图预览对 GPU 应用（PS/AE）截图有时是黑帧（PrintWindow 限制），可考虑改 DXGI 抓取
 
 ---

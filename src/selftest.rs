@@ -94,7 +94,9 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
 ///
 /// 用注册失败（1409）来暴露"两个功能抢同一个键"这种真实冲突——
 /// 如果注册完一项就立刻注销，重复绑定会双双 PASS，报告自相矛盾。
-fn probe_hotkey_registration(items: Vec<(i32, String, u32, u32)>) -> Vec<(i32, String, bool, u32)> {
+fn probe_hotkey_registration(
+    items: Vec<(i32, String, u32, u32)>,
+) -> Vec<(i32, String, bool, u32, u32, u32)> {
     std::thread::spawn(move || {
         let mut results = Vec::new();
         let mut ok_ids = Vec::new();
@@ -111,7 +113,7 @@ fn probe_hotkey_registration(items: Vec<(i32, String, u32, u32)>) -> Vec<(i32, S
                 if ok {
                     ok_ids.push(id);
                 }
-                results.push((id, label, ok, err));
+                results.push((id, label, ok, err, mods_bits, vk));
             }
         }
         for id in ok_ids {
@@ -297,20 +299,22 @@ fn execute(strict: bool, hosting: bool) -> i32 {
         rep.warn("跳过", "没有键名合法的槽位可测");
     } else {
         let priority = cfg.hotkey_priority.unwrap_or(false);
-        for (id, label, ok, err) in probe_hotkey_registration(probe_items) {
+        for (id, label, ok, err, mods_bits, vk) in probe_hotkey_registration(probe_items) {
             if ok {
                 rep.pass(&label, format!("id={id} 注册成功（本次探测已注销）"));
             } else if err == ERROR_HOTKEY_ALREADY_REGISTERED {
+                // 系统不提供真正的占用者，按"常见软件默认键位 + 进程在跑"给出提示
+                let who = match crate::hotkey_owner_hint(mods_bits, vk) {
+                    Some((app, feature)) => format!("很可能被 {app}占用（它默认用这个键{feature}）"),
+                    None => "被其它程序占用（Windows 不提供占用者信息）".to_string(),
+                };
                 // 优先模式下这个键仍会被钩子拦到，不算致命
                 if priority {
-                    rep.warn(
-                        &label,
-                        format!("id={id} 组合键被其它程序占用，但优先模式会用键盘钩子抢到"),
-                    );
+                    rep.warn(&label, format!("id={id} 组合键{who}；优先模式会用键盘钩子抢到"));
                 } else {
                     rep.fail(
                         &label,
-                        format!("id={id} 组合键已被其它程序占用 (ERROR_HOTKEY_ALREADY_REGISTERED)"),
+                        format!("id={id} 组合键{who}；开启「快捷键优先」可强制生效，或换绑"),
                     );
                 }
             } else {

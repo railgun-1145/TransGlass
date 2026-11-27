@@ -691,9 +691,73 @@ pub fn render(
         }
     }
 
-    // 盒式滤波降采样 + 覆盖遮罩
+    // ---- 1 目标像素描边：在超采样域膨胀覆盖遮罩，再跟模型一起降采样 ----
+    //
+    // 旧版在降采样后的 mask 上取 8 邻域最大值、alpha = 0.42 × 邻居覆盖，
+    // 画出来是一条 1~2px、透明度忽高忽低的灰圈，缩到 3px/皮肤像素时就是"毛边"。
+    // 这里改成对覆盖遮罩做半径 = ss 个子采样（正好 1 个目标像素）的最大值膨胀，
+    // 只在模型没盖住的样本上铺描边色，最后由同一套超采样降采样出抗锯齿边缘。
+    {
+        let r = ss;
+        let mut dil = vec![0f32; sw * sh];
+        let mut tmp = vec![0f32; sw * sh];
+        // 水平方向
+        for y in 0..sh {
+            let row = y * sw;
+            for x in 0..sw {
+                let lo = x.saturating_sub(r);
+                let hi = (x + r + 1).min(sw);
+                let mut m = 0.0f32;
+                for xx in lo..hi {
+                    let v = col[row + xx][3];
+                    if v > m {
+                        m = v;
+                        if m >= 1.0 {
+                            break;
+                        }
+                    }
+                }
+                tmp[row + x] = m;
+            }
+        }
+        // 垂直方向
+        for x in 0..sw {
+            for y in 0..sh {
+                let lo = y.saturating_sub(r);
+                let hi = (y + r + 1).min(sh);
+                let mut m = 0.0f32;
+                for yy in lo..hi {
+                    let v = tmp[yy * sw + x];
+                    if v > m {
+                        m = v;
+                        if m >= 1.0 {
+                            break;
+                        }
+                    }
+                }
+                dil[y * sw + x] = m;
+            }
+        }
+        // 描边色（预乘），只在模型外圈；0.85 保证边缘是"深色线"而不是一层灰雾
+        let (cr, cg, cb) = (0.031f32, 0.039f32, 0.055f32);
+        for i in 0..sw * sh {
+            let c = &mut col[i];
+            if c[3] > 0.002 {
+                continue;
+            }
+            let a = 0.85 * dil[i].clamp(0.0, 1.0);
+            if a <= 0.0 {
+                continue;
+            }
+            c[0] = cr * a;
+            c[1] = cg * a;
+            c[2] = cb * a;
+            c[3] = a;
+        }
+    }
+
+    // 盒式滤波降采样
     let inv_n = 1.0 / (ss * ss) as f32;
-    let mut mask = vec![0f32; bw * bh];
     for j in 0..bh {
         for i in 0..bw {
             let mut acc = [0f32; 4];
@@ -714,7 +778,6 @@ pub fn render(
                 continue;
             }
             let a = (acc[3] * inv_n).clamp(0.0, 1.0);
-            mask[j * bw + i] = a;
             let o = (((y0 + j as i32) * dw as i32 + (x0 + i as i32)) * 4) as usize;
             over(
                 dst,
@@ -724,50 +787,6 @@ pub fn render(
                 (acc[2] / acc[3]).clamp(0.0, 1.0),
                 a,
             );
-        }
-    }
-
-    // 1px 深色描边：沿降采样后的覆盖遮罩走一圈，让纸娃娃从桌面上"跳"出来
-    {
-        let ox0 = (x0 - 1).max(0);
-        let oy0 = (y0 - 1).max(0);
-        let ox1 = (x1 + 1).min(dw as i32);
-        let oy1 = (y1 + 1).min(dh as i32);
-        let m = |x: i32, y: i32| -> f32 {
-            let ii = x - x0;
-            let jj = y - y0;
-            if ii < 0 || jj < 0 || ii >= bw as i32 || jj >= bh as i32 {
-                0.0
-            } else {
-                mask[(jj as usize) * bw + ii as usize]
-            }
-        };
-        for y in oy0..oy1 {
-            for x in ox0..ox1 {
-                if m(x, y) >= 0.16 {
-                    continue; // 只在轮廓外圈画
-                }
-                let mut best = 0.0f32;
-                for (nx, ny) in [
-                    (x - 1, y),
-                    (x + 1, y),
-                    (x, y - 1),
-                    (x, y + 1),
-                    (x - 1, y - 1),
-                    (x + 1, y - 1),
-                    (x - 1, y + 1),
-                    (x + 1, y + 1),
-                ] {
-                    best = best.max(m(nx, ny));
-                }
-                if best < 0.35 {
-                    continue;
-                }
-                // 透明度压在 110 以下，避免外层统一描边再套一圈
-                let a = 0.42 * best;
-                let o = ((y * dw as i32 + x) * 4) as usize;
-                over(dst, o, 0.031, 0.039, 0.055, a);
-            }
         }
     }
     Some((x0 - 1, y0 - 1, x1 + 1, y1 + 1))
