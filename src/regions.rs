@@ -124,6 +124,22 @@ pub fn clear(hwnd: isize) {
     hide_visual();
 }
 
+/// 目标窗口关掉后清掉它的选区和视觉洞，别让选区 UI 一直挂着。
+pub fn prune() {
+    let mut removed = false;
+    if let Ok(mut v) = REGIONS.lock() {
+        let before = v.len();
+        v.retain(|(h, _)| unsafe { IsWindow(HWND(*h as *mut _)).as_bool() });
+        removed = v.len() != before;
+    }
+    if let Ok(mut styles) = HOLE_STYLES.lock() {
+        styles.retain(|h| unsafe { IsWindow(HWND(*h as *mut _)).as_bool() });
+    }
+    if removed {
+        hide_visual();
+    }
+}
+
 pub fn set_regions(hwnd: isize, regions: Vec<Region>) {
     let any_visual = regions.iter().any(|r| r.opacity > 0);
     let empty = regions.is_empty();

@@ -115,11 +115,13 @@
 - **坑**：hook 的 fast-path 必须加 `regions::has_any()`，否则无单设备点透/注册表为空时提前返回，选区完全不生效；`UpdateLayeredWindow` 前不能把 DIB 从 mem DC 取消选中（否则 0x8007001F、窗口全透明）；窗口别用 0×0 创建；`SetWindowRgn` 会裁画面，不能用；任意窗口做不了逐像素 alpha，视觉洞只能靠下层快照覆盖层。
 - **限制**：快照静态（下方变了要刷新）；覆盖层只跟前台目标；选区只存内存；没有顶点编辑/持久化。
 
-### 4.7 选择可视化 / 选中控制卡片（`selection.rs`）
+### 4.7 选择可视化 / 选中控制（`selection.rs`）
 - **选择框**：全屏置顶、`WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE` 的分层窗口画 2px 框（颜色取标记色）；150ms 定时器读 `TARGET_HWND`，**只在目标/矩形/标记变化时重画**；4 秒自动收起，目标关闭/最小化隐藏。
 - **标签**：独立的 26px 高 topmost 小窗，画「已选中 · 标记 ×」；点击 `WM_LBUTTONUP` 设 `ENABLED=false` 收起。主界面「显示选中框」和卡片「选中并显示」可重新打开。
 - **标记**：`MARKS: Mutex<Vec<(hwnd, tag, color)>>`；`mark_for`/`set_mark`。卡片标题、标签文字/颜色都用它；同软件多窗口靠标记区分。
-- **主界面卡片**：`selection_control_section` 在「窗口总览」上方，列当前目标 + 所有带选区的窗口；每张卡是 `CollapsingHeader`，内容：标记文字/颜色、选中并显示、逐圈反向/透明度/删除、编辑/清空/刷新透明洞、置顶/点透/透明度/还原。
+- **右键子菜单**：`selection_controls_ui` 放进 `window_menu` 和左侧窗口行的右键菜单；内容：标记文字/颜色、显示选中框、逐圈反向/透明度/删除、编辑/清空/刷新透明洞。
+- **左侧树子项**：`nav_windows` 里对 TARGET/有选区的窗口挂 `CollapsingHeader`，展开调 `self.window_card`（窗口卡片，缩略图/状态/透明度），再点收起；`sel_set` 一次算出。
+- **关闭清理**：`selection_cleanup()` 在 `refresh_window_list` 每帧跑，TARGET 无效置 0，`regions::prune`/`selection::prune` 清无效窗口。
 - **选区联动**：卡片的 `regions::update_region/remove_region` 走 `WM_VISUAL_MASK` 只重画覆盖层 mask，保留已抓的下层快照；编辑/保存才 `refresh_visual` 重新抓。
 - **右键悬浮球**：`WindowFromPoint` 在球中心拿到球自己；沿 `GW_HWNDNEXT` 跳过 own/shell，检查矩形包含，`GetAncestor(GA_ROOT)`；找到就 `select_window_for_control`（切目标 + 弹面板），找不到只弹当前面板。
 - **坑**：选择框是 transient cue，不要永久置顶；topmost 目标会遮住主界面/标签，auto-hide 兜底；卡片的透明度滑条不能触发重新抓快照；`ball_set_expanded` 在主线程跑 200ms 动画，别重入。

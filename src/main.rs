@@ -1725,6 +1725,7 @@ impl TransGlassApp {
         }
     }
     fn refresh_window_list(&mut self, force: bool) {
+        selection_cleanup();
         let due = self
             .wins_at
             .map(|t| t.elapsed().as_millis() > 1500)
@@ -1806,6 +1807,16 @@ impl TransGlassApp {
             ui.label(egui::RichText::new("没有可见窗口").small().weak());
             return;
         }
+        let mut sel_set: Vec<isize> = Vec::new();
+        let tgt = crate::current_target();
+        if tgt != 0 {
+            sel_set.push(tgt);
+        }
+        for (h, _) in crate::regions::snapshot_all() {
+            if !sel_set.contains(&h) {
+                sel_set.push(h);
+            }
+        }
         let mut order: Vec<String> = Vec::new();
         for (_, _, d) in &list {
             if !order.contains(d) {
@@ -1853,6 +1864,7 @@ impl TransGlassApp {
                         resp.context_menu(|ui| {
                             ui.label(egui::RichText::new(title.as_str()).strong().small());
                             ui.separator();
+                            ui.menu_button("选中控制", |ui| selection_controls_ui(ui, *hwnd));
                             match GLOBAL_REGISTRY.get(hwnd) {
                                 Some(st) => {
                                     ui.label(
@@ -1893,6 +1905,43 @@ impl TransGlassApp {
                                 }
                             }
                         });
+                        if sel_set.contains(hwnd) {
+                            let (tag, color) = crate::selection::mark_for(*hwnd).unwrap_or_else(|| {
+                                (title.clone(), (47u8, 194u8, 124u8))
+                            });
+                            let header = format!("选中控制 · {tag}");
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new(header)
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(color.0, color.1, color.2)),
+                            )
+                            .id_source(("nav_sel", *hwnd))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                let mut toggle = None;
+                                self.window_card(ui, *hwnd, title, &desk, &mut toggle);
+                                if let Some(th) = toggle {
+                                    select = Some(th);
+                                    if GLOBAL_REGISTRY.contains_key(&th) {
+                                        restore_now = Some(th);
+                                    } else {
+                                        control_now = Some(th);
+                                    }
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui.button("选中并显示").clicked() {
+                                        crate::select_window_for_control(*hwnd);
+                                        crate::selection::set_enabled(true);
+                                    }
+                                    if ui.button("编辑选区…").clicked() {
+                                        crate::regions::open_editor(*hwnd);
+                                    }
+                                    if ui.button("清空选区").clicked() {
+                                        crate::regions::clear(*hwnd);
+                                    }
+                                });
+                            });
+                        }
                     }
                 });
         }
@@ -1942,7 +1991,6 @@ impl TransGlassApp {
             }
         });
         ui.add_space(6.0);
-        selection_control_section(ui, &self.wins);
         ui.add_space(8.0);
         let wins: Vec<(isize, String, String)> = self
             .wins
@@ -4882,199 +4930,96 @@ unsafe fn control_window(hwnd: HWND) {
     set_window_alpha(hwnd, 230);
 }
 
-fn selection_control_section(ui: &mut egui::Ui, wins: &[WinInfo]) {
-    let target = crate::current_target();
-    let all = crate::regions::snapshot_all();
-    let mut hwnds: Vec<isize> = Vec::new();
-    if target != 0
-        && unsafe { IsWindow(HWND(target as *mut _)).as_bool() }
-        && !unsafe { is_own_hwnd(HWND(target as *mut _)) }
-    {
-        hwnds.push(target);
-    }
-    for (h, rs) in &all {
-        if !rs.is_empty()
-            && !hwnds.contains(h)
-            && unsafe { IsWindow(HWND(*h as *mut _)).as_bool() }
-            && !unsafe { is_own_hwnd(HWND(*h as *mut _)) }
+fn selection_controls_ui(ui: &mut egui::Ui, hwnd: isize) {
+    let hwnd_h = HWND(hwnd as *mut _);
+    let app = unsafe { cached_app_name(hwnd_h) };
+    let (tag, color) = crate::selection::mark_for(hwnd).unwrap_or_else(|| {
+        (
+            if app.trim().is_empty() {
+                "窗口".to_string()
+            } else {
+                app.clone()
+            },
+            (47u8, 194u8, 124u8),
+        )
+    });
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("标记").small().weak());
+        let mut edit = tag.clone();
+        if ui
+            .add(egui::TextEdit::singleline(&mut edit).desired_width(120.0))
+            .changed()
         {
-            hwnds.push(*h);
+            crate::selection::set_mark(hwnd, edit, color);
+        }
+        for c in [
+            (47u8, 194u8, 124u8),
+            (70u8, 130u8, 220u8),
+            (240u8, 150u8, 60u8),
+            (180u8, 80u8, 200u8),
+        ] {
+            let btn = egui::Button::new(
+                egui::RichText::new("●").color(egui::Color32::from_rgb(c.0, c.1, c.2)),
+            )
+            .frame(false);
+            if ui.add(btn).clicked() {
+                crate::selection::set_mark(hwnd, tag.clone(), c);
+            }
+        }
+    });
+    let mut on = crate::selection::enabled();
+    if ui.checkbox(&mut on, "显示选中框").changed() {
+        crate::selection::set_enabled(on);
+    }
+    if ui.button("选中并显示").clicked() {
+        crate::select_window_for_control(hwnd);
+        crate::selection::set_enabled(true);
+        ui.close_menu();
+    }
+    let all = crate::regions::snapshot_all();
+    let regions = all
+        .iter()
+        .find(|(h, _)| *h == hwnd)
+        .map(|(_, r)| r.clone())
+        .unwrap_or_default();
+    ui.separator();
+    if regions.is_empty() {
+        ui.label(egui::RichText::new("还没有点透选区").small().weak());
+    } else {
+        for (i, r) in regions.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("圈 {}", i + 1));
+                let mut inv = r.invert;
+                if ui.checkbox(&mut inv, "反向").changed() {
+                    crate::regions::update_region(hwnd, i, Some(inv), None);
+                }
+                let mut op = r.opacity as i32;
+                if ui
+                    .add(egui::Slider::new(&mut op, 0..=100).suffix("%"))
+                    .changed()
+                {
+                    crate::regions::update_region(hwnd, i, None, Some(op as u8));
+                }
+                if ui.button("删").clicked() {
+                    crate::regions::remove_region(hwnd, i);
+                }
+            });
         }
     }
-    if hwnds.is_empty() {
-        return;
-    }
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("选中控制")
-                .font(font_title(18.0))
-                .color(TEXT_PRIMARY),
-        );
-        ui.label(
-            egui::RichText::new(format!("{} 个", hwnds.len()))
-                .small()
-                .weak(),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let mut on = crate::selection::enabled();
-            if ui.checkbox(&mut on, "显示选中框").changed() {
-                crate::selection::set_enabled(on);
-            }
-        });
+        if ui.button("编辑选区…").clicked() {
+            crate::regions::open_editor(hwnd);
+            ui.close_menu();
+        }
+        if ui.button("清空选区").clicked() {
+            crate::regions::clear(hwnd);
+            ui.close_menu();
+        }
+        if ui.button("刷新透明洞").clicked() {
+            crate::regions::refresh_visual(hwnd);
+            ui.close_menu();
+        }
     });
-    ui.add_space(4.0);
-
-    for h in hwnds {
-        let hwnd = HWND(h as *mut _);
-        let app = unsafe { cached_app_name(hwnd) };
-        let win_title = wins
-            .iter()
-            .find(|w| w.hwnd == h)
-            .map(|w| w.title.clone())
-            .unwrap_or_else(|| unsafe { get_window_title(hwnd) });
-        let (tag, color) = crate::selection::mark_for(h).unwrap_or_else(|| {
-            (
-                if app.trim().is_empty() {
-                    "窗口".to_string()
-                } else {
-                    app.clone()
-                },
-                (47u8, 194u8, 124u8),
-            )
-        });
-        let col = egui::Color32::from_rgb(color.0, color.1, color.2);
-        let header = format!("{}  ·  {}  ·  {}", tag, app, win_title);
-        egui::CollapsingHeader::new(egui::RichText::new(header).strong().color(col))
-            .id_source(("sel_card", h))
-            .default_open(h == target)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("标记").small().weak());
-                    let mut edit = tag.clone();
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut edit).desired_width(150.0))
-                        .changed()
-                    {
-                        crate::selection::set_mark(h, edit, color);
-                    }
-                    for c in [
-                        (47u8, 194u8, 124u8),
-                        (70u8, 130u8, 220u8),
-                        (240u8, 150u8, 60u8),
-                        (180u8, 80u8, 200u8),
-                    ] {
-                        let btn = egui::Button::new(
-                            egui::RichText::new("●")
-                                .color(egui::Color32::from_rgb(c.0, c.1, c.2)),
-                        )
-                        .frame(false);
-                        if ui.add(btn).clicked() {
-                            crate::selection::set_mark(h, tag.clone(), c);
-                        }
-                    }
-                    if ui.button("选中并显示").clicked() {
-                        crate::select_window_for_control(h);
-                        crate::selection::set_enabled(true);
-                    }
-                });
-
-                let regions = all
-                    .iter()
-                    .find(|(x, _)| *x == h)
-                    .map(|(_, r)| r.clone())
-                    .unwrap_or_default();
-                if regions.is_empty() {
-                    ui.label(egui::RichText::new("还没有点透选区").small().weak());
-                } else {
-                    for (i, r) in regions.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("圈 {}", i + 1));
-                            let mut inv = r.invert;
-                            if ui.checkbox(&mut inv, "反向").changed() {
-                                crate::regions::update_region(h, i, Some(inv), None);
-                            }
-                            let mut op = r.opacity as i32;
-                            if ui
-                                .add(
-                                    egui::Slider::new(&mut op, 0..=100)
-                                        .suffix("%")
-                                        .show_value(true),
-                                )
-                                .changed()
-                            {
-                                crate::regions::update_region(h, i, None, Some(op as u8));
-                            }
-                            if ui.button("删").clicked() {
-                                crate::regions::remove_region(h, i);
-                            }
-                        });
-                    }
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("编辑选区…").clicked() {
-                        crate::regions::open_editor(h);
-                    }
-                    if ui.button("清空选区").clicked() {
-                        crate::regions::clear(h);
-                    }
-                    if ui.button("刷新透明洞").clicked() {
-                        crate::regions::refresh_visual(h);
-                    }
-                });
-
-                ui.separator();
-                let st = GLOBAL_REGISTRY.get(&h).map(|s| {
-                    (
-                        s.current_alpha,
-                        s.user_pref_topmost,
-                        s.mouse_passthrough,
-                        s.pen_passthrough,
-                    )
-                });
-                let (alpha, top, mouse, pen) = st.unwrap_or((255, false, false, false));
-                ui.horizontal(|ui| {
-                    if ui.button(if top { "取消置顶" } else { "置顶" }).clicked() {
-                        unsafe { toggle_topmost(hwnd) };
-                    }
-                    if ui
-                        .button(if mouse { "取消鼠标点透" } else { "鼠标点透" })
-                        .clicked()
-                    {
-                        unsafe { toggle_mouse_passthrough(hwnd) };
-                    }
-                    if ui
-                        .button(if pen { "取消笔点透" } else { "笔点透" })
-                        .clicked()
-                    {
-                        unsafe { toggle_pen_passthrough(hwnd) };
-                    }
-                    if st.is_some() {
-                        if ui.button("还原").clicked() {
-                            unsafe { restore_window(hwnd) };
-                        }
-                    } else if ui.button("控制（90%）").clicked() {
-                        unsafe { control_window(hwnd) };
-                    }
-                });
-                let mut pct = (alpha as f32 / 255.0 * 100.0).round();
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("透明度").small().weak());
-                    ui.spacing_mut().slider_width = 120.0;
-                    let resp = ui.add(
-                        egui::Slider::new(&mut pct, 30.0..=100.0)
-                            .suffix("%")
-                            .show_value(true),
-                    );
-                    if resp.changed() {
-                        unsafe {
-                            ensure_managed(hwnd);
-                            set_window_alpha(hwnd, (pct * 2.55).round() as u8);
-                        }
-                    }
-                });
-            });
-    }
-    ui.add_space(6.0);
 }
 
 fn window_menu(ui: &mut egui::Ui, hwnd: isize, title: &str) {
@@ -5132,24 +5077,7 @@ fn window_menu(ui: &mut egui::Ui, hwnd: isize, title: &str) {
         unsafe { control_window(HWND(hwnd as *mut _)) };
     }
     ui.separator();
-    let n_regions = crate::regions::count(hwnd);
-    ui.label(
-        egui::RichText::new(format!("点透选区：{n_regions} 个"))
-            .small()
-            .weak(),
-    );
-    if ui.button("编辑自由形状选区…").clicked() {
-        crate::regions::open_editor(hwnd);
-        ui.close_menu();
-    }
-    if n_regions > 0 && ui.button("刷新透明洞画面").clicked() {
-        crate::regions::refresh_visual(hwnd);
-        ui.close_menu();
-    }
-    if n_regions > 0 && ui.button("清空选区").clicked() {
-        crate::regions::clear(hwnd);
-        ui.close_menu();
-    }
+    ui.menu_button("选中控制", |ui| selection_controls_ui(ui, hwnd));
 }
 
 /// 用 PrintWindow 抓一帧窗口缩略图（失败返回 None，卡片会显示"无预览"）
@@ -5360,6 +5288,17 @@ pub(crate) fn set_target_window(hwnd: isize) {
 
 pub(crate) fn current_target() -> isize {
     TARGET_HWND.load(Ordering::Relaxed)
+}
+
+/// 目标窗口关掉后清掉目标/选区/标记，别让选中界面一直挂着。
+pub(crate) fn selection_cleanup() {
+    let t = TARGET_HWND.load(Ordering::Relaxed);
+    if t != 0 && !unsafe { IsWindow(HWND(t as *mut _)).as_bool() } {
+        TARGET_HWND.store(0, Ordering::Relaxed);
+        ball_mark_dirty();
+    }
+    crate::regions::prune();
+    crate::selection::prune();
 }
 
 /// 右键卡片/Alt 会话选中后：把遥感目标切过去并主动弹出悬浮球控制面板。

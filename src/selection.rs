@@ -65,6 +65,13 @@ pub fn set_mark(hwnd: isize, tag: String, color: (u8, u8, u8)) {
     LAST.with(|l| *l.borrow_mut() = None);
 }
 
+pub fn prune() {
+    if let Ok(mut v) = MARKS.lock() {
+        v.retain(|(h, _, _)| unsafe { IsWindow(HWND(*h as *mut _)).as_bool() });
+    }
+    LAST.with(|l| *l.borrow_mut() = None);
+}
+
 unsafe fn selection_thread() {
     let hinst = match GetModuleHandleW(None) {
         Ok(h) => h,
