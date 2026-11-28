@@ -5440,6 +5440,10 @@ pub(crate) unsafe fn capture_window(hwnd: HWND) -> Option<egui::ColorImage> {
 /// 当前被高亮的窗口（0 = 无）
 static HILITE_TARGET: AtomicIsize = AtomicIsize::new(0);
 
+pub(crate) fn log_region_debug(msg: &str) {
+    log_hilite(msg);
+}
+
 fn log_hilite(msg: &str) {
     let _ = std::fs::OpenOptions::new()
         .create(true)

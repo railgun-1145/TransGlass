@@ -115,6 +115,7 @@ pub fn hide_visual() {
 }
 
 static VISUAL_SEQ: AtomicU32 = AtomicU32::new(0);
+static LOG_LAST: Mutex<String> = Mutex::new(String::new());
 
 /// 同步版刷新：等视觉线程完成一次抓取再返回（最多等 2 秒）。
 /// 编辑结束用它，保证「藏主界面 → 抓下层 → 恢复主界面」的顺序，洞里的文字才不会和窗口本身错位。
@@ -1645,6 +1646,32 @@ unsafe fn follow_visual(overlay: HWND) {
         match rect {
             Some(rc) if op > 0 => crate::gpu_hole::update(target, rc, op),
             _ => crate::gpu_hole::hide(),
+        }
+    }
+    // 诊断日志（状态变化才写，不刷屏）：目标/蒙版数/透明度/窗口画面/GPU 是否生效
+    {
+        let (n_masks, op) = VS.with(|v| {
+            let st = v.borrow();
+            let n = st.regions.iter().filter(|r| r.enabled).count();
+            let op = st
+                .regions
+                .iter()
+                .filter(|r| r.enabled)
+                .map(|r| r.opacity)
+                .max()
+                .unwrap_or(0);
+            (n, op)
+        });
+        let win_ready = VS.with(|v| v.borrow().win_snap.is_some());
+        let line = format!(
+            "vis t={target} masks={n_masks} op={op} win={win_ready} gpu={}",
+            crate::gpu_hole::using()
+        );
+        if let Ok(mut last) = LOG_LAST.lock() {
+            if *last != line {
+                *last = line.clone();
+                crate::log_region_debug(&line);
+            }
         }
     }
     if crate::gpu_hole::using() {
