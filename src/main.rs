@@ -25,6 +25,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 mod regions;
+mod gpu_hole;
 mod selection;
 mod selector;
 mod selftest;
@@ -3732,6 +3733,7 @@ fn main() -> Result<(), eframe::Error> {
     // 点透会话选择器：独立线程 + 分层窗口，热键只往它投消息
     selector::init();
     regions::init();
+    gpu_hole::init();
 
     thread::spawn(|| unsafe {
         HOTKEY_THREAD_ID.store(GetCurrentThreadId(), Ordering::Relaxed);

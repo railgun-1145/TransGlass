@@ -104,6 +104,7 @@ pub fn refresh_visual(hwnd: isize) {
 }
 
 pub fn hide_visual() {
+    crate::gpu_hole::hide();
     VISUAL_HIDE_REQ.store(true, Ordering::Relaxed);
     let h = VISUAL_HWND.load(Ordering::Relaxed);
     if h != 0 {
@@ -1597,6 +1598,30 @@ unsafe fn follow_visual(overlay: HWND) {
         )
     });
     if target == 0 || !has_snapshot || !has_visual {
+        let _ = ShowWindow(overlay, SW_HIDE);
+        crate::gpu_hole::hide();
+        return;
+    }
+    // GPU 实时光洞：把洞交给 DWM 缩略图合成（GPU 合成，实时、不拖影）；
+    // 成功时 CPU 覆盖层让位，失败自动退回下面的 CPU 快照方案。
+    {
+        let (polys, op) = VS.with(|v| {
+            let st = v.borrow();
+            let mut polys: Vec<Vec<(f32, f32)>> = Vec::new();
+            let mut op = 0u8;
+            for r in st.regions.iter().filter(|r| r.enabled && r.opacity > 0) {
+                polys.push(r.pts.clone());
+                op = op.max(r.opacity);
+            }
+            (polys, op)
+        });
+        if !polys.is_empty() && op > 0 {
+            crate::gpu_hole::update(target, polys, op);
+        } else {
+            crate::gpu_hole::hide();
+        }
+    }
+    if crate::gpu_hole::using() {
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
     }

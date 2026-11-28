@@ -154,3 +154,4 @@
 ## 6. 安全与一致性保证
 - **100% 还原**: 程序设计原则是“不留痕迹”，所有样式修改在关闭时必须清除。
 - **路径无关性**: `TransGlass.iss` 使用相对路径变量，支持在任何开发目录下直接打包。
+- **GPU 实时光洞（2.21.0）**：`gpu_hole` 模块。置顶无边框覆盖层（`WS_EX_TRANSPARENT|TOOLWINDOW|NOACTIVATE`，`WM_ERASEBKGND` 返回 1 不自绘）+ `SetWindowRgn` 只保留洞区 + `DwmRegisterThumbnail(overlay, 下层窗口)`，`DwmUpdateThumbnailProperties` 的 `rcDestination` = 下层窗口屏幕矩形减掉覆盖层原点、`opacity` = 蒙版透明度、`fSourceClientAreaOnly=FALSE`（整窗对齐）。合成由 DWM 在 GPU 完成，实时、无 CPU 逐像素。源窗口 = z 序里目标下面那扇非本进程/非桌面的窗口；注册失败或源是桌面时 `using()` 为 false，`regions` 自动回退 CPU 快照覆盖层。
