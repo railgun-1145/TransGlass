@@ -1967,9 +1967,9 @@ impl TransGlassApp {
                             let (tag, color) = crate::selection::mark_for(*hwnd).unwrap_or_else(|| {
                                 (title.clone(), (47u8, 194u8, 124u8))
                             });
-                            // 左栏很窄：标题太长会把侧栏撑宽（内容溢出 → 中间留一条黑缝），截断一下
-                            let short: String = tag.chars().take(12).collect();
-                            let tag_line = if tag.chars().count() > 12 {
+                            // 左栏可以拖窄：标题太长会把侧栏撑宽（内容溢出 → 中间留一条黑缝），截断一下
+                            let short: String = tag.chars().take(10).collect();
+                            let tag_line = if tag.chars().count() > 10 {
                                 format!("{short}…")
                             } else {
                                 short
@@ -3294,8 +3294,9 @@ impl eframe::App for TransGlassApp {
         });
 
         egui::SidePanel::left("nav_panel")
-            .resizable(false)
-            .exact_width(280.0)
+            .resizable(true)
+            .default_width(280.0)
+            .width_range(240.0..=420.0)
             .frame(
                 egui::Frame::none()
                     .fill(BG_SIDEBAR)
@@ -3347,8 +3348,9 @@ impl eframe::App for TransGlassApp {
         // 设置页占满主区域，这里不再画窗口列表
         if !self.settings_open {
         egui::SidePanel::right("ps_panel")
-            .resizable(false)
+            .resizable(true)
             .default_width(256.0)
+            .width_range(220.0..=420.0)
             .show(ctx, |ui| {
                 self.ps_selection_panel(ui, ctx);
             });
@@ -7208,6 +7210,8 @@ impl TransGlassApp {
     /// 右侧「蒙版 / 点透」面板：只做预览；画选区在目标窗口上用编辑器画（画图式工具 + 确定）。
     /// 圈完出现「完成 / 取消」，完成立即写入蒙版（不再开全屏覆盖层编辑器、也不用按 Enter）。
     fn ps_selection_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // 面板可以拖宽/拖窄；内容超过可用宽度时不要反过来把面板撑大
+        ui.set_max_width(ui.available_width());
         // 窗口变矮时蒙版列表会超出侧栏，套一层滚动条
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
