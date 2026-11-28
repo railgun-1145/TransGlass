@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.22.0**
+> 归档时间：2026-11-28　·　对应版本：**v2.22.1**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.22.0** |
+| 当前版本 | **v2.22.1** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -129,6 +129,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.21.4 | **选区变成整窗透明 + 挡一点就全没**：① GPU 覆盖层的区域用 `CreateRectRgn(0,0,cw,ch)` 当基础再 OR 洞多边形 → 区域 = 整个客户区，缩略图铺满整窗（看着像整窗透明）；改成**空区域 + OR 多边形**。② 遮挡从「采样点被挡就整块隐藏」改成**把上方窗口的矩形从区域里扣掉**（RGN_DIFF），只显示真正露出来的部分；CPU 路径同样改成区域裁剪 + `GetRgnBox` 为空才隐藏 |
 | 2.21.5 | **暂停 GPU 缩略图方案，恢复 CPU 半透明**：DWM 缩略图**不受 `SetWindowRgn` 裁剪**，置顶覆盖层会被缩略图铺满整个窗口（「整窗透明」的根因）。GPU 缩略图路径停用（`gpu_hole::hide()`），回到 CPU 快照方案：覆盖层位图只在洞里有 alpha，选区以外完全透明；部分遮挡用区域裁剪 |
 | 2.22.0 | **GPU 实时洞 v2（每洞一个小窗口）**：调研后确认 DWM 缩略图不受 `SetWindowRgn` 裁剪（Vista 起的老问题）；改成只给矩形洞放一个小窗口（尺寸=洞），缩略图被小窗口边界自然裁住，不会整窗透明；圆/自由形状、桌面下层、注册失败回退 CPU。`WDA_EXCLUDEFROMCAPTURE` 只能作用于本进程窗口，DXGI 重复抠图含目标，不可行 |
+| 2.22.1 | **透明度宽容度放宽**：CPU 回退路径的下层 alpha 封顶从 178（70%）提到 242（95%），洞里最多透出 95%、窗口画面保底 5%；GPU 路径（矩形洞）本来就是 0–100% 全区间。同时将「新功能/大改动前先查类似项目成功案例」写进 STATE.md 开发规则 |
 
 ---
 
@@ -284,6 +285,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.21.4 | `dist\installer\TransGlass_2.21.4_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.21.4.zip` | ✅ |
 | v2.21.5 | `dist\installer\TransGlass_2.21.5_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.21.5.zip` | ✅ |
 | v2.22.0 | `dist\installer\TransGlass_2.22.0_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.22.0.zip` | ✅ |
+| v2.22.1 | `dist\installer\TransGlass_2.22.1_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.22.1.zip` | ✅ |
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
 ---
