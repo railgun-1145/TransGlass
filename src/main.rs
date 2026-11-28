@@ -7650,6 +7650,10 @@ impl TransGlassApp {
         }
         if let Some(i) = pick {
             self.ps_selected = i;
+            // 在面板里点选一个蒙版 → 悬浮球滑条直接切到这个蒙版
+            BALL_ADJ_MODE.store((i + 1) as isize, Ordering::Relaxed);
+            crate::set_target_window(target);
+            crate::ball_mark_dirty();
         }
         if let Some((i, en)) = set_en {
             crate::regions::update_region(target, i, None, None, Some(en));
@@ -7669,8 +7673,13 @@ impl TransGlassApp {
         let n = crate::regions::count(target);
         if n == 0 {
             self.ps_selected = 0;
+            BALL_ADJ_MODE.store(0, Ordering::Relaxed);
         } else if self.ps_selected >= n {
             self.ps_selected = n - 1;
+        }
+        // 蒙版删到比当前调节位置还少时，悬浮球回到整窗口
+        if BALL_ADJ_MODE.load(Ordering::Relaxed) > n as isize {
+            BALL_ADJ_MODE.store(0, Ordering::Relaxed);
         }
         // 蒙版可能存在"别的窗口"上（微信等多窗口程序里，点选的目标和画蒙版的窗口未必是同一个）。
         // 这里把其他有蒙版的窗口列出来，点一下就能切过去管理。
