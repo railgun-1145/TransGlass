@@ -1604,9 +1604,53 @@ unsafe fn follow_visual(overlay: HWND) {
         crate::gpu_hole::hide();
         return;
     }
-    // GPU 缩略图方案暂停：DWM 缩略图不受 SetWindowRgn 裁剪，会铺满整个窗口（看着像整窗透明）。
-    // 等下一代 D3D/DirectComposition 方案再启用。
-    crate::gpu_hole::hide();
+    // GPU v2：每个矩形洞一个小窗口 + DWM 缩略图（缩略图被小窗口边界自然裁住）。
+    // 非矩形或没有合适的下层窗口时自动回退 CPU。
+    {
+        let mut rect = None;
+        let mut op = 0u8;
+        let screen_rect = {
+            let hw = HWND(target as *mut _);
+            client_screen_rect(hw)
+        };
+        let (gcx, gcy, gcw, gch) = match screen_rect {
+            Some(v) => v,
+            None => {
+                let _ = ShowWindow(overlay, SW_HIDE);
+                return;
+            }
+        };
+        VS.with(|v| {
+            let st = v.borrow();
+            for r in st.regions.iter().filter(|r| r.enabled && r.opacity > 0) {
+                op = op.max(r.opacity);
+                if rect.is_none() && r.pts.len() <= 4 {
+                    let (mut minx, mut miny, mut maxx, mut maxy) =
+                        (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                    for (nx, ny) in &r.pts {
+                        minx = minx.min(*nx);
+                        miny = miny.min(*ny);
+                        maxx = maxx.max(*nx);
+                        maxy = maxy.max(*ny);
+                    }
+                    rect = Some((
+                        gcx + (minx * gcw as f32) as i32,
+                        gcy + (miny * gch as f32) as i32,
+                        gcx + (maxx * gcw as f32) as i32,
+                        gcy + (maxy * gch as f32) as i32,
+                    ));
+                }
+            }
+        });
+        match rect {
+            Some(rc) if op > 0 => crate::gpu_hole::update(target, rc, op),
+            _ => crate::gpu_hole::hide(),
+        }
+    }
+    if crate::gpu_hole::using() {
+        let _ = ShowWindow(overlay, SW_HIDE);
+        return;
+    }
     let hwnd = HWND(target as *mut _);
     let Some((cx, cy, cw, ch)) = client_screen_rect(hwnd) else {
         let _ = ShowWindow(overlay, SW_HIDE);

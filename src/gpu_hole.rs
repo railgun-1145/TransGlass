@@ -1,8 +1,11 @@
-//! GPU（DWM）实时光洞：用 DWM 缩略图把「目标窗口下面那扇窗口」实时贴到洞区。
-//! 合成完全由 DWM 在 GPU 上完成，不走 CPU 逐像素，所以洞里的下层画面是实时的、跟手不拖影。
+//! GPU 实时光洞 v2：每个矩形洞一个独立的置顶小窗口 + DWM 缩略图。
 //!
-//! 用法：regions 的视觉线程每帧把目标/洞/透明度丢进来；本模块自己一个线程 + 16ms 定时器。
-//! 缩略图注册失败（比如下层是桌面、或系统不支持）时 `using()` 为 false，调用方回退到 CPU 快照方案。
+//! 关键教训（v1 的坑）：DWM 缩略图**不认** `SetWindowRgn` 的窗口区域（Vista 起的老问题），
+//! 给整窗贴缩略图会把整个窗口铺满。所以这里反过来：**小窗口 = 洞本身**，缩略图天然被窗口
+//! 边界裁住，不会再"整窗透明"。
+//!
+//! 只支持矩形洞（编辑器画的矩形/椭圆的包围盒）；自由形状/椭圆继续走 CPU 快照回退。
+//! 失败（缩略图注册失败、下层是桌面、找不到下层窗口）时 `using()` 为 false，调用方回退 CPU。
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Mutex;
@@ -17,14 +20,13 @@ const WM_GPU_REQ: u32 = WM_APP + 0x700;
 const WM_GPU_HIDE: u32 = WM_APP + 0x701;
 
 static GPU_HWND: AtomicIsize = AtomicIsize::new(0);
-/// GPU 覆盖层当前是否成功在显示（调用方据此决定要不要回退 CPU 覆盖层）
 static GPU_USING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 struct Req {
     target: isize,
-    /// 归一化客户区多边形
-    polys: Vec<Vec<(f32, f32)>>,
+    /// 洞的屏幕矩形 (left, top, right, bottom)
+    rect: (i32, i32, i32, i32),
     opacity: u8,
 }
 
@@ -34,12 +36,11 @@ pub fn using() -> bool {
     GPU_USING.load(Ordering::Relaxed)
 }
 
-/// 由 regions 视觉线程调用：更新目标/洞/透明度（非阻塞）。
-pub fn update(target: isize, polys: Vec<Vec<(f32, f32)>>, opacity: u8) {
+pub fn update(target: isize, rect: (i32, i32, i32, i32), opacity: u8) {
     if let Ok(mut r) = REQ.lock() {
         *r = Some(Req {
             target,
-            polys,
+            rect,
             opacity,
         });
     }
@@ -64,14 +65,16 @@ pub fn hide() {
     }
 }
 
-struct GpuState {
+struct State {
     thumb: isize,
     source: isize,
+    shown_opacity: u8,
 }
 
-static STATE: Mutex<GpuState> = Mutex::new(GpuState {
+static STATE: Mutex<State> = Mutex::new(State {
     thumb: 0,
     source: 0,
+    shown_opacity: 0,
 });
 
 pub fn init() {
@@ -86,7 +89,7 @@ unsafe fn thread_main() {
         Ok(h) => h,
         Err(_) => return,
     };
-    let cls = w!("TransGlassGpuHole");
+    let cls = w!("TransGlassGpuHole2");
     let wc = WNDCLASSW {
         style: WNDCLASS_STYLES(0),
         lpfnWndProc: Some(wndproc),
@@ -159,15 +162,14 @@ unsafe fn hide_now(hwnd: HWND) {
         st.source = 0;
     }
     let _ = ShowWindow(hwnd, SW_HIDE);
-    let _ = SetWindowRgn(hwnd, None::<&HRGN>, true);
 }
 
 unsafe fn apply(hwnd: HWND) {
     let Some(req) = REQ.lock().ok().and_then(|mut r| r.take()) else {
-        // 没有新请求：保持现状即可
         return;
     };
-    if req.target == 0 || req.polys.is_empty() || req.opacity == 0 {
+    let (l, t, r, b) = req.rect;
+    if req.target == 0 || r <= l || b <= t || req.opacity == 0 {
         hide_now(hwnd);
         return;
     }
@@ -176,102 +178,18 @@ unsafe fn apply(hwnd: HWND) {
         hide_now(hwnd);
         return;
     }
-    // 目标客户区
-    let mut rc = RECT::default();
-    if GetClientRect(target, &mut rc).is_err() {
+    // 目标在这一层必须露着（中心点）；被盖住就藏
+    let cx = (l + r) / 2;
+    let cy = (t + b) / 2;
+    if top_foreign_at(cx, cy) != req.target {
         hide_now(hwnd);
         return;
     }
-    let cw = rc.right - rc.left;
-    let ch = rc.bottom - rc.top;
-    if cw <= 0 || ch <= 0 {
-        hide_now(hwnd);
-        return;
-    }
-    let mut origin = POINT { x: 0, y: 0 };
-    if ClientToScreen(target, &mut origin).as_bool() == false {
-        hide_now(hwnd);
-        return;
-    }
-    let (cx, cy) = (origin.x, origin.y);
-
-    // 在洞里找一个未被别的窗口盖住的采样点（网格扫），
-    // 用它来确定下层窗口；找不到说明洞全被盖了，直接隐藏。
-    let mut sample = None;
-    'outer: for gy in 0..8 {
-        for gx in 0..8 {
-            let nx = (gx as f32 + 0.5) / 8.0;
-            let ny = (gy as f32 + 0.5) / 8.0;
-            if !req.polys.iter().any(|p| point_in_poly(p, nx, ny)) {
-                continue;
-            }
-            let sx = cx + (nx * cw as f32) as i32;
-            let sy = cy + (ny * ch as f32) as i32;
-            if top_foreign_at(sx, sy) == req.target {
-                sample = Some((sx, sy));
-                break 'outer;
-            }
-        }
-    }
-    let Some((sx, sy)) = sample else {
-        hide_now(hwnd);
-        return;
-    };
-    let source = lower_window_at(sx, sy, req.target);
+    let source = lower_window_at(cx, cy, req.target);
     if source == 0 {
         hide_now(hwnd);
         return;
     }
-
-    // 区域：空区域 + 洞多边形的并集（不能用整个客户区当基础，否则整个窗口都会被覆盖层盖住）
-    let base = CreateRectRgn(0, 0, 0, 0);
-    if base.is_invalid() {
-        hide_now(hwnd);
-        return;
-    }
-    for poly in &req.polys {
-        if poly.len() < 3 {
-            continue;
-        }
-        let pts: Vec<POINT> = poly
-            .iter()
-            .map(|(nx, ny)| POINT {
-                x: (nx * cw as f32).round() as i32,
-                y: (ny * ch as f32).round() as i32,
-            })
-            .collect();
-        let pr = CreatePolygonRgn(&pts, WINDING);
-        if pr.is_invalid() {
-            continue;
-        }
-        let _ = CombineRgn(Some(&base), Some(&base), Some(&pr), RGN_OR);
-        let _ = DeleteObject(HGDIOBJ(pr.0));
-    }
-    // 层数遮盖：把目标上面那些窗口的矩形从洞里扣掉，
-    // 只给真正露出来的部分发布区域，部分遮挡不会整块消失
-    let mut above = match GetTopWindow(HWND(std::ptr::null_mut())) {
-        Ok(h) => h,
-        Err(_) => HWND(std::ptr::null_mut()),
-    };
-    while !above.0.is_null() && above.0 as isize != req.target {
-        if !crate::is_own_hwnd(above) && !crate::is_shell_hwnd(above) && IsWindowVisible(above).as_bool() {
-            let mut rr = RECT::default();
-            if GetWindowRect(above, &mut rr).is_ok() {
-                let clip = CreateRectRgn(rr.left - cx, rr.top - cy, rr.right - cx, rr.bottom - cy);
-                if !clip.is_invalid() {
-                    let _ = CombineRgn(Some(&base), Some(&base), Some(&clip), RGN_DIFF);
-                    let _ = DeleteObject(HGDIOBJ(clip.0));
-                }
-            }
-        }
-        above = match GetWindow(above, GW_HWNDNEXT) {
-            Ok(n) => n,
-            Err(_) => HWND(std::ptr::null_mut()),
-        };
-    }
-    let _ = SetWindowRgn(hwnd, Some(&base), true);
-
-    // 缩略图：源变了就重新注册
     let mut st = match STATE.lock() {
         Ok(s) => s,
         Err(_) => return,
@@ -282,9 +200,10 @@ unsafe fn apply(hwnd: HWND) {
     }
     if st.thumb == 0 {
         match DwmRegisterThumbnail(hwnd, HWND(source as *mut _)) {
-            Ok(t) => {
-                st.thumb = t;
+            Ok(th) => {
+                st.thumb = th;
                 st.source = source;
+                st.shown_opacity = 0;
             }
             Err(_) => {
                 GPU_USING.store(false, Ordering::Relaxed);
@@ -293,19 +212,22 @@ unsafe fn apply(hwnd: HWND) {
             }
         }
     }
-    // 源窗口的屏幕矩形 -> 覆盖层客户区坐标
+    // 源窗口屏幕矩形 -> 小窗口客户区坐标（洞的左上角为原点）
     let mut sr = RECT::default();
     if GetWindowRect(HWND(source as *mut _), &mut sr).is_err() {
         hide_now(hwnd);
         return;
     }
     let props = DWM_THUMBNAIL_PROPERTIES {
-        dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE | DWM_TNP_SOURCECLIENTAREAONLY,
+        dwFlags: DWM_TNP_RECTDESTINATION
+            | DWM_TNP_OPACITY
+            | DWM_TNP_VISIBLE
+            | DWM_TNP_SOURCECLIENTAREAONLY,
         rcDestination: RECT {
-            left: sr.left - cx,
-            top: sr.top - cy,
-            right: sr.right - cx,
-            bottom: sr.bottom - cy,
+            left: sr.left - l,
+            top: sr.top - t,
+            right: sr.right - l,
+            bottom: sr.bottom - t,
         },
         rcSource: RECT::default(),
         opacity: req.opacity,
@@ -313,71 +235,31 @@ unsafe fn apply(hwnd: HWND) {
         fSourceClientAreaOnly: FALSE,
     };
     let _ = DwmUpdateThumbnailProperties(st.thumb, &props);
+    st.shown_opacity = req.opacity;
 
-    let _ = SetWindowPos(
-        hwnd,
-        HWND_TOPMOST,
-        cx,
-        cy,
-        cw,
-        ch,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW,
-    );
-    let _ = ShowWindow(hwnd, SW_SHOW);
+    if IsWindowVisible(hwnd).as_bool() {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            l,
+            t,
+            r - l,
+            b - t,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    } else {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            l,
+            t,
+            r - l,
+            b - t,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        let _ = ShowWindow(hwnd, SW_SHOW);
+    }
     GPU_USING.store(true, Ordering::Relaxed);
-}
-
-fn sample_point(polys: &[Vec<(f32, f32)>], cx: i32, cy: i32, cw: i32, ch: i32) -> Option<(i32, i32)> {
-    for poly in polys {
-        if poly.len() < 3 {
-            continue;
-        }
-        let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for (x, y) in poly {
-            minx = minx.min(*x);
-            miny = miny.min(*y);
-            maxx = maxx.max(*x);
-            maxy = maxy.max(*y);
-        }
-        let nx = (minx + maxx) * 0.5;
-        let ny = (miny + maxy) * 0.5;
-        // 简化的"点在多边形内"：这里只用于取采样点，用 bbox 中心就够（矩形洞最常见）
-        return Some((
-            cx + (nx * cw as f32) as i32,
-            cy + (ny * ch as f32) as i32,
-        ));
-    }
-    None
-}
-
-unsafe fn lower_window_at(x: i32, y: i32, target: isize) -> isize {
-    let mut h = match GetTopWindow(HWND(std::ptr::null_mut())) {
-        Ok(h) => h,
-        Err(_) => return 0,
-    };
-    let mut passed_target = false;
-    while !h.0.is_null() {
-        let hwnd_val = h.0 as isize;
-        if hwnd_val == target {
-            passed_target = true;
-        } else if passed_target && !crate::is_own_hwnd(h) && !crate::is_shell_hwnd(h) {
-            let mut r = RECT::default();
-            if IsWindowVisible(h).as_bool()
-                && GetWindowRect(h, &mut r).is_ok()
-                && x >= r.left
-                && x < r.right
-                && y >= r.top
-                && y < r.bottom
-            {
-                return hwnd_val;
-            }
-        }
-        h = match GetWindow(h, GW_HWNDNEXT) {
-            Ok(n) => n,
-            Err(_) => return 0,
-        };
-    }
-    0
 }
 
 unsafe fn top_foreign_at(x: i32, y: i32) -> isize {
@@ -406,16 +288,32 @@ unsafe fn top_foreign_at(x: i32, y: i32) -> isize {
     0
 }
 
-fn point_in_poly(poly: &[(f32, f32)], x: f32, y: f32) -> bool {
-    let mut inside = false;
-    let mut j = poly.len() - 1;
-    for i in 0..poly.len() {
-        let (xi, yi) = poly[i];
-        let (xj, yj) = poly[j];
-        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
-            inside = !inside;
+unsafe fn lower_window_at(x: i32, y: i32, target: isize) -> isize {
+    let mut h = match GetTopWindow(HWND(std::ptr::null_mut())) {
+        Ok(h) => h,
+        Err(_) => return 0,
+    };
+    let mut passed = false;
+    while !h.0.is_null() {
+        let v = h.0 as isize;
+        if v == target {
+            passed = true;
+        } else if passed && !crate::is_own_hwnd(h) && !crate::is_shell_hwnd(h) {
+            let mut r = RECT::default();
+            if IsWindowVisible(h).as_bool()
+                && GetWindowRect(h, &mut r).is_ok()
+                && x >= r.left
+                && x < r.right
+                && y >= r.top
+                && y < r.bottom
+            {
+                return v;
+            }
         }
-        j = i;
+        h = match GetWindow(h, GW_HWNDNEXT) {
+            Ok(n) => n,
+            Err(_) => return 0,
+        };
     }
-    inside
+    0
 }
