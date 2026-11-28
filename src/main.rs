@@ -6165,8 +6165,22 @@ unsafe fn ball_render() {
         for (i, r) in p.buttons.iter().enumerate() {
             draw_mc_button(buf, w, h, *r, hover == (i as u8 + 1), false, panel_alpha);
         }
-        let cur = target_alpha_now();
-        let sv = ((255.0 - cur as f32) / 215.0).clamp(0.0, 1.0);
+        // 滑块位置：蒙版模式用蒙版透明度，否则用窗口透明度
+        let cur_target = ball_target();
+        let mode = BALL_ADJ_MODE.load(Ordering::Relaxed);
+        let mask_n = if cur_target.0.is_null() {
+            0isize
+        } else {
+            crate::regions::count(cur_target.0 as isize) as isize
+        };
+        let sv = if mode > 0 && mode <= mask_n {
+            crate::regions::mask_opacity(cur_target.0 as isize, (mode - 1) as usize).unwrap_or(0)
+                as f32
+                / 100.0
+        } else {
+            let cur = target_alpha_now();
+            ((255.0 - cur as f32) / 215.0).clamp(0.0, 1.0)
+        };
         draw_mc_slider(buf, w, h, p.slider, sv, panel_alpha);
         // 标题栏右上角的关闭键（MC 风格小按钮 + ×）
         draw_mc_button(buf, w, h, p.close_btn, hover == 6, false, panel_alpha);
@@ -6320,11 +6334,9 @@ unsafe fn ball_render() {
                 let mode = BALL_ADJ_MODE.load(Ordering::Relaxed).min(mask_n as isize);
                 // 点这一行可在「整窗口」和「蒙版1..N」之间循环，滑条跟着变
                 if mode > 0 {
-                    let op = crate::regions::mask_opacity(h.0 as isize, (mode - 1) as usize)
-                        .unwrap_or(0);
-                    format!("蒙版{mode} {op}%")
+                    format!("【{app}】蒙版{mode}")
                 } else if mask_n > 0 {
-                    format!("【{app}】蒙版{mask_n}")
+                    format!("【{app}】窗口")
                 } else if app.is_empty() {
                     "未选中窗口".to_string()
                 } else {
@@ -6371,14 +6383,22 @@ unsafe fn ball_render() {
         for (i, r) in p.buttons.iter().enumerate() {
             draw_mc_label(mem, labels[i], *r, fade((255, 255, 255)));
         }
-        let cur = target_alpha_now();
-        let sv = ((255.0 - cur as f32) / 215.0).clamp(0.0, 1.0);
-        draw_mc_label(
-            mem,
-            &format!("透明度 {}%", (sv * 100.0).round() as i32),
-            p.slider,
-            fade((255, 255, 255)),
-        );
+        let mode = BALL_ADJ_MODE.load(Ordering::Relaxed);
+        let mask_n = if target_hwnd.0.is_null() {
+            0isize
+        } else {
+            crate::regions::count(target_hwnd.0 as isize) as isize
+        };
+        let (slider_text, sv) = if mode > 0 && mode <= mask_n {
+            let op = crate::regions::mask_opacity(target_hwnd.0 as isize, (mode - 1) as usize)
+                .unwrap_or(0);
+            (format!("蒙版{mode} {op}%"), op as f32 / 100.0)
+        } else {
+            let cur = target_alpha_now();
+            let sv = ((255.0 - cur as f32) / 215.0).clamp(0.0, 1.0);
+            (format!("窗口 {}%", (sv * 100.0).round() as i32), sv)
+        };
+        draw_mc_label(mem, &slider_text, p.slider, fade((255, 255, 255)));
         SelectObject(mem, old_sat);
         let _ = DeleteObject(HGDIOBJ(font.0));
     }
@@ -6449,6 +6469,12 @@ unsafe fn ball_hit(x: i32, y: i32) -> u8 {
             let inside = |r: (i32, i32, i32, i32)| x >= r.0 && x < r.2 && y >= r.1 && y < r.3;
             if inside(p.close_btn) {
                 return 6;
+            }
+            // 目标行：切换滑条调「窗口」还是「蒙版 N」（放在球体判定之前，
+            // 否则面板跟球重叠时点不到）
+            let tr = p.target_row;
+            if x >= tr.0 && y >= tr.1 && x < tr.2 && y < tr.3 {
+                return 12;
             }
         }
     }
