@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.20.0**
+> 归档时间：2026-11-28　·　对应版本：**v2.20.1**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.20.0** |
+| 当前版本 | **v2.20.1** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -118,6 +118,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.19.8 | **洞跟窗口更紧**：视觉洞定时器 200ms → 50ms，拖动窗口时洞按当前 rect 从整屏快照重裁，跟手很多（依然不重抓、不闪）；配合 2.19.7 的悬停修复，鼠标在洞里也不会再"复原" |
 | 2.19.9 | **透明度真正作用在窗口自己身上**：洞里不再只是"把下层快照按 alpha 盖上去"，而是用 PrintWindow 抓一张窗口客户区画面，按 `窗口×(1-透明度) + 下层×透明度` 混合成不透明像素——0% 无变化、100% 完全透出下层，半透明时看到的是"窗口自己的画面变淡"，不再依赖窗口实时的像素层 |
 | 2.20.0 | **视觉洞改成真挖洞（SetWindowRgn）**：透明度 > 0 的蒙版直接把窗口 region 按洞剪掉——洞里的下层画面是**实时**的、自动跟着窗口走、点击天然落到下层，彻底告别快照/错位/不跟随/悬停复原。0 < 透明度 < 100 时再用 PrintWindow 的窗口画面按 (1-透明度) 叠在实时下层上，做出"窗口这块变淡"的效果；100% 就是纯洞。退出时 `restore_all_holes()` 把窗口恢复成矩形 |
+| 2.20.1 | **半透明不再"真消失"**：2.20.0 把透明度拉到 100% 时窗口画面整个消失（用户要的是"半透明"）。现在覆盖层在 0<透明度≤100 都显示，窗口画面**保底 30% 不透明度**——拉到 100% 也是"很透但还看得见上层"。另外窗口画面改用**屏幕截取**兜底（Chromium/KOOK 这类 PrintWindow 抓不到），并在挖洞前先抓，保证覆盖层有内容可叠 |
 
 ---
 
@@ -178,6 +179,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 54. **松手还是闪一下 / 洞内容错位**：`capture_visual` 抓的快照只有「目标客户区」那么大，而且每次都要 `SW_HIDE` 目标 + 睡 80ms + 恢复——松开鼠标触发一次重抓就闪一下；窗口移动后旧快照按新 rect 画，内容还会错位。修法：**抓整块虚拟屏幕**（`SM_XVIRTUALSCREEN` 等四个指标，BitBlt 一次），连同 `origin` 存进 `VS`；`draw_visual` 每个像素取 `(rect.x + x - origin.x, rect.y + y - origin.y)`；`follow_visual` 发现目标 rect 变了只更新 `VS.rect` + `draw_visual` 重裁，**不再重抓、不再藏目标窗口**。代价：快照是整屏（1920×1080 约 8MB），下层画面变了要手动「刷新」；换来了拖动/松手完全无闪、洞内容和屏幕严格对齐。
 55. **鼠标一放进洞，洞就消失（"复原"）**：`enforce_at` 在鼠标进洞时给目标加 `WS_EX_TRANSPARENT`，于是 `WindowFromPoint` 跳过目标、返回**下层窗口**；`follow_visual` 的遮挡判断看到"顶层不是目标"就以为被挡住，把覆盖层藏了——表现就是鼠标移上去洞就没了。修法：遮挡判断前先查 `HOLE_STYLES`，目标正在被我们强制点透时不判遮挡（`enforced == true` 直接显示）。**凡是"洞里点击穿透"的样式切换，都不能拿来当遮挡判据。**
 56. **洞"留在原地/不跟随/错位/变小"（快照方案的天花板）**：视觉洞一直是"把下层画面贴到洞区"——快照是静态的：窗口一动、下面内容一变，洞里的画面就停在旧位置；半透明时又和实时窗口层叠加，出现重影/大小对不上。2.20.0 换成**真挖洞**：`SetWindowRgn(hwnd, rect - 洞多边形)`（窗口坐标，洞点按客户区归一化坐标 × 客户区尺寸 + 客户区在窗口里的偏移）。于是洞里的下层是实时的、跟着窗口走、点击天然穿透，不需要 `WS_EX_TRANSPARENT` 也就不用再担心悬停复原。只给「透明度 > 0」的蒙版挖洞（0% 仍然只点透、不改外观）；0<透明度<100 时用 PrintWindow 的窗口画面按 (1-透明度) 叠回去；100% 不显示覆盖层。窗口缩放后重挖（`reapply_cuts_if_resized`，50ms 定时器里查尺寸），退出时 `restore_all_holes()` 恢复矩形。**SetWindowRgn 会接管 region 的所有权，不要再 DeleteObject。** 坑：窗口被 SetWindowRgn 后会失去系统阴影/圆角，属于挖洞的固有代价。
+57. **透明度拉满后上层画面"真消失"**：2.20.0 在 100% 时完全靠挖洞、覆盖层隐藏，用户要的是"半透明"而不是整块消失。修法：`draw_visual` 的窗口内容不透明度改成 `max((100-透明度)*255/100, 76)`（保底 30%），并且在透明度 > 0（含 100%）时都显示覆盖层——任何设置下都能看到上层画面。另一个坑：KOOK/Chromium 这类窗口 `PrintWindow(PW_CLIENTONLY)` 经常返回黑帧或失败，覆盖层没内容可叠 → 看着像"上层消失"；修法是**挖洞之前**从屏幕 BitBlt 客户区当窗口画面（`capture_screen_client`），`PrintWindow` 只在已经挖洞、不能截屏时兜底。
 34. **选中控制卡片**：主界面 `selection_control_section` 列 `TARGET_HWND` + 所有有选区的窗口；卡片用 `CollapsingHeader` 堆叠，可展开/收起。选区反向/透明度/删除走 `regions::update_region/remove_region` → `WM_VISUAL_MASK` **只重画覆盖层 mask**，不重新抓下层快照（否则每拖一下滑条就 BitBlt/闪）。标记存在 `selection.rs::MARKS`（hwnd → 文字/颜色），`set_mark` 清 `LAST` 让选择框重画；卡片标题和选择框标签都显示标记。
 
 ---
@@ -261,6 +263,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.19.8 | `dist\installer\TransGlass_2.19.8_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.19.8.zip` | ✅ |
 | v2.19.9 | `dist\installer\TransGlass_2.19.9_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.19.9.zip` | ✅ |
 | v2.20.0 | `dist\installer\TransGlass_2.20.0_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.20.0.zip` | ✅ |
+| v2.20.1 | `dist\installer\TransGlass_2.20.1_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.20.1.zip` | ✅ |
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
 ---

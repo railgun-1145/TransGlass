@@ -189,15 +189,17 @@ fn apply_regions(hwnd: isize, regions: Vec<Region>, wait: bool) {
         }
     }
     clear_hole_style(hwnd);
+    // 先抓窗口画面（此时窗口还没被挖洞），再挖洞；不然屏幕截图里只能抓到洞里的下层
+    if !empty {
+        if wait {
+            refresh_visual_wait(hwnd);
+        } else {
+            refresh_visual(hwnd);
+        }
+    }
     unsafe { apply_window_hole(hwnd) };
-    // 即使当前透明度是 0（只点透、不改外观）也抓一张窗口画面存着：
-    // 之后在列表里把透明度滑块拉起来就能立刻看到半透明效果。
     if empty {
         hide_visual();
-    } else if wait {
-        refresh_visual_wait(hwnd);
-    } else {
-        refresh_visual(hwnd);
     }
 }
 
@@ -318,6 +320,7 @@ unsafe fn apply_window_hole(hwnd: isize) {
     if base.is_invalid() {
         return;
     }
+    let mut n_holes = 0;
     for r in holes {
         if r.pts.len() < 3 {
             continue;
@@ -337,8 +340,12 @@ unsafe fn apply_window_hole(hwnd: isize) {
         let mode = if r.invert { RGN_AND } else { RGN_DIFF };
         let _ = CombineRgn(Some(&base), Some(&base), Some(&poly), mode);
         let _ = DeleteObject(HGDIOBJ(poly.0));
+        n_holes += 1;
     }
-    let _ = SetWindowRgn(h, Some(&base), true);
+    let set_ret = SetWindowRgn(h, Some(&base), true);
+    crate::log_region_debug(&format!(
+        "cut hwnd={hwnd} holes={n_holes} win={ww}x{wh} client={cw}x{ch} at=({cx},{cy}) set_ret={set_ret}"
+    ));
     if let Ok(mut v) = CUT_HWNDS.lock() {
         v.retain(|x| x.0 != hwnd);
         v.push((hwnd, cw, ch));
@@ -1616,9 +1623,17 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
     };
-    // 只需要窗口自己的客户区画面：PrintWindow 不碰窗口、不闪。
-    // 洞由 SetWindowRgn 真挖开，下层是实时画面，不再需要屏幕快照。
-    let win_snap = capture_window_client(hwnd, w, h);
+    // 窗口画面：还没挖洞时直接从屏幕截客户区（Chromium/KOOK 这类窗口 PrintWindow 经常抓不到），
+    // 已经挖洞时用 PrintWindow（截屏会截到洞里的下层）。
+    let cut = CUT_HWNDS
+        .lock()
+        .map(|v| v.iter().any(|x| x.0 == target))
+        .unwrap_or(false);
+    let win_snap = if cut {
+        capture_window_client(hwnd, w, h)
+    } else {
+        capture_screen_client(cx, cy, w, h).or_else(|| capture_window_client(hwnd, w, h))
+    };
     VS.with(|v| {
         *v.borrow_mut() = VisualState {
             target,
@@ -1648,7 +1663,7 @@ unsafe fn follow_visual(overlay: HWND) {
             st.win_snap.is_some(),
             st.regions
                 .iter()
-                .any(|r| r.enabled && r.opacity > 0 && r.opacity < 100),
+                .any(|r| r.enabled && r.opacity > 0),
         )
     });
     if target == 0 || !win_ready || !has_visual {
@@ -1723,6 +1738,40 @@ fn hole_sample(regions: &[Region], cx: i32, cy: i32, cw: i32, ch: i32) -> Option
         }
     }
     None
+}
+
+/// 从屏幕截取客户区画面（窗口还没挖洞、且可见时用这个，Chromium 类窗口也能抓到）。
+unsafe fn capture_screen_client(cx: i32, cy: i32, w: i32, h: i32) -> Option<Vec<u8>> {
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let screen = GetDC(None);
+    let mem = CreateCompatibleDC(screen);
+    let mut bi: BITMAPINFO = std::mem::zeroed();
+    bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB.0;
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let mut out = None;
+    if let Ok(dib) = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+        let old = SelectObject(mem, HGDIOBJ(dib.0));
+        if BitBlt(mem, 0, 0, w, h, screen, cx, cy, SRCCOPY).is_ok() {
+            let buf = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
+            let mut v = buf.to_vec();
+            for px in v.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+            out = Some(v);
+        }
+        SelectObject(mem, old);
+        let _ = DeleteObject(HGDIOBJ(dib.0));
+    }
+    let _ = DeleteDC(mem);
+    ReleaseDC(None, screen);
+    out
 }
 
 /// 抓目标窗口客户区画面（PrintWindow，1:1）。失败返回 None，洞里退回"贴下层快照"的老画法。
@@ -1814,8 +1863,10 @@ unsafe fn draw_visual(overlay: HWND) {
                 }
             }
             let di = (row + x as usize) * 4;
-            if op > 0 && op < 100 {
-                let a = ((100 - op) * 255 / 100) as u32; // 窗口内容剩下的不透明度
+            if op > 0 {
+                // 窗口内容永远保留一层（最低 30%）：拉到 100% 也是"很透但还看得见"，
+                // 不会变成上层内容整个消失的真洞。
+                let a = (((100 - op) * 255 / 100) as u32).max(76);
                 let (wx, wy) = if win_w == w && win_h == h {
                     (x, y)
                 } else {
