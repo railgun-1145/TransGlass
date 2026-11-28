@@ -609,6 +609,11 @@ pub(crate) unsafe fn set_hwnd_mouse_transparent(hwnd: HWND, enabled: bool) {
     );
 }
 
+/// 主界面窗口句柄（0 = 还没创建）。视觉洞需要判断主界面有没有压在目标窗口上。
+pub(crate) fn root_hwnd() -> isize {
+    ROOT_HWND.load(Ordering::Relaxed)
+}
+
 /// 洞内临时点透：`WS_EX_TRANSPARENT` 只有窗口本身是 layered 时才会真的让鼠标穿到下层。
 /// 没 layered 的窗口先补 `WS_EX_LAYERED` + `SetLayeredWindowAttributes`（保持它当前的 alpha）。
 /// 返回 true 表示 LAYERED 是我们加的，离开洞时要撤掉。

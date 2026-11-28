@@ -1569,18 +1569,35 @@ unsafe fn follow_visual(overlay: HWND) {
         return;
     }
     let hwnd = HWND(target as *mut _);
-    if !IsWindow(hwnd).as_bool()
-        || !IsWindowVisible(hwnd).as_bool()
-        || IsIconic(hwnd).as_bool()
-        || GetForegroundWindow() != hwnd
-    {
-        let _ = ShowWindow(overlay, SW_HIDE);
-        return;
-    }
     let Some((cx, cy, cw, ch)) = client_screen_rect(hwnd) else {
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
     };
+    // 目标窗口在前台时显示（正常）；
+    // 主界面在前台、且主界面没有压在目标窗口上时也显示——在面板里拉透明度能立刻看到效果，
+    // 不用先点一下目标窗口（而且洞内点击现在会穿到下层，点不回来）。
+    let fg = GetForegroundWindow();
+    let main_overlays = {
+        let root = crate::root_hwnd();
+        if root != 0 && fg == HWND(root as *mut _) {
+            let mut m = RECT::default();
+            if GetWindowRect(HWND(root as *mut _), &mut m).is_ok() {
+                !(m.right <= cx || m.left >= cx + cw || m.bottom <= cy || m.top >= cy + ch)
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    };
+    if fg != hwnd && !(fg == HWND(crate::root_hwnd() as *mut _) && !main_overlays) {
+        let _ = ShowWindow(overlay, SW_HIDE);
+        return;
+    }
+    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+        let _ = ShowWindow(overlay, SW_HIDE);
+        return;
+    }
     if (rect.0, rect.1, rect.2, rect.3) != (cx, cy, cw, ch) || w != cw || h != ch {
         // 窗动洞动：窗口拖动/缩放后按新位置重新抓下层快照，洞跟着窗口走（像布上开洞）
         refresh_visual(target);
