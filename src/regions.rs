@@ -1337,6 +1337,11 @@ struct VisualState {
     origin: (i32, i32),
     w: i32,
     h: i32,
+    /// 目标窗口自己的客户区快照（PrintWindow，1:1，客户区尺寸）。洞里按透明度与下层混合，
+    /// 这样"透明"作用在窗口自己的画面上，而不是把下层图片直接盖上去。
+    win_snap: Option<Vec<u8>>,
+    win_w: i32,
+    win_h: i32,
     /// 目标窗口客户区（当前屏幕坐标 + 尺寸）
     rect: (i32, i32, i32, i32),
     regions: Vec<Region>,
@@ -1350,6 +1355,9 @@ impl Default for VisualState {
             origin: (0, 0),
             w: 0,
             h: 0,
+            win_snap: None,
+            win_w: 0,
+            win_h: 0,
             rect: (0, 0, 0, 0),
             regions: Vec::new(),
         }
@@ -1476,6 +1484,10 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
     };
     let was_foreground = GetForegroundWindow() == hwnd;
 
+    // 先抓窗口自己的客户区画面（PrintWindow，1:1、不受遮挡影响）。
+    // 洞里用「窗口画面 ×(1-透明度) + 下层画面 ×透明度」混合，让透明度作用在窗口自己身上。
+    let win_snap = capture_window_client(hwnd, w, h);
+
     // 主界面也不能出现在洞里：抓下层快照前先把它藏起来，抓到干净的桌面/下层窗口。
     // 只在主界面确实压在目标客户区上时才藏，避免目标窗口拖动时反复闪主界面。
     let root = crate::main_window_handle();
@@ -1562,6 +1574,9 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
             origin: (vx, vy),
             w: vw,
             h: vh,
+            win_snap,
+            win_w: w,
+            win_h: h,
             rect: (cx, cy, w, h),
             regions,
         };
@@ -1681,8 +1696,49 @@ fn hole_sample(regions: &[Region], cx: i32, cy: i32, cw: i32, ch: i32) -> Option
     None
 }
 
+/// 抓目标窗口客户区画面（PrintWindow，1:1）。失败返回 None，洞里退回"贴下层快照"的老画法。
+unsafe fn capture_window_client(hwnd: HWND, w: i32, h: i32) -> Option<Vec<u8>> {
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let screen = GetDC(None);
+    let mem = CreateCompatibleDC(screen);
+    let mut bi: BITMAPINFO = std::mem::zeroed();
+    bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB.0;
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let mut out = None;
+    if let Ok(dib) = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+        let old = SelectObject(mem, HGDIOBJ(dib.0));
+        // PW_CLIENTONLY(1)：只画客户区，正好是客户区尺寸，1:1
+        if windows::Win32::Storage::Xps::PrintWindow(
+            hwnd,
+            mem,
+            windows::Win32::Storage::Xps::PRINT_WINDOW_FLAGS(1),
+        )
+        .as_bool()
+        {
+            let buf = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
+            let mut v = buf.to_vec();
+            for px in v.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+            out = Some(v);
+        }
+        SelectObject(mem, old);
+        let _ = DeleteObject(HGDIOBJ(dib.0));
+    }
+    let _ = DeleteDC(mem);
+    ReleaseDC(None, screen);
+    out
+}
+
 unsafe fn draw_visual(overlay: HWND) {
-    let (origin, sw, sh, rect, snapshot, regions) = VS.with(|v| {
+    let (origin, sw, sh, rect, snapshot, win_snap, win_w, win_h, regions) = VS.with(|v| {
         let st = v.borrow();
         (
             st.origin,
@@ -1690,6 +1746,9 @@ unsafe fn draw_visual(overlay: HWND) {
             st.h,
             st.rect,
             st.snapshot.clone(),
+            st.win_snap.clone(),
+            st.win_w,
+            st.win_h,
             st.regions.clone(),
         )
     });
@@ -1733,10 +1792,35 @@ unsafe fn draw_visual(overlay: HWND) {
             if alpha > 0 && sx >= 0 && sy >= 0 && sx < sw && sy < sh {
                 let a = (alpha * 255 / 100) as u32;
                 let si = ((sy as usize) * (sw as usize) + sx as usize) * 4;
-                buf[di] = ((snapshot[si] as u32 * a) / 255) as u8;
-                buf[di + 1] = ((snapshot[si + 1] as u32 * a) / 255) as u8;
-                buf[di + 2] = ((snapshot[si + 2] as u32 * a) / 255) as u8;
-                buf[di + 3] = a as u8;
+                if let Some(win) = &win_snap {
+                    // 窗口自己的画面按 (1-透明度) 与下层混合，结果完全不透明：
+                    // 透明度作用在"窗口画的那块区域"上，而不是把下层图直接盖上去。
+                    let (wx, wy) = if win_w == w && win_h == h {
+                        (x, y)
+                    } else {
+                        (
+                            (x as f32 * win_w as f32 / w as f32) as i32,
+                            (y as f32 * win_h as f32 / h as f32) as i32,
+                        )
+                    };
+                    let wi = ((wy.max(0) as usize) * (win_w.max(1) as usize) + wx.max(0) as usize) * 4;
+                    let wb = win.get(wi).copied().unwrap_or(0) as u32;
+                    let wg = win.get(wi + 1).copied().unwrap_or(0) as u32;
+                    let wr = win.get(wi + 2).copied().unwrap_or(0) as u32;
+                    let lb = snapshot[si] as u32;
+                    let lg = snapshot[si + 1] as u32;
+                    let lr = snapshot[si + 2] as u32;
+                    buf[di] = ((wb * (255 - a) + lb * a) / 255) as u8;
+                    buf[di + 1] = ((wg * (255 - a) + lg * a) / 255) as u8;
+                    buf[di + 2] = ((wr * (255 - a) + lr * a) / 255) as u8;
+                    buf[di + 3] = 255;
+                } else {
+                    // 抓不到窗口画面时退回老行为：把下层快照按 alpha 贴上去
+                    buf[di] = ((snapshot[si] as u32 * a) / 255) as u8;
+                    buf[di + 1] = ((snapshot[si + 1] as u32 * a) / 255) as u8;
+                    buf[di + 2] = ((snapshot[si + 2] as u32 * a) / 255) as u8;
+                    buf[di + 3] = a as u8;
+                }
             } else {
                 buf[di] = 0;
                 buf[di + 1] = 0;

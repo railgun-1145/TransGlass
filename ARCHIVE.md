@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.19.8**
+> 归档时间：2026-11-28　·　对应版本：**v2.19.9**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.19.8** |
+| 当前版本 | **v2.19.9** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -116,6 +116,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.19.6 | **拖动/松手彻底不闪、洞内容对齐**：视觉洞改成抓**整块虚拟屏幕**的下层快照（去掉目标、主界面、覆盖层后 BitBlt 一次），之后窗口拖动/缩放只是从这张图里按新位置裁一块重画——不再重抓、不再藏目标窗口，松手不会闪，洞里的内容也严格对齐屏幕坐标。`draw_visual` 按 `(屏幕坐标 - 快照原点)` 取像素；`follow_visual` 发现 rect 变了就更新 rect + 重画，不重抓 |
 | 2.19.7 | **鼠标移进洞里洞不再消失**：`enforce_at` 在鼠标进洞时会把目标临时设成 `WS_EX_TRANSPARENT`，这时 `WindowFromPoint` 会跳过目标返回下层窗口，遮挡判断误以为"被挡住"→ 洞被隐藏（看着像"放上去就复原"）。修法：`follow_visual` 先看 `HOLE_STYLES` 里有没有目标，正在强制点透时跳过遮挡判断 |
 | 2.19.8 | **洞跟窗口更紧**：视觉洞定时器 200ms → 50ms，拖动窗口时洞按当前 rect 从整屏快照重裁，跟手很多（依然不重抓、不闪）；配合 2.19.7 的悬停修复，鼠标在洞里也不会再"复原" |
+| 2.19.9 | **透明度真正作用在窗口自己身上**：洞里不再只是"把下层快照按 alpha 盖上去"，而是用 PrintWindow 抓一张窗口客户区画面，按 `窗口×(1-透明度) + 下层×透明度` 混合成不透明像素——0% 无变化、100% 完全透出下层，半透明时看到的是"窗口自己的画面变淡"，不再依赖窗口实时的像素层 |
 
 ---
 
@@ -256,6 +257,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.19.6 | `dist\installer\TransGlass_2.19.6_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.19.6.zip` | ✅ |
 | v2.19.7 | `dist\installer\TransGlass_2.19.7_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.19.7.zip` | ✅ |
 | v2.19.8 | `dist\installer\TransGlass_2.19.8_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.19.8.zip` | ✅ |
+| v2.19.9 | `dist\installer\TransGlass_2.19.9_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.19.9.zip` | ✅ |
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
 ---
