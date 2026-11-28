@@ -1604,29 +1604,9 @@ unsafe fn follow_visual(overlay: HWND) {
         crate::gpu_hole::hide();
         return;
     }
-    // GPU 实时光洞：把洞交给 DWM 缩略图合成（GPU 合成，实时、不拖影）；
-    // 成功时 CPU 覆盖层让位，失败自动退回下面的 CPU 快照方案。
-    {
-        let (polys, op) = VS.with(|v| {
-            let st = v.borrow();
-            let mut polys: Vec<Vec<(f32, f32)>> = Vec::new();
-            let mut op = 0u8;
-            for r in st.regions.iter().filter(|r| r.enabled && r.opacity > 0) {
-                polys.push(r.pts.clone());
-                op = op.max(r.opacity);
-            }
-            (polys, op)
-        });
-        if !polys.is_empty() && op > 0 {
-            crate::gpu_hole::update(target, polys, op);
-        } else {
-            crate::gpu_hole::hide();
-        }
-    }
-    if crate::gpu_hole::using() {
-        let _ = ShowWindow(overlay, SW_HIDE);
-        return;
-    }
+    // GPU 缩略图方案暂停：DWM 缩略图不受 SetWindowRgn 裁剪，会铺满整个窗口（看着像整窗透明）。
+    // 等下一代 D3D/DirectComposition 方案再启用。
+    crate::gpu_hole::hide();
     let hwnd = HWND(target as *mut _);
     let Some((cx, cy, cw, ch)) = client_screen_rect(hwnd) else {
         let _ = ShowWindow(overlay, SW_HIDE);
