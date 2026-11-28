@@ -1636,22 +1636,56 @@ unsafe fn follow_visual(overlay: HWND) {
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
     }
-    // 遮挡判断：按 z 序找洞里那一点最上面的外部窗口，不是目标就藏起覆盖层。
-    // （不能用 WindowFromPoint：我们自己的覆盖层是 topmost 且带 alpha，会命中它自己。）
-    let covered = {
-        let regions = VS.with(|v| v.borrow().regions.clone());
-        match hole_sample(&regions, cx, cy, cw, ch) {
-            // 按 z 序找"洞里那一点最上面那扇不是我们自己的窗口"：
-            // 如果它不是目标窗口，说明目标被别的窗口压住了，覆盖层绝不能画上去
-            // （否则洞会盖在别的页面上面——用户看到的"穿透覆盖上层页面"）。
-            Some((sx, sy)) => unsafe { top_foreign_window_at(sx, sy) != target },
-            None => false,
-        }
-    };
-    if covered {
+    // 遮挡：把目标上面那些窗口的矩形从洞区里扣掉，只显示真正露出来的部分；
+    // 全被盖住才隐藏（以前按采样点判断，挡住一点就整块消失）。
+    let base = CreateRectRgn(0, 0, 0, 0);
+    if base.is_invalid() {
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
     }
+    let regions_now = VS.with(|v| v.borrow().regions.clone());
+    for r in regions_now.iter().filter(|r| r.enabled && r.opacity > 0) {
+        if r.pts.len() < 3 {
+            continue;
+        }
+        let pts: Vec<POINT> = r
+            .pts
+            .iter()
+            .map(|(nx, ny)| POINT {
+                x: (nx * cw as f32).round() as i32,
+                y: (ny * ch as f32).round() as i32,
+            })
+            .collect();
+        let pr = CreatePolygonRgn(&pts, WINDING);
+        if pr.is_invalid() {
+            continue;
+        }
+        let _ = CombineRgn(Some(&base), Some(&base), Some(&pr), RGN_OR);
+        let _ = DeleteObject(HGDIOBJ(pr.0));
+    }
+    let null = HWND(std::ptr::null_mut());
+    let mut above = GetTopWindow(null).unwrap_or(null);
+    while !above.0.is_null() && above.0 as isize != target {
+        if !crate::is_own_hwnd(above) && !crate::is_shell_hwnd(above) && IsWindowVisible(above).as_bool() {
+            let mut rr = RECT::default();
+            if GetWindowRect(above, &mut rr).is_ok() {
+                let clip = CreateRectRgn(rr.left - cx, rr.top - cy, rr.right - cx, rr.bottom - cy);
+                if !clip.is_invalid() {
+                    let _ = CombineRgn(Some(&base), Some(&base), Some(&clip), RGN_DIFF);
+                    let _ = DeleteObject(HGDIOBJ(clip.0));
+                }
+            }
+        }
+        above = GetWindow(above, GW_HWNDNEXT).unwrap_or(null);
+    }
+    let mut bx = RECT::default();
+    let _ = GetRgnBox(base, &mut bx);
+    if bx.left >= bx.right || bx.top >= bx.bottom {
+        let _ = DeleteObject(HGDIOBJ(base.0));
+        let _ = ShowWindow(overlay, SW_HIDE);
+        return;
+    }
+    let _ = SetWindowRgn(overlay, Some(&base), true);
     if (rect.0, rect.1, rect.2, rect.3) != (cx, cy, cw, ch) {
         // 窗动洞动：整屏快照已经在 VS 里了，直接按新位置重裁一块，不用再抓屏 → 拖动/松手都不闪。
         VS.with(|v| v.borrow_mut().rect = (cx, cy, cw, ch));

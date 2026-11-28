@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.21.3**
+> 归档时间：2026-11-28　·　对应版本：**v2.21.4**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.21.3** |
+| 当前版本 | **v2.21.4** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -126,6 +126,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.21.1 | **洞里浮出自己的面板**：下层快照抓屏时只在「主界面矩形与目标客户区相交」时才藏主界面；但目标 hwnd 可能和面板显示的不是同一个（微信多窗口），相交判断漏掉，主界面被拍进快照，洞里就浮出一块 TransGlass 自己的 UI。改成抓快照前**无条件隐藏主界面** |
 | 2.21.2 | **面板看不到别的窗口上的蒙版**：微信等多窗口程序里，点选的目标 hwnd 和画蒙版的窗口可能不同，面板只列当前目标的蒙版，就显示「还没有蒙版」。修法：面板底部增加「其他窗口的蒙版」列表（从 `regions::mask_windows()` 取），点一下就能切过去；另外画完蒙版后直接把控制目标切到被编辑的窗口 |
 | 2.21.3 | **GPU 覆盖层的层数遮挡**：GPU 路径（DWM 缩略图）原来没做遮挡判断，目标窗口被别的页面盖住时洞仍然画在最上面。修法：洞里采样点从 z 序最上面往下找「包含该点、不是本进程/桌面」的窗口，不是目标就隐藏 GPU 覆盖层 |
+| 2.21.4 | **选区变成整窗透明 + 挡一点就全没**：① GPU 覆盖层的区域用 `CreateRectRgn(0,0,cw,ch)` 当基础再 OR 洞多边形 → 区域 = 整个客户区，缩略图铺满整窗（看着像整窗透明）；改成**空区域 + OR 多边形**。② 遮挡从「采样点被挡就整块隐藏」改成**把上方窗口的矩形从区域里扣掉**（RGN_DIFF），只显示真正露出来的部分；CPU 路径同样改成区域裁剪 + `GetRgnBox` 为空才隐藏 |
 
 ---
 
@@ -278,6 +279,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.21.1 | `dist\installer\TransGlass_2.21.1_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.21.1.zip` | ✅ |
 | v2.21.2 | `dist\installer\TransGlass_2.21.2_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.21.2.zip` | ✅ |
 | v2.21.3 | `dist\installer\TransGlass_2.21.3_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.21.3.zip` | ✅ |
+| v2.21.4 | `dist\installer\TransGlass_2.21.4_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.21.4.zip` | ✅ |
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
 ---

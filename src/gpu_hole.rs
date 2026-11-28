@@ -195,21 +195,36 @@ unsafe fn apply(hwnd: HWND) {
     }
     let (cx, cy) = (origin.x, origin.y);
 
-    // 取下层窗口：从 z 序最上面往下找"包含洞里采样点、不是目标/不是我们进程"的窗口
-    let sample = sample_point(&req.polys, cx, cy, cw, ch);
-    let (source, below) = match sample {
-        Some((sx, sy)) => (lower_window_at(sx, sy, req.target), top_foreign_at(sx, sy)),
-        None => (0, 0),
+    // 在洞里找一个未被别的窗口盖住的采样点（网格扫），
+    // 用它来确定下层窗口；找不到说明洞全被盖了，直接隐藏。
+    let mut sample = None;
+    'outer: for gy in 0..8 {
+        for gx in 0..8 {
+            let nx = (gx as f32 + 0.5) / 8.0;
+            let ny = (gy as f32 + 0.5) / 8.0;
+            if !req.polys.iter().any(|p| point_in_poly(p, nx, ny)) {
+                continue;
+            }
+            let sx = cx + (nx * cw as f32) as i32;
+            let sy = cy + (ny * ch as f32) as i32;
+            if top_foreign_at(sx, sy) == req.target {
+                sample = Some((sx, sy));
+                break 'outer;
+            }
+        }
+    }
+    let Some((sx, sy)) = sample else {
+        hide_now(hwnd);
+        return;
     };
-    // 层数遮盖：洞里那一点最上面的外部窗口必须就是目标本身，
-    // 否则说明目标被别的页面盖住了，覆盖层不能画上去
-    if below != req.target || source == 0 {
+    let source = lower_window_at(sx, sy, req.target);
+    if source == 0 {
         hide_now(hwnd);
         return;
     }
 
-    // 区域：窗口坐标（覆盖层是无边框 popup，客户区 = 窗口区）
-    let base = CreateRectRgn(0, 0, cw, ch);
+    // 区域：空区域 + 洞多边形的并集（不能用整个客户区当基础，否则整个窗口都会被覆盖层盖住）
+    let base = CreateRectRgn(0, 0, 0, 0);
     if base.is_invalid() {
         hide_now(hwnd);
         return;
@@ -231,6 +246,28 @@ unsafe fn apply(hwnd: HWND) {
         }
         let _ = CombineRgn(Some(&base), Some(&base), Some(&pr), RGN_OR);
         let _ = DeleteObject(HGDIOBJ(pr.0));
+    }
+    // 层数遮盖：把目标上面那些窗口的矩形从洞里扣掉，
+    // 只给真正露出来的部分发布区域，部分遮挡不会整块消失
+    let mut above = match GetTopWindow(HWND(std::ptr::null_mut())) {
+        Ok(h) => h,
+        Err(_) => HWND(std::ptr::null_mut()),
+    };
+    while !above.0.is_null() && above.0 as isize != req.target {
+        if !crate::is_own_hwnd(above) && !crate::is_shell_hwnd(above) && IsWindowVisible(above).as_bool() {
+            let mut rr = RECT::default();
+            if GetWindowRect(above, &mut rr).is_ok() {
+                let clip = CreateRectRgn(rr.left - cx, rr.top - cy, rr.right - cx, rr.bottom - cy);
+                if !clip.is_invalid() {
+                    let _ = CombineRgn(Some(&base), Some(&base), Some(&clip), RGN_DIFF);
+                    let _ = DeleteObject(HGDIOBJ(clip.0));
+                }
+            }
+        }
+        above = match GetWindow(above, GW_HWNDNEXT) {
+            Ok(n) => n,
+            Err(_) => HWND(std::ptr::null_mut()),
+        };
     }
     let _ = SetWindowRgn(hwnd, Some(&base), true);
 
@@ -367,4 +404,18 @@ unsafe fn top_foreign_at(x: i32, y: i32) -> isize {
         };
     }
     0
+}
+
+fn point_in_poly(poly: &[(f32, f32)], x: f32, y: f32) -> bool {
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
