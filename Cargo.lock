@@ -4872,7 +4872,7 @@ dependencies = [
 
 [[package]]
 name = "transglass"
-version = "2.19.7"
+version = "2.19.8"
 dependencies = [
  "dashmap",
  "eframe",
