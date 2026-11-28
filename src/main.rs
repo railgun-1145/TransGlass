@@ -7586,6 +7586,38 @@ impl TransGlassApp {
         } else if self.ps_selected >= n {
             self.ps_selected = n - 1;
         }
+        // 蒙版可能存在"别的窗口"上（微信等多窗口程序里，点选的目标和画蒙版的窗口未必是同一个）。
+        // 这里把其他有蒙版的窗口列出来，点一下就能切过去管理。
+        let others: Vec<(isize, usize)> = crate::regions::mask_windows()
+            .into_iter()
+            .filter(|(h, _)| *h != target)
+            .collect();
+        if !others.is_empty() {
+            ui.separator();
+            ui.label(egui::RichText::new("其他窗口的蒙版").small().strong());
+            for (h, cnt) in others {
+                let title = unsafe { crate::get_window_title(HWND(h as *mut _)) };
+                let title = if title.is_empty() {
+                    format!("窗口 {h}")
+                } else {
+                    title
+                };
+                let short: String = title.chars().take(14).collect();
+                let label = if title.chars().count() > 14 {
+                    format!("{short}… · {cnt} 个")
+                } else {
+                    format!("{title} · {cnt} 个")
+                };
+                if ui
+                    .small_button(label)
+                    .on_hover_text("切到这个窗口，管理它的蒙版")
+                    .clicked()
+                {
+                    crate::set_target_window(h);
+                    self.ps_selected = 0;
+                }
+            }
+        }
         ui.separator();
         if let Some(st) = GLOBAL_REGISTRY.get(&target) {
             let pct = (st.current_alpha as f32 / 255.0 * 100.0).round();

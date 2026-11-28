@@ -200,6 +200,14 @@ fn apply_regions(hwnd: isize, regions: Vec<Region>, wait: bool) {
     }
 }
 
+/// 所有有蒙版的窗口（hwnd, 数量），面板用来显示"其他窗口的蒙版"。
+pub fn mask_windows() -> Vec<(isize, usize)> {
+    REGIONS
+        .lock()
+        .map(|v| v.iter().filter(|(_, r)| !r.is_empty()).map(|(h, r)| (*h, r.len())).collect())
+        .unwrap_or_default()
+}
+
 pub fn snapshot_all() -> Vec<(isize, Vec<Region>)> {
     REGIONS.lock().map(|v| v.clone()).unwrap_or_default()
 }
@@ -784,6 +792,8 @@ unsafe fn end_edit(overlay: HWND, save: bool) {
     if save {
         // 同步等透明洞抓完下层快照，再恢复主界面，避免主界面出现在洞里
         set_regions(state.hwnd, state.regions.clone());
+        // 让面板切到这扇窗口，刚画的蒙版立刻能在列表里看到/调
+        crate::set_target_window(state.hwnd);
     }
     clear_hole_style(state.hwnd);
 
