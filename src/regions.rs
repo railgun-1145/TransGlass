@@ -114,10 +114,6 @@ pub fn hide_visual() {
 }
 
 static VISUAL_SEQ: AtomicU32 = AtomicU32::new(0);
-/// 窗口在动：先藏覆盖层、等停稳再重抓快照，避免拖动时每 200ms 藏/显目标窗口造成闪烁
-static VISUAL_PENDING: AtomicBool = AtomicBool::new(false);
-static MOVE_SEQ: AtomicU32 = AtomicU32::new(0);
-static LAST_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// 同步版刷新：等视觉线程完成一次抓取再返回（最多等 2 秒）。
 /// 编辑结束用它，保证「藏主界面 → 抓下层 → 恢复主界面」的顺序，洞里的文字才不会和窗口本身错位。
@@ -1335,9 +1331,13 @@ unsafe fn draw_editor(overlay: HWND) {
 
 struct VisualState {
     target: isize,
+    /// 整块虚拟屏幕的下层快照（RGBA，alpha=255）。拖动窗口时从这里裁，不用重抓 → 不闪。
     snapshot: Option<Vec<u8>>,
+    /// snapshot 对应的虚拟屏幕原点和尺寸
+    origin: (i32, i32),
     w: i32,
     h: i32,
+    /// 目标窗口客户区（当前屏幕坐标 + 尺寸）
     rect: (i32, i32, i32, i32),
     regions: Vec<Region>,
 }
@@ -1347,6 +1347,7 @@ impl Default for VisualState {
         Self {
             target: 0,
             snapshot: None,
+            origin: (0, 0),
             w: 0,
             h: 0,
             rect: (0, 0, 0, 0),
@@ -1432,25 +1433,12 @@ unsafe extern "system" fn visual_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         }
         WM_VISUAL_HIDE => {
             VISUAL_HIDE_REQ.store(false, Ordering::Relaxed);
-            VISUAL_PENDING.store(false, Ordering::Relaxed);
             VS.with(|v| *v.borrow_mut() = VisualState::default());
             let _ = ShowWindow(hwnd, SW_HIDE);
             LRESULT(0)
         }
         WM_TIMER => {
-            // 窗口在动时 follow_visual 只更新 rect 并藏起来；连续两次定时器都没再动，
-            // 才真正重抓快照（拖动时不闪）
-            let seq = MOVE_SEQ.load(Ordering::Relaxed);
-            let last = LAST_SEQ.swap(seq, Ordering::Relaxed);
-            if VISUAL_PENDING.load(Ordering::Relaxed) && seq == last {
-                VISUAL_PENDING.store(false, Ordering::Relaxed);
-                let target = VS.with(|v| v.borrow().target);
-                if target != 0 {
-                    refresh_visual(target);
-                }
-            } else {
-                follow_visual(hwnd);
-            }
+            follow_visual(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -1507,6 +1495,17 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
         }
     }
 
+    // 抓整块虚拟屏幕，不只抓客户区：之后窗口拖动/缩放时直接从这张图里裁，
+    // 不用再藏目标窗口重抓 → 松手不闪、洞里的内容也不会错位。
+    let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if vw <= 0 || vh <= 0 {
+        let _ = ShowWindow(overlay, SW_HIDE);
+        return;
+    }
+
     let _ = ShowWindow(overlay, SW_HIDE);
     let _ = ShowWindow(hwnd, SW_HIDE);
     thread::sleep(std::time::Duration::from_millis(80));
@@ -1515,8 +1514,8 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
     let mem = CreateCompatibleDC(screen);
     let mut bi: BITMAPINFO = std::mem::zeroed();
     bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biWidth = vw;
+    bi.bmiHeader.biHeight = -vh;
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB.0;
@@ -1526,8 +1525,8 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
     let mut snapshot = None;
     if let Ok(dib) = dib {
         let old = SelectObject(mem, HGDIOBJ(dib.0));
-        if BitBlt(mem, 0, 0, w, h, screen, cx, cy, SRCCOPY).is_ok() {
-            let buf = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize);
+        if BitBlt(mem, 0, 0, vw, vh, screen, vx, vy, SRCCOPY).is_ok() {
+            let buf = std::slice::from_raw_parts(bits as *const u8, (vw * vh * 4) as usize);
             let mut v = buf.to_vec();
             for px in v.chunks_exact_mut(4) {
                 px[3] = 255;
@@ -1559,8 +1558,9 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
         *v.borrow_mut() = VisualState {
             target,
             snapshot: Some(snapshot),
-            w,
-            h,
+            origin: (vx, vy),
+            w: vw,
+            h: vh,
             rect: (cx, cy, w, h),
             regions,
         };
@@ -1570,13 +1570,11 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
 }
 
 unsafe fn follow_visual(overlay: HWND) {
-    let (target, rect, w, h, has_snapshot, has_visual) = VS.with(|v| {
+    let (target, rect, has_snapshot, has_visual) = VS.with(|v| {
         let st = v.borrow();
         (
             st.target,
             st.rect,
-            st.w,
-            st.h,
             st.snapshot.is_some(),
             st.regions.iter().any(|r| r.enabled && r.opacity > 0),
         )
@@ -1614,14 +1612,10 @@ unsafe fn follow_visual(overlay: HWND) {
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
     }
-    if (rect.0, rect.1, rect.2, rect.3) != (cx, cy, cw, ch) || w != cw || h != ch {
-        // 窗动洞动：拖动/缩放中先藏起来，等停稳（连续两次定时器都不再动）再重抓快照，
-        // 否则每帧 refresh_visual 都会把目标窗口藏一下再 BitBlt，看起来就是闪烁。
-        MOVE_SEQ.fetch_add(1, Ordering::Relaxed);
-        VISUAL_PENDING.store(true, Ordering::Relaxed);
+    if (rect.0, rect.1, rect.2, rect.3) != (cx, cy, cw, ch) {
+        // 窗动洞动：整屏快照已经在 VS 里了，直接按新位置重裁一块，不用再抓屏 → 拖动/松手都不闪。
         VS.with(|v| v.borrow_mut().rect = (cx, cy, cw, ch));
-        let _ = ShowWindow(overlay, SW_HIDE);
-        return;
+        draw_visual(overlay);
     }
     let _ = SetWindowPos(
         overlay,
@@ -1680,12 +1674,20 @@ fn hole_sample(regions: &[Region], cx: i32, cy: i32, cw: i32, ch: i32) -> Option
 }
 
 unsafe fn draw_visual(overlay: HWND) {
-    let (w, h, rect, snapshot, regions) = VS.with(|v| {
+    let (origin, sw, sh, rect, snapshot, regions) = VS.with(|v| {
         let st = v.borrow();
-        (st.w, st.h, st.rect, st.snapshot.clone(), st.regions.clone())
+        (
+            st.origin,
+            st.w,
+            st.h,
+            st.rect,
+            st.snapshot.clone(),
+            st.regions.clone(),
+        )
     });
     let Some(snapshot) = snapshot else { return };
-    if w <= 0 || h <= 0 {
+    let (rx, ry, w, h) = rect;
+    if w <= 0 || h <= 0 || sw <= 0 || sh <= 0 {
         return;
     }
     let screen = GetDC(None);
@@ -1708,6 +1710,7 @@ unsafe fn draw_visual(overlay: HWND) {
 
     for y in 0..h {
         let ny = (y as f32 + 0.5) / h as f32;
+        let sy = ry + y - origin.1;
         let row = (y * w) as usize;
         for x in 0..w {
             let nx = (x as f32 + 0.5) / w as f32;
@@ -1718,9 +1721,10 @@ unsafe fn draw_visual(overlay: HWND) {
                 }
             }
             let di = (row + x as usize) * 4;
-            if alpha > 0 {
+            let sx = rx + x - origin.0;
+            if alpha > 0 && sx >= 0 && sy >= 0 && sx < sw && sy < sh {
                 let a = (alpha * 255 / 100) as u32;
-                let si = (row + x as usize) * 4;
+                let si = ((sy as usize) * (sw as usize) + sx as usize) * 4;
                 buf[di] = ((snapshot[si] as u32 * a) / 255) as u8;
                 buf[di + 1] = ((snapshot[si + 1] as u32 * a) / 255) as u8;
                 buf[di + 2] = ((snapshot[si + 2] as u32 * a) / 255) as u8;
