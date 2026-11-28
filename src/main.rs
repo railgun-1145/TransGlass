@@ -7539,6 +7539,12 @@ impl TransGlassApp {
         });
         if regions.is_empty() {
             ui.label(egui::RichText::new("还没有蒙版").small().weak());
+        } else {
+            ui.label(
+                egui::RichText::new("点蒙版名字或 ⇄：悬浮球滑条就调它")
+                    .small()
+                    .weak(),
+            );
         }
         // ---------- 蒙版列表：每行一张小预览 + 眼睛/反向/透明度/删除 ----------
         let mut pick: Option<usize> = None;
@@ -7603,6 +7609,14 @@ impl TransGlassApp {
                                     .changed()
                                 {
                                     set_en = Some((i, en));
+                                }
+                                // 点这个就把悬浮球的滑条切到这个蒙版（并把目标对齐到当前窗口）
+                                if ui
+                                    .small_button("⇄")
+                                    .on_hover_text("让悬浮球调这个蒙版（同步目标窗口）")
+                                    .clicked()
+                                {
+                                    pick = Some(i);
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
