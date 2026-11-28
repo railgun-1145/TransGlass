@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.19.4**
+> 归档时间：2026-11-28　·　对应版本：**v2.19.5**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.19.4** |
+| 当前版本 | **v2.19.5** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -112,6 +112,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.19.2 | **左右侧栏恢复可拖**：左栏 240–420（默认 280）、右栏 220–420（默认 256），都可以拖分隔线调宽度；树子项标题截断到 10 字、窗口行 18 字，保证拖到最窄也不撑宽、不出黑缝；右侧面板内容加 `set_max_width` 防溢出 |
 | 2.19.3 | **修蒙版点透不生效（蒙版不是空壳了）**：`WS_EX_TRANSPARENT` 只有在窗口本身是 layered 时才真的让鼠标穿过去——进洞时给没 layered 的窗口临时补 `WS_EX_LAYERED + SetLayeredWindowAttributes(当前alpha)`，出洞撤销；洞里左键/右键现在都会落到下层窗口；另外洞里点击不再把控制目标切到下层窗口 |
 | 2.19.4 | **拉蒙版透明度能立刻看到效果**：视觉洞原来只在目标窗口是前台时显示，面板在前台拉滑块时啥也看不到（现在洞内点击又会穿到下层，点不回目标）。改成「目标前台，或主界面在前台且没压在目标窗口上」都显示；`follow_visual` 用 `crate::root_hwnd()` 判断主界面矩形是否和目标客户区相交 |
+| 2.19.5 | **选别的窗口不再让洞消失、拖动不再闪**：显示条件从"谁在前台"改成**遮挡判断**（在洞里取采样点 `WindowFromPoint`，顶层不是目标/不是自己的覆盖层就藏）——切到别的窗口时洞还在，主界面/别的窗口压住洞时自动藏；拖动/缩放时只更新 rect 并藏覆盖层，连续两次定时器都不动才重抓快照，避免每帧藏/显目标窗口导致的闪烁 |
 
 ---
 
@@ -168,6 +169,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 50. **编辑器工具栏白字变浅绿糊块**：13px 中文用 `ANTIALIASED_QUALITY` 时笔画像素是"白+背景绿"的中间色，补 alpha 后就变成不透明的浅绿，看起来像糊块。改成 `NONANTIALIASED_QUALITY`（3），笔画实心；选中的工具按钮也从"绿底白字"改成"浅绿底 + 深绿字 + 绿框"，小字号才看得清。
 51. **蒙版点透了但还是点不动（空壳）**：`WS_EX_TRANSPARENT` 单独加在**非 layered** 窗口上并不会让鼠标穿过去——它只对 layered 窗口（`WS_EX_LAYERED` + `SetLayeredWindowAttributes`）生效。整窗点透一直能用是因为 `apply_transparency_to_hwnd` 永远会补 `WS_EX_LAYERED`；而洞的 `enforce_at` 只调 `set_hwnd_mouse_transparent`（只改 TRANSPARENT 位），目标窗口没被调过透明度时就不是 layered，于是洞"看着有、点不动"。修法：新增 `crate::add_hole_passthrough` / `remove_hole_passthrough`，进洞时若窗口没 LAYERED 就补上并 `SetLayeredWindowAttributes(当前 alpha 或 255)`，同时记到 `HOLE_LAYERED`，出洞/清空/失效时撤掉。**验证方法**：两个窗口上下叠，洞内左键应把前台切到下层窗口、右键弹的是下层的菜单；同时 `GetWindowLongW(GWL_EXSTYLE)` 在洞内应看到 `0x20|0x80000`，离开后恢复。另一个坑：洞里点击会命中下层窗口，鼠标钩子的"点击=切换控制目标"要先用 `regions::hole_at()` 排除，否则点洞会把面板目标切到下面那个窗口。
 52. **拉透明度看不到效果**：视觉洞的 `follow_visual` 只认 `GetForegroundWindow() == 目标窗口`。在面板里拉滑块时前台是主界面，覆盖层一直藏着；而洞内点击现在又会穿到下层，用户很难把目标窗口点回前台，于是"透明度没用"。修法：加 `crate::root_hwnd()`，显示条件改成 **目标前台 或（主界面前台且主界面矩形与目标客户区不相交）**——面板在旁边时拉滑块立刻能看到洞里的下层画面；主界面压在目标上时仍然隐藏，避免覆盖层糊到面板上。视觉线程本来就有 200ms 的 `WM_TIMER → follow_visual`，所以前台变化后最多 200ms 就会显示/隐藏，不用额外消息。
+53. **切窗口洞消失 / 拖动闪烁**：显示条件绑"前台"太脆——选别的窗口（前台变了）洞就没了；而 `follow_visual` 发现目标矩形变了就 `refresh_visual`，`refresh_visual` 每次都会 `SW_HIDE` 目标再 BitBlt，于是拖动时每 200ms 闪一下。修法：① 改**遮挡判断**：在洞里取采样点（先试每个选区包围盒中心，再 5×5 网格），`WindowFromPoint + GetAncestor(GA_ROOT)`，顶层既不是目标也不是自己的 `TransGlassHole` 覆盖层就藏——切窗口不受影响，主界面/别的窗口压上来会正确隐藏。注意覆盖层是 `WS_EX_TRANSPARENT|WS_EX_LAYERED`，本身会被 `WindowFromPoint` 跳过，所以采样点命中的是目标窗口。② 拖动时只记 `MOVE_SEQ` + 更新 `VS.rect` + 藏覆盖层；`WM_TIMER` 里连续两次 `MOVE_SEQ` 没变化（约 400ms 没动）才 `refresh_visual` 重抓一次，拖动过程不再反复藏/显目标。
 34. **选中控制卡片**：主界面 `selection_control_section` 列 `TARGET_HWND` + 所有有选区的窗口；卡片用 `CollapsingHeader` 堆叠，可展开/收起。选区反向/透明度/删除走 `regions::update_region/remove_region` → `WM_VISUAL_MASK` **只重画覆盖层 mask**，不重新抓下层快照（否则每拖一下滑条就 BitBlt/闪）。标记存在 `selection.rs::MARKS`（hwnd → 文字/颜色），`set_mark` 清 `LAST` 让选择框重画；卡片标题和选择框标签都显示标记。
 
 ---
@@ -245,6 +247,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.19.2 | `dist\installer\TransGlass_2.19.2_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.19.2.zip` | ✅ |
 | v2.19.3 | `dist\installer\TransGlass_2.19.3_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.19.3.zip` | ✅ |
 | v2.19.4 | `dist\installer\TransGlass_2.19.4_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.19.4.zip` | ✅ |
+| v2.19.5 | `dist\installer\TransGlass_2.19.5_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.19.5.zip` | ✅ |
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
 ---

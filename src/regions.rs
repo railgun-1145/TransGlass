@@ -114,6 +114,10 @@ pub fn hide_visual() {
 }
 
 static VISUAL_SEQ: AtomicU32 = AtomicU32::new(0);
+/// 窗口在动：先藏覆盖层、等停稳再重抓快照，避免拖动时每 200ms 藏/显目标窗口造成闪烁
+static VISUAL_PENDING: AtomicBool = AtomicBool::new(false);
+static MOVE_SEQ: AtomicU32 = AtomicU32::new(0);
+static LAST_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// 同步版刷新：等视觉线程完成一次抓取再返回（最多等 2 秒）。
 /// 编辑结束用它，保证「藏主界面 → 抓下层 → 恢复主界面」的顺序，洞里的文字才不会和窗口本身错位。
@@ -1428,12 +1432,25 @@ unsafe extern "system" fn visual_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         }
         WM_VISUAL_HIDE => {
             VISUAL_HIDE_REQ.store(false, Ordering::Relaxed);
+            VISUAL_PENDING.store(false, Ordering::Relaxed);
             VS.with(|v| *v.borrow_mut() = VisualState::default());
             let _ = ShowWindow(hwnd, SW_HIDE);
             LRESULT(0)
         }
         WM_TIMER => {
-            follow_visual(hwnd);
+            // 窗口在动时 follow_visual 只更新 rect 并藏起来；连续两次定时器都没再动，
+            // 才真正重抓快照（拖动时不闪）
+            let seq = MOVE_SEQ.load(Ordering::Relaxed);
+            let last = LAST_SEQ.swap(seq, Ordering::Relaxed);
+            if VISUAL_PENDING.load(Ordering::Relaxed) && seq == last {
+                VISUAL_PENDING.store(false, Ordering::Relaxed);
+                let target = VS.with(|v| v.borrow().target);
+                if target != 0 {
+                    refresh_visual(target);
+                }
+            } else {
+                follow_visual(hwnd);
+            }
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -1573,34 +1590,37 @@ unsafe fn follow_visual(overlay: HWND) {
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
     };
-    // 目标窗口在前台时显示（正常）；
-    // 主界面在前台、且主界面没有压在目标窗口上时也显示——在面板里拉透明度能立刻看到效果，
-    // 不用先点一下目标窗口（而且洞内点击现在会穿到下层，点不回来）。
-    let fg = GetForegroundWindow();
-    let main_overlays = {
-        let root = crate::root_hwnd();
-        if root != 0 && fg == HWND(root as *mut _) {
-            let mut m = RECT::default();
-            if GetWindowRect(HWND(root as *mut _), &mut m).is_ok() {
-                !(m.right <= cx || m.left >= cx + cw || m.bottom <= cy || m.top >= cy + ch)
-            } else {
-                true
-            }
-        } else {
-            false
-        }
-    };
-    if fg != hwnd && !(fg == HWND(crate::root_hwnd() as *mut _) && !main_overlays) {
-        let _ = ShowWindow(overlay, SW_HIDE);
-        return;
-    }
     if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
     }
+    // 遮挡判断：在洞里取一个采样点，看它现在属于谁。
+    // 只要洞的位置没被别的窗口压住（目标自己是顶层，或只是我们自己的窗口在上面），就显示；
+    // 这样「选择别的窗口」不会让洞突然消失，拖动主界面压上去时也会正确隐藏。
+    let covered = {
+        let regions = VS.with(|v| v.borrow().regions.clone());
+        match hole_sample(&regions, cx, cy, cw, ch) {
+            Some((sx, sy)) => unsafe {
+                let hit = WindowFromPoint(POINT { x: sx, y: sy });
+                let root = GetAncestor(hit, GA_ROOT);
+                // 顶层不是目标窗口（也不是我们自己的覆盖层）就认为被挡住了：
+                // 主界面/悬浮球压上来时藏起来，别的窗口盖住时也藏。
+                root != hwnd && root != overlay
+            },
+            None => false,
+        }
+    };
+    if covered {
+        let _ = ShowWindow(overlay, SW_HIDE);
+        return;
+    }
     if (rect.0, rect.1, rect.2, rect.3) != (cx, cy, cw, ch) || w != cw || h != ch {
-        // 窗动洞动：窗口拖动/缩放后按新位置重新抓下层快照，洞跟着窗口走（像布上开洞）
-        refresh_visual(target);
+        // 窗动洞动：拖动/缩放中先藏起来，等停稳（连续两次定时器都不再动）再重抓快照，
+        // 否则每帧 refresh_visual 都会把目标窗口藏一下再 BitBlt，看起来就是闪烁。
+        MOVE_SEQ.fetch_add(1, Ordering::Relaxed);
+        VISUAL_PENDING.store(true, Ordering::Relaxed);
+        VS.with(|v| v.borrow_mut().rect = (cx, cy, cw, ch));
+        let _ = ShowWindow(overlay, SW_HIDE);
         return;
     }
     let _ = SetWindowPos(
@@ -1613,6 +1633,50 @@ unsafe fn follow_visual(overlay: HWND) {
         SWP_NOACTIVATE | SWP_SHOWWINDOW,
     );
     let _ = ShowWindow(overlay, SW_SHOW);
+}
+
+/// 在洞里找一个采样点（屏幕坐标），用于判断洞有没有被别的窗口压住。
+fn hole_sample(regions: &[Region], cx: i32, cy: i32, cw: i32, ch: i32) -> Option<(i32, i32)> {
+    if cw <= 0 || ch <= 0 {
+        return None;
+    }
+    // 先试每个选区包围盒中心（大多数情况一下就中）
+    for r in regions {
+        if !r.enabled || r.opacity == 0 {
+            continue;
+        }
+        let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for (x, y) in &r.pts {
+            minx = minx.min(*x);
+            miny = miny.min(*y);
+            maxx = maxx.max(*x);
+            maxy = maxy.max(*y);
+        }
+        let nx = (minx + maxx) * 0.5;
+        let ny = (miny + maxy) * 0.5;
+        if region_contains(r, nx, ny) {
+            return Some((
+                cx + (nx * cw as f32) as i32,
+                cy + (ny * ch as f32) as i32,
+            ));
+        }
+    }
+    // 反向选区（洞在圈外）或细长洞：网格扫一遍
+    for gy in 0..5 {
+        for gx in 0..5 {
+            let x = cx + cw / 10 + gx * cw / 5;
+            let y = cy + ch / 10 + gy * ch / 5;
+            let nx = (x - cx) as f32 / cw as f32;
+            let ny = (y - cy) as f32 / ch as f32;
+            if regions
+                .iter()
+                .any(|r| r.enabled && r.opacity > 0 && region_contains(r, nx, ny))
+            {
+                return Some((x, y));
+            }
+        }
+    }
+    None
 }
 
 unsafe fn draw_visual(overlay: HWND) {
