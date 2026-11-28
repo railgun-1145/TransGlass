@@ -1570,8 +1570,6 @@ unsafe fn restore_window(hwnd: HWND) {
 }
 
 unsafe fn restore_all_windows() {
-    // 先把挖过洞的窗口恢复成矩形，否则退出后窗口会留着一个洞
-    crate::regions::restore_all_holes();
     let hwnds: Vec<isize> = GLOBAL_REGISTRY.iter().map(|kv| *kv.key()).collect();
     for hwnd_val in hwnds {
         restore_window(HWND(hwnd_val as *mut _));
@@ -5440,11 +5438,6 @@ pub(crate) unsafe fn capture_window(hwnd: HWND) -> Option<egui::ColorImage> {
 /// 当前被高亮的窗口（0 = 无）
 static HILITE_TARGET: AtomicIsize = AtomicIsize::new(0);
 
-/// regions 模块的调试日志（挖洞用）
-pub(crate) fn log_region_debug(msg: &str) {
-    log_hilite(msg);
-}
-
 fn log_hilite(msg: &str) {
     let _ = std::fs::OpenOptions::new()
         .create(true)
@@ -7392,7 +7385,7 @@ impl TransGlassApp {
             }
         });
         ui.label(
-            egui::RichText::new("框内 = 点透；新蒙版默认 0%（只点透、不改外观）")
+            egui::RichText::new("框内 = 点透；新蒙版默认 40%（半透明，可调 0–100）")
                 .small()
                 .weak(),
         );

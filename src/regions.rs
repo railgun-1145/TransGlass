@@ -155,7 +155,6 @@ pub fn clear(hwnd: isize) {
         v.retain(|(h, _)| *h != hwnd);
     }
     clear_hole_style(hwnd);
-    unsafe { apply_window_hole(hwnd) };
     hide_visual();
 }
 
@@ -189,17 +188,14 @@ fn apply_regions(hwnd: isize, regions: Vec<Region>, wait: bool) {
         }
     }
     clear_hole_style(hwnd);
-    // 先抓窗口画面（此时窗口还没被挖洞），再挖洞；不然屏幕截图里只能抓到洞里的下层
-    if !empty {
-        if wait {
-            refresh_visual_wait(hwnd);
-        } else {
-            refresh_visual(hwnd);
-        }
-    }
-    unsafe { apply_window_hole(hwnd) };
+    // 即使当前透明度是 0（只点透、不改外观）也抓一张下层快照存着：
+    // 之后在列表里把透明度滑块拉起来就能立刻看到视觉洞，不用重新抓屏。
     if empty {
         hide_visual();
+    } else if wait {
+        refresh_visual_wait(hwnd);
+    } else {
+        refresh_visual(hwnd);
     }
 }
 
@@ -230,8 +226,8 @@ pub fn update_region(
         }
     }
     clear_hole_style(hwnd);
-    unsafe { apply_window_hole(hwnd) };
-    // 透明度归 0 时只重画 mask
+    // 透明度归 0 时只重画 mask（全透明 + follow_visual 会把覆盖层藏起来），
+    // 保留已抓的下层快照，之后拉回透明度不用重抓。
     refresh_visual_mask();
 }
 
@@ -249,7 +245,6 @@ pub fn remove_region(hwnd: isize, idx: usize) {
         }
     }
     clear_hole_style(hwnd);
-    unsafe { apply_window_hole(hwnd) };
     if empty {
         hide_visual();
     } else {
@@ -263,123 +258,6 @@ fn refresh_visual_mask() {
         unsafe {
             let _ = PostMessageW(HWND(h as *mut _), WM_VISUAL_MASK, WPARAM(0), LPARAM(0));
         }
-    }
-}
-
-/// 这些窗口当前被我们挖了洞（SetWindowRgn）。记录挖洞时的客户区尺寸，窗口缩放后重挖。
-static CUT_HWNDS: Mutex<Vec<(isize, i32, i32)>> = Mutex::new(Vec::new());
-
-/// 有「透明度 > 0」的蒙版时，把窗口的 region 按这些洞挖掉（窗口坐标）。
-/// 洞里的下层画面是实时的、点击也自然落到下层，不再依赖任何屏幕快照。
-unsafe fn apply_window_hole(hwnd: isize) {
-    let h = HWND(hwnd as *mut _);
-    if !IsWindow(h).as_bool() {
-        if let Ok(mut v) = CUT_HWNDS.lock() {
-            v.retain(|x| x.0 != hwnd);
-        }
-        return;
-    }
-    let regions = REGIONS
-        .lock()
-        .ok()
-        .and_then(|v| v.iter().find(|(x, _)| *x == hwnd).map(|(_, r)| r.clone()))
-        .unwrap_or_default();
-    let holes: Vec<Region> = regions
-        .iter()
-        .filter(|r| r.enabled && r.opacity > 0)
-        .cloned()
-        .collect();
-    let already = CUT_HWNDS
-        .lock()
-        .map(|v| v.iter().any(|x| x.0 == hwnd))
-        .unwrap_or(false);
-    if holes.is_empty() {
-        if already {
-            let _ = SetWindowRgn(h, None::<&HRGN>, true);
-            if let Ok(mut v) = CUT_HWNDS.lock() {
-                v.retain(|x| x.0 != hwnd);
-            }
-        }
-        return;
-    }
-    let Some((cx, cy, cw, ch)) = client_screen_rect(h) else {
-        return;
-    };
-    let mut wr = RECT::default();
-    if GetWindowRect(h, &mut wr).is_err() {
-        return;
-    }
-    let ww = wr.right - wr.left;
-    let wh = wr.bottom - wr.top;
-    if ww <= 0 || wh <= 0 || cw <= 0 || ch <= 0 {
-        return;
-    }
-    let ox = cx - wr.left;
-    let oy = cy - wr.top;
-    let base = CreateRectRgn(0, 0, ww, wh);
-    if base.is_invalid() {
-        return;
-    }
-    let mut n_holes = 0;
-    for r in holes {
-        if r.pts.len() < 3 {
-            continue;
-        }
-        let pts: Vec<POINT> = r
-            .pts
-            .iter()
-            .map(|(nx, ny)| POINT {
-                x: ox + (nx * cw as f32).round() as i32,
-                y: oy + (ny * ch as f32).round() as i32,
-            })
-            .collect();
-        let poly = CreatePolygonRgn(&pts, WINDING);
-        if poly.is_invalid() {
-            continue;
-        }
-        let mode = if r.invert { RGN_AND } else { RGN_DIFF };
-        let _ = CombineRgn(Some(&base), Some(&base), Some(&poly), mode);
-        let _ = DeleteObject(HGDIOBJ(poly.0));
-        n_holes += 1;
-    }
-    let set_ret = SetWindowRgn(h, Some(&base), true);
-    crate::log_region_debug(&format!(
-        "cut hwnd={hwnd} holes={n_holes} win={ww}x{wh} client={cw}x{ch} at=({cx},{cy}) set_ret={set_ret}"
-    ));
-    if let Ok(mut v) = CUT_HWNDS.lock() {
-        v.retain(|x| x.0 != hwnd);
-        v.push((hwnd, cw, ch));
-    }
-}
-
-/// 窗口缩放后重新挖洞（region 用的是窗口坐标，尺寸变了要重算）。
-pub fn reapply_cuts_if_resized() {
-    let list = CUT_HWNDS.lock().map(|v| v.clone()).unwrap_or_default();
-    for (hwnd, cw, ch) in list {
-        unsafe {
-            let h = HWND(hwnd as *mut _);
-            if !IsWindow(h).as_bool() {
-                continue;
-            }
-            if let Some((_, _, w, hh)) = client_screen_rect(h) {
-                if w != cw || hh != ch {
-                    apply_window_hole(hwnd);
-                }
-            }
-        }
-    }
-}
-
-/// 退出时把所有挖过洞的窗口恢复成矩形。
-pub fn restore_all_holes() {
-    let list = CUT_HWNDS.lock().map(|v| v.clone()).unwrap_or_default();
-    for (hwnd, _, _) in list {
-        unsafe {
-            let _ = SetWindowRgn(HWND(hwnd as *mut _), None::<&HRGN>, true);
-        }
-    }
-    if let Ok(mut v) = CUT_HWNDS.lock() {
-        v.clear();
     }
 }
 
@@ -435,24 +313,6 @@ pub fn enforce_at(x: i32, y: i32) {
     for (hwnd_val, regions) in map.iter() {
         let hwnd = HWND(*hwnd_val as *mut _);
         let tracked = styles.contains(hwnd_val);
-
-        // 已经用 SetWindowRgn 真挖洞的窗口不需要再切换鼠标穿透样式（洞本身就让点击穿过去了）
-        let cut = CUT_HWNDS
-            .lock()
-            .map(|v| v.iter().any(|x| x.0 == *hwnd_val))
-            .unwrap_or(false);
-        if cut {
-            if tracked {
-                styles.retain(|h| h != hwnd_val);
-            }
-            let added = take_layered(*hwnd_val);
-            if tracked || added {
-                unsafe {
-                    crate::remove_hole_passthrough(hwnd, added);
-                }
-            }
-            continue;
-        }
 
         if crate::selector::is_session_window(*hwnd_val)
             || crate::window_passthrough_active(*hwnd_val)
@@ -1177,7 +1037,8 @@ unsafe fn confirm_edit(overlay: HWND) {
             // 新蒙版默认只做「点击穿透」，不改变窗口外观：
             // 视觉洞贴的是下层快照，默认打开会让人看到别的窗口文字叠在本窗口文字上，像"文字错位"。
             // 想要视觉洞到列表里把透明度拉起来即可（会有提示）。
-            opacity: 0,
+            // 新蒙版默认给一个看得见的半透明，用户才能立刻确认洞的位置和效果
+            opacity: 40,
             enabled: true,
         });
         true
@@ -1564,11 +1425,11 @@ unsafe extern "system" fn visual_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             LRESULT(0)
         }
         WM_VISUAL_MASK => {
-            let (target, win_ready) = VS.with(|v| {
+            let (target, w, h, has_snapshot) = VS.with(|v| {
                 let st = v.borrow();
-                (st.target, st.win_snap.is_some())
+                (st.target, st.w, st.h, st.snapshot.is_some())
             });
-            if target != 0 && win_ready {
+            if target != 0 && w > 0 && h > 0 && has_snapshot {
                 if let Ok(map) = REGIONS.lock() {
                     if let Some((_, regions)) = map.iter().find(|(x, _)| *x == target) {
                         let regions = regions.clone();
@@ -1587,7 +1448,6 @@ unsafe extern "system" fn visual_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             LRESULT(0)
         }
         WM_TIMER => {
-            reapply_cuts_if_resized();
             follow_visual(hwnd);
             LRESULT(0)
         }
@@ -1623,24 +1483,98 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
     };
-    // 窗口画面：还没挖洞时直接从屏幕截客户区（Chromium/KOOK 这类窗口 PrintWindow 经常抓不到），
-    // 已经挖洞时用 PrintWindow（截屏会截到洞里的下层）。
-    let cut = CUT_HWNDS
-        .lock()
-        .map(|v| v.iter().any(|x| x.0 == target))
-        .unwrap_or(false);
-    let win_snap = if cut {
-        capture_window_client(hwnd, w, h)
-    } else {
-        capture_screen_client(cx, cy, w, h).or_else(|| capture_window_client(hwnd, w, h))
+    let was_foreground = GetForegroundWindow() == hwnd;
+
+    // 先抓窗口自己的客户区画面（1:1）。优先从屏幕截取（Chromium/KOOK 的 PrintWindow 经常是黑帧），
+    // PrintWindow 兜底；此时目标窗口还没被任何样式/挖洞影响，截到的就是它真实的画面。
+    let win_snap = capture_screen_client(cx, cy, w, h).or_else(|| capture_window_client(hwnd, w, h));
+
+    // 主界面也不能出现在洞里：抓下层快照前先把它藏起来，抓到干净的桌面/下层窗口。
+    // 只在主界面确实压在目标客户区上时才藏，避免目标窗口拖动时反复闪主界面。
+    let root = crate::main_window_handle();
+    let root_hwnd = HWND(root as *mut _);
+    let mut main_hidden = false;
+    let mut main_was_foreground = false;
+    if root != 0 && IsWindowVisible(root_hwnd).as_bool() && !IsIconic(root_hwnd).as_bool() {
+        let mut rr = RECT::default();
+        if GetWindowRect(root_hwnd, &mut rr).is_ok()
+            && rr.left < cx + w
+            && rr.right > cx
+            && rr.top < cy + h
+            && rr.bottom > cy
+        {
+            main_was_foreground = GetForegroundWindow() == root_hwnd;
+            let _ = ShowWindow(root_hwnd, SW_HIDE);
+            main_hidden = true;
+        }
+    }
+
+    // 抓整块虚拟屏幕，不只抓客户区：之后窗口拖动/缩放时直接从这张图里裁，
+    // 不用再藏目标窗口重抓 → 松手不闪、洞里的内容也不会错位。
+    let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if vw <= 0 || vh <= 0 {
+        let _ = ShowWindow(overlay, SW_HIDE);
+        return;
+    }
+
+    let _ = ShowWindow(overlay, SW_HIDE);
+    let _ = ShowWindow(hwnd, SW_HIDE);
+    thread::sleep(std::time::Duration::from_millis(80));
+
+    let screen = GetDC(None);
+    let mem = CreateCompatibleDC(screen);
+    let mut bi: BITMAPINFO = std::mem::zeroed();
+    bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bi.bmiHeader.biWidth = vw;
+    bi.bmiHeader.biHeight = -vh;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB.0;
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &mut bits, None, 0);
+
+    let mut snapshot = None;
+    if let Ok(dib) = dib {
+        let old = SelectObject(mem, HGDIOBJ(dib.0));
+        if BitBlt(mem, 0, 0, vw, vh, screen, vx, vy, SRCCOPY).is_ok() {
+            let buf = std::slice::from_raw_parts(bits as *const u8, (vw * vh * 4) as usize);
+            let mut v = buf.to_vec();
+            for px in v.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+            snapshot = Some(v);
+        }
+        SelectObject(mem, old);
+        let _ = DeleteObject(HGDIOBJ(dib.0));
+    }
+    let _ = DeleteDC(mem);
+    ReleaseDC(None, screen);
+
+    let _ = ShowWindow(hwnd, SW_SHOW);
+    if was_foreground {
+        let _ = SetForegroundWindow(hwnd);
+    }
+    if main_hidden {
+        let _ = ShowWindow(root_hwnd, SW_SHOW);
+        if main_was_foreground {
+            let _ = SetForegroundWindow(root_hwnd);
+        }
+    }
+
+    let Some(snapshot) = snapshot else {
+        let _ = ShowWindow(overlay, SW_HIDE);
+        return;
     };
     VS.with(|v| {
         *v.borrow_mut() = VisualState {
             target,
-            snapshot: None,
-            origin: (0, 0),
-            w: 0,
-            h: 0,
+            snapshot: Some(snapshot),
+            origin: (vx, vy),
+            w: vw,
+            h: vh,
             win_snap,
             win_w: w,
             win_h: h,
@@ -1653,20 +1587,16 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
 }
 
 unsafe fn follow_visual(overlay: HWND) {
-    // 覆盖层只在 0 < 透明度 < 100 时需要：100% 由 SetWindowRgn 真挖洞负责，
-    // 0% 不高亮。部分透明度时覆盖层把窗口内容按 (1-透明度) 叠在实时下层画面上。
-    let (target, rect, win_ready, has_visual) = VS.with(|v| {
+    let (target, rect, has_snapshot, has_visual) = VS.with(|v| {
         let st = v.borrow();
         (
             st.target,
             st.rect,
-            st.win_snap.is_some(),
-            st.regions
-                .iter()
-                .any(|r| r.enabled && r.opacity > 0),
+            st.snapshot.is_some(),
+            st.regions.iter().any(|r| r.enabled && r.opacity > 0),
         )
     });
-    if target == 0 || !win_ready || !has_visual {
+    if target == 0 || !has_snapshot || !has_visual {
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
     }
@@ -1679,8 +1609,35 @@ unsafe fn follow_visual(overlay: HWND) {
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
     }
+    // 遮挡判断：在洞里取一个采样点，看它现在属于谁。
+    // 注意：鼠标进洞时 enforce_at 会把目标窗口临时设成 WS_EX_TRANSPARENT，
+    // 这时 WindowFromPoint 会跳过目标、返回下层窗口——如果照常判断就会误以为"被挡住"，
+    // 表现就是鼠标一放上去洞就消失（复原）。所以"我们正在强制点透"时跳过遮挡判断。
+    let enforced = HOLE_STYLES
+        .lock()
+        .map(|s| s.iter().any(|h| *h == target))
+        .unwrap_or(false);
+    let covered = if enforced {
+        false
+    } else {
+        let regions = VS.with(|v| v.borrow().regions.clone());
+        match hole_sample(&regions, cx, cy, cw, ch) {
+            Some((sx, sy)) => unsafe {
+                let hit = WindowFromPoint(POINT { x: sx, y: sy });
+                let root = GetAncestor(hit, GA_ROOT);
+                // 顶层不是目标窗口（也不是我们自己的覆盖层）就认为被挡住了：
+                // 主界面/悬浮球压上来时藏起来，别的窗口盖住时也藏。
+                root != hwnd && root != overlay
+            },
+            None => false,
+        }
+    };
+    if covered {
+        let _ = ShowWindow(overlay, SW_HIDE);
+        return;
+    }
     if (rect.0, rect.1, rect.2, rect.3) != (cx, cy, cw, ch) {
-        // 窗动洞动：只更新 rect + 重画（窗口画面按客户区 1:1，不依赖屏幕快照）
+        // 窗动洞动：整屏快照已经在 VS 里了，直接按新位置重裁一块，不用再抓屏 → 拖动/松手都不闪。
         VS.with(|v| v.borrow_mut().rect = (cx, cy, cw, ch));
         draw_visual(overlay);
     }
@@ -1740,7 +1697,8 @@ fn hole_sample(regions: &[Region], cx: i32, cy: i32, cw: i32, ch: i32) -> Option
     None
 }
 
-/// 从屏幕截取客户区画面（窗口还没挖洞、且可见时用这个，Chromium 类窗口也能抓到）。
+/// 抓目标窗口客户区画面（PrintWindow，1:1）。失败返回 None，洞里退回"贴下层快照"的老画法。
+/// 从屏幕截取客户区画面（窗口完好、可见时用这个，Chromium/KOOK 也能抓到）。
 unsafe fn capture_screen_client(cx: i32, cy: i32, w: i32, h: i32) -> Option<Vec<u8>> {
     if w <= 0 || h <= 0 {
         return None;
@@ -1774,7 +1732,6 @@ unsafe fn capture_screen_client(cx: i32, cy: i32, w: i32, h: i32) -> Option<Vec<
     out
 }
 
-/// 抓目标窗口客户区画面（PrintWindow，1:1）。失败返回 None，洞里退回"贴下层快照"的老画法。
 unsafe fn capture_window_client(hwnd: HWND, w: i32, h: i32) -> Option<Vec<u8>> {
     if w <= 0 || h <= 0 {
         return None;
@@ -1816,21 +1773,23 @@ unsafe fn capture_window_client(hwnd: HWND, w: i32, h: i32) -> Option<Vec<u8>> {
 }
 
 unsafe fn draw_visual(overlay: HWND) {
-    // 覆盖层只负责"部分透明度"：把窗口画面按 (1-透明度) 叠回去。
-    // 洞本身由 SetWindowRgn 真挖开，下层是实时画面，没有快照/错位/跟随问题。
-    let (rect, win_snap, win_w, win_h, regions) = VS.with(|v| {
+    let (origin, sw, sh, rect, snapshot, win_snap, win_w, win_h, regions) = VS.with(|v| {
         let st = v.borrow();
         (
+            st.origin,
+            st.w,
+            st.h,
             st.rect,
+            st.snapshot.clone(),
             st.win_snap.clone(),
             st.win_w,
             st.win_h,
             st.regions.clone(),
         )
     });
-    let Some(win) = win_snap else { return };
+    let Some(snapshot) = snapshot else { return };
     let (rx, ry, w, h) = rect;
-    if w <= 0 || h <= 0 || win_w <= 0 || win_h <= 0 {
+    if w <= 0 || h <= 0 || sw <= 0 || sh <= 0 {
         return;
     }
     let screen = GetDC(None);
@@ -1853,36 +1812,51 @@ unsafe fn draw_visual(overlay: HWND) {
 
     for y in 0..h {
         let ny = (y as f32 + 0.5) / h as f32;
+        let sy = ry + y - origin.1;
         let row = (y * w) as usize;
         for x in 0..w {
             let nx = (x as f32 + 0.5) / w as f32;
-            let mut op = 0u32;
+            let mut alpha = 0u32;
             for r in &regions {
-                if r.enabled && r.opacity > 0 && region_contains(r, nx, ny) {
-                    op = op.max(r.opacity as u32);
+                if r.opacity > 0 && region_contains(r, nx, ny) {
+                    alpha = alpha.max(r.opacity as u32);
                 }
             }
             let di = (row + x as usize) * 4;
-            if op > 0 {
-                // 窗口内容永远保留一层（最低 30%）：拉到 100% 也是"很透但还看得见"，
-                // 不会变成上层内容整个消失的真洞。
-                let a = (((100 - op) * 255 / 100) as u32).max(76);
-                let (wx, wy) = if win_w == w && win_h == h {
-                    (x, y)
+            let sx = rx + x - origin.0;
+            if alpha > 0 && sx >= 0 && sy >= 0 && sx < sw && sy < sh {
+                // 下层最多压到 70%，保住至少 30% 的窗口画面：透明度拉满也是"半透明"，不会真消失
+                let a = ((alpha * 255 / 100) as u32).min(178);
+                let si = ((sy as usize) * (sw as usize) + sx as usize) * 4;
+                if let Some(win) = &win_snap {
+                    // 窗口自己的画面按 (1-透明度) 与下层混合，结果完全不透明：
+                    // 透明度作用在"窗口画的那块区域"上，而不是把下层图直接盖上去。
+                    let (wx, wy) = if win_w == w && win_h == h {
+                        (x, y)
+                    } else {
+                        (
+                            (x as f32 * win_w as f32 / w as f32) as i32,
+                            (y as f32 * win_h as f32 / h as f32) as i32,
+                        )
+                    };
+                    let wi = ((wy.max(0) as usize) * (win_w.max(1) as usize) + wx.max(0) as usize) * 4;
+                    let wb = win.get(wi).copied().unwrap_or(0) as u32;
+                    let wg = win.get(wi + 1).copied().unwrap_or(0) as u32;
+                    let wr = win.get(wi + 2).copied().unwrap_or(0) as u32;
+                    let lb = snapshot[si] as u32;
+                    let lg = snapshot[si + 1] as u32;
+                    let lr = snapshot[si + 2] as u32;
+                    buf[di] = ((wb * (255 - a) + lb * a) / 255) as u8;
+                    buf[di + 1] = ((wg * (255 - a) + lg * a) / 255) as u8;
+                    buf[di + 2] = ((wr * (255 - a) + lr * a) / 255) as u8;
+                    buf[di + 3] = 255;
                 } else {
-                    (
-                        (x as f32 * win_w as f32 / w as f32) as i32,
-                        (y as f32 * win_h as f32 / h as f32) as i32,
-                    )
-                };
-                let wi = (wy.max(0) as usize * win_w.max(1) as usize + wx.max(0) as usize) * 4;
-                let wb = win.get(wi).copied().unwrap_or(0) as u32;
-                let wg = win.get(wi + 1).copied().unwrap_or(0) as u32;
-                let wr = win.get(wi + 2).copied().unwrap_or(0) as u32;
-                buf[di] = ((wb * a) / 255) as u8;
-                buf[di + 1] = ((wg * a) / 255) as u8;
-                buf[di + 2] = ((wr * a) / 255) as u8;
-                buf[di + 3] = a as u8;
+                    // 抓不到窗口画面时退回老行为：把下层快照按 alpha 贴上去
+                    buf[di] = ((snapshot[si] as u32 * a) / 255) as u8;
+                    buf[di + 1] = ((snapshot[si + 1] as u32 * a) / 255) as u8;
+                    buf[di + 2] = ((snapshot[si + 2] as u32 * a) / 255) as u8;
+                    buf[di + 3] = a as u8;
+                }
             } else {
                 buf[di] = 0;
                 buf[di + 1] = 0;
@@ -1892,7 +1866,7 @@ unsafe fn draw_visual(overlay: HWND) {
         }
     }
 
-    let pos = POINT { x: rx, y: ry };
+    let pos = POINT { x: rect.0, y: rect.1 };
     let size = SIZE { cx: w, cy: h };
     let src = POINT { x: 0, y: 0 };
     let blend = BLENDFUNCTION {
