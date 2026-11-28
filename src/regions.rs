@@ -1609,26 +1609,15 @@ unsafe fn follow_visual(overlay: HWND) {
         let _ = ShowWindow(overlay, SW_HIDE);
         return;
     }
-    // 遮挡判断：在洞里取一个采样点，看它现在属于谁。
-    // 注意：鼠标进洞时 enforce_at 会把目标窗口临时设成 WS_EX_TRANSPARENT，
-    // 这时 WindowFromPoint 会跳过目标、返回下层窗口——如果照常判断就会误以为"被挡住"，
-    // 表现就是鼠标一放上去洞就消失（复原）。所以"我们正在强制点透"时跳过遮挡判断。
-    let enforced = HOLE_STYLES
-        .lock()
-        .map(|s| s.iter().any(|h| *h == target))
-        .unwrap_or(false);
-    let covered = if enforced {
-        false
-    } else {
+    // 遮挡判断：按 z 序找洞里那一点最上面的外部窗口，不是目标就藏起覆盖层。
+    // （不能用 WindowFromPoint：我们自己的覆盖层是 topmost 且带 alpha，会命中它自己。）
+    let covered = {
         let regions = VS.with(|v| v.borrow().regions.clone());
         match hole_sample(&regions, cx, cy, cw, ch) {
-            Some((sx, sy)) => unsafe {
-                let hit = WindowFromPoint(POINT { x: sx, y: sy });
-                let root = GetAncestor(hit, GA_ROOT);
-                // 顶层不是目标窗口（也不是我们自己的覆盖层）就认为被挡住了：
-                // 主界面/悬浮球压上来时藏起来，别的窗口盖住时也藏。
-                root != hwnd && root != overlay
-            },
+            // 按 z 序找"洞里那一点最上面那扇不是我们自己的窗口"：
+            // 如果它不是目标窗口，说明目标被别的窗口压住了，覆盖层绝不能画上去
+            // （否则洞会盖在别的页面上面——用户看到的"穿透覆盖上层页面"）。
+            Some((sx, sy)) => unsafe { top_foreign_window_at(sx, sy) != target },
             None => false,
         }
     };
@@ -1651,6 +1640,33 @@ unsafe fn follow_visual(overlay: HWND) {
         SWP_NOACTIVATE | SWP_SHOWWINDOW,
     );
     let _ = ShowWindow(overlay, SW_SHOW);
+}
+
+/// 从 z 序最上面往下找：包含这一点的、不是我们进程的顶层窗口（忽略 shell/桌面）。
+unsafe fn top_foreign_window_at(x: i32, y: i32) -> isize {
+    let mut h = match GetTopWindow(HWND(std::ptr::null_mut())) {
+        Ok(h) => h,
+        Err(_) => return 0,
+    };
+    while !h.0.is_null() {
+        if !crate::is_own_hwnd(h) && !crate::is_shell_hwnd(h) {
+            let mut r = RECT::default();
+            if IsWindowVisible(h).as_bool()
+                && GetWindowRect(h, &mut r).is_ok()
+                && x >= r.left
+                && x < r.right
+                && y >= r.top
+                && y < r.bottom
+            {
+                return h.0 as isize;
+            }
+        }
+        h = match GetWindow(h, GW_HWNDNEXT) {
+            Ok(n) => n,
+            Err(_) => return 0,
+        };
+    }
+    0
 }
 
 /// 在洞里找一个采样点（屏幕坐标），用于判断洞有没有被别的窗口压住。
