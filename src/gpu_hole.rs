@@ -197,11 +197,13 @@ unsafe fn apply(hwnd: HWND) {
 
     // 取下层窗口：从 z 序最上面往下找"包含洞里采样点、不是目标/不是我们进程"的窗口
     let sample = sample_point(&req.polys, cx, cy, cw, ch);
-    let source = match sample {
-        Some((sx, sy)) => lower_window_at(sx, sy, req.target),
-        None => 0,
+    let (source, below) = match sample {
+        Some((sx, sy)) => (lower_window_at(sx, sy, req.target), top_foreign_at(sx, sy)),
+        None => (0, 0),
     };
-    if source == 0 {
+    // 层数遮盖：洞里那一点最上面的外部窗口必须就是目标本身，
+    // 否则说明目标被别的页面盖住了，覆盖层不能画上去
+    if below != req.target || source == 0 {
         hide_now(hwnd);
         return;
     }
@@ -331,6 +333,32 @@ unsafe fn lower_window_at(x: i32, y: i32, target: isize) -> isize {
                 && y < r.bottom
             {
                 return hwnd_val;
+            }
+        }
+        h = match GetWindow(h, GW_HWNDNEXT) {
+            Ok(n) => n,
+            Err(_) => return 0,
+        };
+    }
+    0
+}
+
+unsafe fn top_foreign_at(x: i32, y: i32) -> isize {
+    let mut h = match GetTopWindow(HWND(std::ptr::null_mut())) {
+        Ok(h) => h,
+        Err(_) => return 0,
+    };
+    while !h.0.is_null() {
+        if !crate::is_own_hwnd(h) && !crate::is_shell_hwnd(h) {
+            let mut r = RECT::default();
+            if IsWindowVisible(h).as_bool()
+                && GetWindowRect(h, &mut r).is_ok()
+                && x >= r.left
+                && x < r.right
+                && y >= r.top
+                && y < r.bottom
+            {
+                return h.0 as isize;
             }
         }
         h = match GetWindow(h, GW_HWNDNEXT) {
