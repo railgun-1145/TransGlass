@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.22.3**
+> 归档时间：2026-11-28　·　对应版本：**v2.22.4**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.22.3** |
+| 当前版本 | **v2.22.4** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -132,6 +132,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.22.1 | **透明度宽容度放宽**：CPU 回退路径的下层 alpha 封顶从 178（70%）提到 242（95%），洞里最多透出 95%、窗口画面保底 5%；GPU 路径（矩形洞）本来就是 0–100% 全区间。同时将「新功能/大改动前先查类似项目成功案例」写进 STATE.md 开发规则 |
 | 2.22.2 | **透明度拉满 = 完全看穿**：CPU 回退路径去掉封顶（去 95% 上限），100% 时洞里完全是下层画面；GPU 矩形洞本来就是 0–100% |
 | 2.22.3 | **视觉洞诊断日志**：follow_visual 在状态变化时向 hilite.log 写 `vis t=... masks=... op=... win=... gpu=...`，用于定位「拉到 100% 也没效果」 |
+| 2.22.4 | **GPU 实时洞属性量级错了**：`DWM_THUMBNAIL_PROPERTIES.opacity` 是 0–255，之前直接把 0–100 的滑块值传进去 → 滑块 100% 实际只有 39% 不透明，40% 只有 16%，所以「效果微乎其微」。修正为 `opacity * 255 / 100` |
 
 ---
 
@@ -290,6 +291,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.22.1 | `dist\installer\TransGlass_2.22.1_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.22.1.zip` | ✅ |
 | v2.22.2 | `dist\installer\TransGlass_2.22.2_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.22.2.zip` | ✅ |
 | v2.22.3 | `dist\installer\TransGlass_2.22.3_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.22.3.zip` | ✅ |
+| v2.22.4 | `dist\installer\TransGlass_2.22.4_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.22.4.zip` | ✅ |
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
 ---

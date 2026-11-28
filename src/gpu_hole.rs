@@ -230,7 +230,7 @@ unsafe fn apply(hwnd: HWND) {
             bottom: sr.bottom - t,
         },
         rcSource: RECT::default(),
-        opacity: req.opacity,
+        opacity: (req.opacity as u32 * 255 / 100) as u8,
         fVisible: TRUE,
         fSourceClientAreaOnly: FALSE,
     };
