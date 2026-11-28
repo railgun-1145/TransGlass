@@ -42,6 +42,8 @@ pub struct Region {
 
 static REGIONS: Mutex<Vec<(isize, Vec<Region>)>> = Mutex::new(Vec::new());
 static HOLE_STYLES: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+/// 这些窗口的 LAYERED 是我们在洞内临时补的，离开洞时要撤掉。
+static HOLE_LAYERED: Mutex<Vec<isize>> = Mutex::new(Vec::new());
 
 static INIT: Once = Once::new();
 static EDITOR_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -267,9 +269,20 @@ fn clear_hole_style(hwnd: isize) {
             hit = true;
         }
     }
+    let added_layered = HOLE_LAYERED
+        .lock()
+        .map(|mut v| {
+            if let Some(pos) = v.iter().position(|h| *h == hwnd) {
+                v.remove(pos);
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false);
     if hit && !crate::window_passthrough_active(hwnd) {
         unsafe {
-            crate::set_hwnd_mouse_transparent(HWND(hwnd as *mut _), false);
+            crate::remove_hole_passthrough(HWND(hwnd as *mut _), added_layered);
         }
     }
 }
@@ -282,6 +295,21 @@ pub fn enforce_at(x: i32, y: i32) {
     let Ok(map) = REGIONS.lock() else { return };
     let Ok(mut styles) = HOLE_STYLES.lock() else { return };
 
+    // 取走「LAYERED 是我们加的」标记
+    let take_layered = |h: isize| -> bool {
+        HOLE_LAYERED
+            .lock()
+            .map(|mut v| {
+                if let Some(pos) = v.iter().position(|x| *x == h) {
+                    v.remove(pos);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false)
+    };
+
     for (hwnd_val, regions) in map.iter() {
         let hwnd = HWND(*hwnd_val as *mut _);
         let tracked = styles.contains(hwnd_val);
@@ -292,6 +320,12 @@ pub fn enforce_at(x: i32, y: i32) {
             if tracked {
                 styles.retain(|h| h != hwnd_val);
             }
+            let added = take_layered(*hwnd_val);
+            if tracked || added {
+                unsafe {
+                    crate::remove_hole_passthrough(hwnd, added);
+                }
+            }
             continue;
         }
 
@@ -301,8 +335,11 @@ pub fn enforce_at(x: i32, y: i32) {
         if !valid {
             if tracked {
                 styles.retain(|h| h != hwnd_val);
+            }
+            let added = take_layered(*hwnd_val);
+            if tracked || added {
                 unsafe {
-                    crate::set_hwnd_mouse_transparent(hwnd, false);
+                    crate::remove_hole_passthrough(hwnd, added);
                 }
             }
             continue;
@@ -311,8 +348,11 @@ pub fn enforce_at(x: i32, y: i32) {
         let Some((cx, cy, w, h)) = (unsafe { client_screen_rect(hwnd) }) else {
             if tracked {
                 styles.retain(|h| h != hwnd_val);
+            }
+            let added = take_layered(*hwnd_val);
+            if tracked || added {
                 unsafe {
-                    crate::set_hwnd_mouse_transparent(hwnd, false);
+                    crate::remove_hole_passthrough(hwnd, added);
                 }
             }
             continue;
@@ -326,18 +366,43 @@ pub fn enforce_at(x: i32, y: i32) {
 
         if inside {
             if !tracked {
-                unsafe {
-                    crate::set_hwnd_mouse_transparent(hwnd, true);
+                // WS_EX_TRANSPARENT 只有在 layered 窗口上才真的让鼠标穿过去
+                let added = unsafe { crate::add_hole_passthrough(hwnd) };
+                if added {
+                    if let Ok(mut v) = HOLE_LAYERED.lock() {
+                        v.push(*hwnd_val);
+                    }
                 }
                 styles.push(*hwnd_val);
             }
         } else if tracked {
             styles.retain(|h| h != hwnd_val);
+            let added = take_layered(*hwnd_val);
             unsafe {
-                crate::set_hwnd_mouse_transparent(hwnd, false);
+                crate::remove_hole_passthrough(hwnd, added);
             }
         }
     }
+}
+
+/// 鼠标点是不是落在某个蒙版的洞里——洞里点击是"穿到下层"的，不应该把控制目标切过去。
+pub fn hole_at(x: i32, y: i32) -> bool {
+    let Ok(map) = REGIONS.lock() else { return false };
+    for (hwnd_val, regions) in map.iter() {
+        let hwnd = HWND(*hwnd_val as *mut _);
+        let Some((cx, cy, w, h)) = (unsafe { client_screen_rect(hwnd) }) else {
+            continue;
+        };
+        if w <= 0 || h <= 0 || x < cx || y < cy || x >= cx + w || y >= cy + h {
+            continue;
+        }
+        let nx = (x - cx) as f32 / w as f32;
+        let ny = (y - cy) as f32 / h as f32;
+        if regions.iter().any(|r| region_contains(r, nx, ny)) {
+            return true;
+        }
+    }
+    false
 }
 
 fn region_contains(r: &Region, x: f32, y: f32) -> bool {

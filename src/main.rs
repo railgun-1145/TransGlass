@@ -417,13 +417,15 @@ fn spawn_device_tracking_ticker() {
             }
         }
         unsafe {
-            let fg = GetForegroundWindow();
-            if !fg.0.is_null() && !is_own_hwnd(fg) && !is_shell_hwnd(fg) {
-                // 只有目标真变了才弹气泡：之前这里每 150ms 无条件 ball_bubble()，
-                // 气泡时间戳一直被重置，1.8s 渐隐永远走不到（旧版 3.2s 也长到看不出来）。
-                let v = fg.0 as isize;
-                if TARGET_HWND.swap(v, Ordering::Relaxed) != v {
-                    ball_bubble();
+            if !FOLLOW_SUPPRESSED.load(Ordering::Relaxed) {
+                let fg = GetForegroundWindow();
+                if !fg.0.is_null() && !is_own_hwnd(fg) && !is_shell_hwnd(fg) {
+                    // 只有目标真变了才弹气泡：之前这里每 150ms 无条件 ball_bubble()，
+                    // 气泡时间戳一直被重置，1.8s 渐隐永远走不到（旧版 3.2s 也长到看不出来）。
+                    let v = fg.0 as isize;
+                    if TARGET_HWND.swap(v, Ordering::Relaxed) != v {
+                        ball_bubble();
+                    }
                 }
             }
         }
@@ -605,6 +607,59 @@ pub(crate) unsafe fn set_hwnd_mouse_transparent(hwnd: HWND, enabled: bool) {
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER,
     );
+}
+
+/// 洞内临时点透：`WS_EX_TRANSPARENT` 只有窗口本身是 layered 时才会真的让鼠标穿到下层。
+/// 没 layered 的窗口先补 `WS_EX_LAYERED` + `SetLayeredWindowAttributes`（保持它当前的 alpha）。
+/// 返回 true 表示 LAYERED 是我们加的，离开洞时要撤掉。
+pub(crate) unsafe fn add_hole_passthrough(hwnd: HWND) -> bool {
+    let cur = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    let v = hwnd.0 as isize;
+    let alpha = GLOBAL_REGISTRY
+        .get(&v)
+        .map(|s| s.current_alpha)
+        .unwrap_or(255);
+    let mut added = false;
+    if (cur & WS_EX_LAYERED.0) == 0 {
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, (cur | WS_EX_LAYERED.0) as i32);
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+        added = true;
+    }
+    let cur2 = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if (cur2 & WS_EX_TRANSPARENT.0) == 0 {
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, (cur2 | WS_EX_TRANSPARENT.0) as i32);
+    }
+    let _ = SetWindowPos(
+        hwnd,
+        HWND(0 as *mut _),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER,
+    );
+    added
+}
+
+/// 离开洞：撤掉临时点透；`added_layered` = 进入时是不是我们补的 LAYERED。
+pub(crate) unsafe fn remove_hole_passthrough(hwnd: HWND, added_layered: bool) {
+    let cur = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    let mut next = cur & !WS_EX_TRANSPARENT.0;
+    if added_layered {
+        next &= !WS_EX_LAYERED.0;
+    }
+    if next != cur {
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, next as i32);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND(0 as *mut _),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER,
+        );
+    }
 }
 
 /// 这个窗口现在是不是"整窗点透"（鼠标或笔任一开）——点透选区在这种窗口上不生效。
@@ -931,8 +986,12 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
         // 记录"最后点过的非自身窗口"，供悬浮球当遥控目标
         if msg == WM_LBUTTONDOWN {
-            if let Some(root) = hit_root_at_fresh(info.pt.x, info.pt.y) {
+            // 洞里点击是穿到下层窗口的操作，不要把控制目标切到下层去
+            if crate::regions::hole_at(info.pt.x, info.pt.y) {
+                FOLLOW_SUPPRESSED.store(true, Ordering::Relaxed);
+            } else if let Some(root) = hit_root_at_fresh(info.pt.x, info.pt.y) {
                 if !is_own_hwnd(root) && !is_shell_hwnd(root) {
+                    FOLLOW_SUPPRESSED.store(false, Ordering::Relaxed);
                     TARGET_HWND.store(root.0 as isize, Ordering::Relaxed);
                     ball_bubble();
                     ball_mark_dirty();
@@ -5458,6 +5517,9 @@ static BUBBLE_HWND: AtomicIsize = AtomicIsize::new(0);
 static BUBBLE_SHOWN_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 /// 最后一次点击命中的（非自身的）窗口，悬浮球遥控的目标
 static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 洞里点击是"穿透到下层"的操作，别让 ticker 把控制目标跟到下层窗口去；
+/// 下一次在洞外点击（会显式设置目标）时解除。
+static FOLLOW_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 static BALL_EXPANDED: AtomicBool = AtomicBool::new(false);
 static BALL_ANIM: AtomicU32 = AtomicU32::new(0);
 static BALL_CURSOR: AtomicU64 = AtomicU64::new(0);
