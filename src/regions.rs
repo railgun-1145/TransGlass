@@ -1927,7 +1927,7 @@ unsafe fn draw_visual(overlay: HWND) {
             let sx = rx + x - origin.0;
             if alpha > 0 && sx >= 0 && sy >= 0 && sx < sw && sy < sh {
                 // 下层最多压到 70%，保住至少 30% 的窗口画面：透明度拉满也是"半透明"，不会真消失
-                let a = ((alpha * 255 / 100) as u32).min(242);
+                let a = (alpha * 255 / 100) as u32;
                 let si = ((sy as usize) * (sw as usize) + sx as usize) * 4;
                 if let Some(win) = &win_snap {
                     // 窗口自己的画面按 (1-透明度) 与下层混合，结果完全不透明：
