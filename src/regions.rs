@@ -1593,9 +1593,16 @@ unsafe fn follow_visual(overlay: HWND) {
         return;
     }
     // 遮挡判断：在洞里取一个采样点，看它现在属于谁。
-    // 只要洞的位置没被别的窗口压住（目标自己是顶层，或只是我们自己的窗口在上面），就显示；
-    // 这样「选择别的窗口」不会让洞突然消失，拖动主界面压上去时也会正确隐藏。
-    let covered = {
+    // 注意：鼠标进洞时 enforce_at 会把目标窗口临时设成 WS_EX_TRANSPARENT，
+    // 这时 WindowFromPoint 会跳过目标、返回下层窗口——如果照常判断就会误以为"被挡住"，
+    // 表现就是鼠标一放上去洞就消失（复原）。所以"我们正在强制点透"时跳过遮挡判断。
+    let enforced = HOLE_STYLES
+        .lock()
+        .map(|s| s.iter().any(|h| *h == target))
+        .unwrap_or(false);
+    let covered = if enforced {
+        false
+    } else {
         let regions = VS.with(|v| v.borrow().regions.clone());
         match hole_sample(&regions, cx, cy, cw, ch) {
             Some((sx, sy)) => unsafe {
