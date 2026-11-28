@@ -203,6 +203,27 @@ fn apply_regions(hwnd: isize, regions: Vec<Region>, wait: bool) {
 
 /// 所有有蒙版的窗口（hwnd, 数量），面板用来显示"其他窗口的蒙版"。
 /// 某个窗口第 idx 个蒙版的透明度（0–100），供悬浮球面板读取。
+/// 坐标落在哪个窗口的第几个蒙版里（用于点洞同步悬浮球目标）。
+pub fn mask_at(x: i32, y: i32) -> Option<(isize, usize)> {
+    let map = REGIONS.lock().ok()?;
+    for (hwnd_val, regions) in map.iter() {
+        let Some((cx, cy, w, h)) = (unsafe { client_screen_rect(HWND(*hwnd_val as *mut _)) }) else {
+            continue;
+        };
+        if w <= 0 || h <= 0 || x < cx || y < cy || x >= cx + w || y >= cy + h {
+            continue;
+        }
+        let nx = (x - cx) as f32 / w as f32;
+        let ny = (y - cy) as f32 / h as f32;
+        for (i, r) in regions.iter().enumerate() {
+            if r.enabled && region_contains(r, nx, ny) {
+                return Some((*hwnd_val, i));
+            }
+        }
+    }
+    None
+}
+
 pub fn mask_opacity(hwnd: isize, idx: usize) -> Option<u8> {
     REGIONS
         .lock()
@@ -247,7 +268,11 @@ pub fn update_region(
             }
         }
     }
-    clear_hole_style(hwnd);
+    // 只改透明度时不能清掉穿透样式：每一步清一次、鼠标钩再补回去，
+    // 滑条拖起来就一卡一卡的（尤其是悬浮球滑条）。几何/开关变了才需要重置。
+    if invert.is_some() || enabled.is_some() {
+        clear_hole_style(hwnd);
+    }
     // 透明度归 0 时只重画 mask（全透明 + follow_visual 会把覆盖层藏起来），
     // 保留已抓的下层快照，之后拉回透明度不用重抓。
     refresh_visual_mask();

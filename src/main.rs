@@ -987,13 +987,24 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         let info = *(lparam.0 as *const MSLLHOOKSTRUCT);
         // 记录"最后点过的非自身窗口"，供悬浮球当遥控目标
         if msg == WM_LBUTTONDOWN {
-            // 洞里点击是穿到下层窗口的操作，不要把控制目标切到下层去
-            if crate::regions::hole_at(info.pt.x, info.pt.y) {
+            // 点在蒙版里 → 目标切到这个窗口 + 悬浮球切到这个蒙版；
+            // 点在蒙版外的窗口上 → 悬浮球回到整窗口。
+            // 实现上洞里的点击仍然会穿到下层，这里只是记录控制目标。
+            if let Some((mh, idx)) = crate::regions::mask_at(info.pt.x, info.pt.y) {
+                FOLLOW_SUPPRESSED.store(false, Ordering::Relaxed);
+                TARGET_HWND.store(mh, Ordering::Relaxed);
+                BALL_ADJ_MODE.store((idx + 1) as isize, Ordering::Relaxed);
+                ball_bubble();
+                ball_mark_dirty();
+                log_hilite(&format!("target={mh} mask={}", idx + 1));
+            } else if crate::regions::hole_at(info.pt.x, info.pt.y) {
+                // 洞里点击是穿到下层窗口的操作，不要把控制目标切到下层去
                 FOLLOW_SUPPRESSED.store(true, Ordering::Relaxed);
             } else if let Some(root) = hit_root_at_fresh(info.pt.x, info.pt.y) {
                 if !is_own_hwnd(root) && !is_shell_hwnd(root) {
                     FOLLOW_SUPPRESSED.store(false, Ordering::Relaxed);
                     TARGET_HWND.store(root.0 as isize, Ordering::Relaxed);
+                    BALL_ADJ_MODE.store(0, Ordering::Relaxed);
                     ball_bubble();
                     ball_mark_dirty();
                     log_hilite(&format!("target={:?}", root.0));

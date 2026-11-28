@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.23.4**
+> 归档时间：2026-11-28　·　对应版本：**v2.24.0**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.23.4** |
+| 当前版本 | **v2.24.0** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -138,6 +138,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.23.2 | **洞里悬停转圈**：鼠标钩里每条消息都跑 `enforce_at`（锁 REGIONS/HOLE_STYLES + 跨进程 SetWindowLong），悬停时很贵。现在同点重复直接跳过、限到 ~60Hz；GPU 小窗口增加 WM_SETCURSOR 固定箭头，不再变等待光标 |
 | 2.23.3 | **面板点蒙版同步到悬浮球**：之前只有悬浮球目标行能切模式，面板蒙版列表点选只改 `ps_selected`。现在面板里点中第 i 个蒙版会同步 `BALL_ADJ_MODE=i+1` + `set_target_window(target)`，悬浮球滑条直接调它；蒙版删完会把超出的模式降回整窗口 |
 | 2.23.4 | **蒙版列表增加 ⇄ 按钮 + 提示**：之前点蒙版只有小预览/名字两个点可选，点别处不会同步悬浮球。现在每行加一个 `⇄` 按钮（同步目标 + 让悬浮球调这个蒙版），并在列表上方加一行提示 |
+| 2.24.0 | **点洞选蒙版 / 点外选窗口 + 滑条跟手**：鼠标左键落在某个蒙版里 → `TARGET_HWND` 切到该窗口 + `BALL_ADJ_MODE=idx+1`（悬浮球直接调该蒙版）；点在蒙版外 → 整窗口模式。`update_region` 仅改透明度时不再 `clear_hole_style`（之前每步清掉穿透样式、鼠标钩再补回，拖动一卡一卡） |
 
 ---
 
@@ -302,6 +303,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.23.2 | `dist\installer\TransGlass_2.23.2_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.23.2.zip` | ✅ |
 | v2.23.3 | `dist\installer\TransGlass_2.23.3_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.23.3.zip` | ✅ |
 | v2.23.4 | `dist\installer\TransGlass_2.23.4_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.23.4.zip` | ✅ |
+| v2.24.0 | `dist\installer\TransGlass_2.24.0_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.24.0.zip` | ✅ |
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
 ---
