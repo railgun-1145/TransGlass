@@ -1570,6 +1570,8 @@ unsafe fn restore_window(hwnd: HWND) {
 }
 
 unsafe fn restore_all_windows() {
+    // 先把挖过洞的窗口恢复成矩形，否则退出后窗口会留着一个洞
+    crate::regions::restore_all_holes();
     let hwnds: Vec<isize> = GLOBAL_REGISTRY.iter().map(|kv| *kv.key()).collect();
     for hwnd_val in hwnds {
         restore_window(HWND(hwnd_val as *mut _));
