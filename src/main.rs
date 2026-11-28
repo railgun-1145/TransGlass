@@ -1382,15 +1382,21 @@ unsafe fn apply_transparency_to_hwnd(
     } else {
         HWND_NOTOPMOST
     };
-    let _ = SetWindowPos(
-        hwnd,
-        pos,
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS | SWP_FRAMECHANGED,
-    );
+    // 只在样式/置顶真的变了才动窗口：每步都 SetWindowPos(FRAMECHANGED) 会让
+    // 被调窗口重算边框、闪一下（滑条连续拖动时特别明显）。
+    let now_topmost = (current_style & WS_EX_TOPMOST.0) != 0;
+    let need_pos = next_style != current_style || now_topmost != topmost;
+    if need_pos {
+        let _ = SetWindowPos(
+            hwnd,
+            pos,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS | SWP_FRAMECHANGED,
+        );
+    }
     Ok(())
 }
 
@@ -2439,20 +2445,31 @@ impl TransGlassApp {
                             }
                         }
                         ui.add_space(6.0);
-                        ui.add(
-                            egui::Label::new({
-                                let app = unsafe { cached_app_name(HWND(hwnd as *mut _)) };
-                                let text = if app.is_empty() {
-                                    title.to_string()
-                                } else {
-                                    format!("【{app}】 {title}")
-                                };
-                                egui::RichText::new(text)
-                                    .font(font_title(14.0))
-                                    .color(TEXT_PRIMARY)
-                            })
-                            .truncate(),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new({
+                                    let app = unsafe { cached_app_name(HWND(hwnd as *mut _)) };
+                                    let text = if app.is_empty() {
+                                        title.to_string()
+                                    } else {
+                                        format!("【{app}】 {title}")
+                                    };
+                                    egui::RichText::new(text)
+                                        .font(font_title(14.0))
+                                        .color(TEXT_PRIMARY)
+                                })
+                                .truncate(),
+                            );
+                            // 已经配了洞/蒙版的窗口给个绿标，一眼区分哪些「已调节」
+                            let n_masks = crate::regions::count(hwnd);
+                            if n_masks > 0 {
+                                ui.label(
+                                    egui::RichText::new(format!("● 蒙版 {n_masks}"))
+                                        .small()
+                                        .color(ACCENT),
+                                );
+                            }
+                        });
                         let mut badges = String::new();
                         match managed {
                             Some((a, top, m, p)) => {
@@ -5632,6 +5649,8 @@ static BALL_MOVED: AtomicBool = AtomicBool::new(false);
 static BALL_HOVER: AtomicU8 = AtomicU8::new(0);
 /// 正在拖透明度滑条
 static BALL_SLIDER_DRAG: AtomicBool = AtomicBool::new(false);
+/// 悬浮球滑条当前调谁：0 = 整窗口，1..n = 第 n 个蒙版
+static BALL_ADJ_MODE: AtomicIsize = AtomicIsize::new(0);
 /// 悬浮球当前是否显示（设置里可开关）
 static BALL_SHOWN: AtomicBool = AtomicBool::new(true);
 /// 双击纸娃娃打开主界面（设置里可关）
@@ -6296,9 +6315,17 @@ unsafe fn ball_render() {
             if h.0.is_null() {
                 "未选中窗口".to_string()
             } else {
-                // 只显示"是什么软件"，用【】框起来
                 let app = cached_app_name(h);
-                if app.is_empty() {
+                let mask_n = crate::regions::count(h.0 as isize);
+                let mode = BALL_ADJ_MODE.load(Ordering::Relaxed).min(mask_n as isize);
+                // 点这一行可在「整窗口」和「蒙版1..N」之间循环，滑条跟着变
+                if mode > 0 {
+                    let op = crate::regions::mask_opacity(h.0 as isize, (mode - 1) as usize)
+                        .unwrap_or(0);
+                    format!("蒙版{mode} {op}%")
+                } else if mask_n > 0 {
+                    format!("【{app}】蒙版{mask_n}")
+                } else if app.is_empty() {
                     "未选中窗口".to_string()
                 } else {
                     format!("【{app}】")
@@ -6446,6 +6473,10 @@ unsafe fn ball_hit(x: i32, y: i32) -> u8 {
         if x >= s.0 && y >= s.1 && x < s.2 && y < s.3 {
             return 5; // 透明度滑条
         }
+        let tr = p.target_row;
+        if x >= tr.0 && y >= tr.1 && x < tr.2 && y < tr.3 {
+            return 12; // 点目标行：切换滑条调「窗口」还是「蒙版 N」
+        }
     }
     0
 }
@@ -6457,11 +6488,18 @@ unsafe fn slider_apply(x: i32) {
     let (x0, _, _, _) = p.slider;
     let travel = slider_travel(p.slider);
     let v = ((x - x0 - 16) as f32 / travel).clamp(0.0, 1.0);
-    let alpha = (255.0 - v * 215.0).round().clamp(40.0, 255.0) as u8;
     let target = ball_target();
     if target.0.is_null() {
         return;
     }
+    let mode = BALL_ADJ_MODE.load(Ordering::Relaxed);
+    let mask_n = crate::regions::count(target.0 as isize) as isize;
+    if mode > 0 && mode <= mask_n {
+        let op = (v * 100.0).round().clamp(0.0, 100.0) as u8;
+        crate::regions::update_region(target.0 as isize, (mode - 1) as usize, None, Some(op), None);
+        return;
+    }
+    let alpha = (255.0 - v * 215.0).round().clamp(40.0, 255.0) as u8;
     ball_apply(target, BallAction::SetAlpha(alpha));
 }
 
@@ -6489,6 +6527,18 @@ unsafe extern "system" fn ball_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 let _ = SetCapture(hwnd);
                 slider_apply(x);
                 ball_render();
+                return LRESULT(0);
+            }
+            if hit == 12 {
+                // 切换滑条目标：整窗口 → 蒙版1 → … → 整窗口
+                let target = ball_target();
+                if !target.0.is_null() {
+                    let n = crate::regions::count(target.0 as isize) as isize;
+                    let cur = BALL_ADJ_MODE.load(Ordering::Relaxed);
+                    let next = if cur >= n { 0 } else { cur + 1 };
+                    BALL_ADJ_MODE.store(next, Ordering::Relaxed);
+                    ball_render();
+                }
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, w, l)
@@ -7096,6 +7146,12 @@ unsafe fn ball_apply(target: HWND, action: BallAction) {
             let _ = apply_transparency_to_hwnd(target, alpha, top, on, on);
         }
         BallAction::SetAlpha(want) => {
+            let mode = BALL_ADJ_MODE.load(Ordering::Relaxed);
+            if mode > 0 && mode <= crate::regions::count(target.0 as isize) as isize {
+                let op = ((255 - want) as u32 * 100 / 215).min(100) as u8;
+                crate::regions::update_region(target.0 as isize, (mode - 1) as usize, None, Some(op), None);
+                return;
+            }
             ensure_managed(target);
             let v = target.0 as isize;
             let (top, mouse, pen) = {

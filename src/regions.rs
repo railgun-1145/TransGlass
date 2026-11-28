@@ -202,6 +202,18 @@ fn apply_regions(hwnd: isize, regions: Vec<Region>, wait: bool) {
 }
 
 /// 所有有蒙版的窗口（hwnd, 数量），面板用来显示"其他窗口的蒙版"。
+/// 某个窗口第 idx 个蒙版的透明度（0–100），供悬浮球面板读取。
+pub fn mask_opacity(hwnd: isize, idx: usize) -> Option<u8> {
+    REGIONS
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(h, _)| *h == hwnd)?
+        .1
+        .get(idx)
+        .map(|r| r.opacity)
+}
+
 pub fn mask_windows() -> Vec<(isize, usize)> {
     REGIONS
         .lock()

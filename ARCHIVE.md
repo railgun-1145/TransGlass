@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.22.4**
+> 归档时间：2026-11-28　·　对应版本：**v2.23.0**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.22.4** |
+| 当前版本 | **v2.23.0** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -133,6 +133,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.22.2 | **透明度拉满 = 完全看穿**：CPU 回退路径去掉封顶（去 95% 上限），100% 时洞里完全是下层画面；GPU 矩形洞本来就是 0–100% |
 | 2.22.3 | **视觉洞诊断日志**：follow_visual 在状态变化时向 hilite.log 写 `vis t=... masks=... op=... win=... gpu=...`，用于定位「拉到 100% 也没效果」 |
 | 2.22.4 | **GPU 实时洞属性量级错了**：`DWM_THUMBNAIL_PROPERTIES.opacity` 是 0–255，之前直接把 0–100 的滑块值传进去 → 滑块 100% 实际只有 39% 不透明，40% 只有 16%，所以「效果微乎其微」。修正为 `opacity * 255 / 100` |
+| 2.23.0 | **悬浮球可调蒙版 + 已调节标记 + 抖动治理**：悬浮球面板点「目标行」循环切换滑条调「整窗口 ↔ 蒙版1..N」；主界面卡片对有蒙版的窗口加绿色「● 蒙版 N」标记；`apply_transparency_to_hwnd` 的 SetWindowPos（FRAMECHANGED）改成仅在样式/置顶真变时才调，减少拖滑条时的闪烁 |
 
 ---
 
@@ -292,6 +293,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.22.2 | `dist\installer\TransGlass_2.22.2_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.22.2.zip` | ✅ |
 | v2.22.3 | `dist\installer\TransGlass_2.22.3_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.22.3.zip` | ✅ |
 | v2.22.4 | `dist\installer\TransGlass_2.22.4_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.22.4.zip` | ✅ |
+| v2.23.0 | `dist\installer\TransGlass_2.23.0_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.23.0.zip` | ✅ |
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
 ---
