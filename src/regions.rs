@@ -1490,24 +1490,16 @@ unsafe fn capture_visual(overlay: HWND, target: isize) {
     // PrintWindow 兜底；此时目标窗口还没被任何样式/挖洞影响，截到的就是它真实的画面。
     let win_snap = capture_screen_client(cx, cy, w, h).or_else(|| capture_window_client(hwnd, w, h));
 
-    // 主界面也不能出现在洞里：抓下层快照前先把它藏起来，抓到干净的桌面/下层窗口。
-    // 只在主界面确实压在目标客户区上时才藏，避免目标窗口拖动时反复闪主界面。
+    // 主界面绝不能出现在洞里：抓下层快照前无条件藏起来（目标 hwnd 可能和面板里的不是同一个，
+    // 用"矩形相交"判断会漏掉，结果面板被拍进洞里、洞上浮出一块自己的 UI）。
     let root = crate::main_window_handle();
     let root_hwnd = HWND(root as *mut _);
     let mut main_hidden = false;
     let mut main_was_foreground = false;
     if root != 0 && IsWindowVisible(root_hwnd).as_bool() && !IsIconic(root_hwnd).as_bool() {
-        let mut rr = RECT::default();
-        if GetWindowRect(root_hwnd, &mut rr).is_ok()
-            && rr.left < cx + w
-            && rr.right > cx
-            && rr.top < cy + h
-            && rr.bottom > cy
-        {
-            main_was_foreground = GetForegroundWindow() == root_hwnd;
-            let _ = ShowWindow(root_hwnd, SW_HIDE);
-            main_hidden = true;
-        }
+        main_was_foreground = GetForegroundWindow() == root_hwnd;
+        let _ = ShowWindow(root_hwnd, SW_HIDE);
+        main_hidden = true;
     }
 
     // 抓整块虚拟屏幕，不只抓客户区：之后窗口拖动/缩放时直接从这张图里裁，

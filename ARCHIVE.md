@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.21.0**
+> 归档时间：2026-11-28　·　对应版本：**v2.21.1**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.21.0** |
+| 当前版本 | **v2.21.1** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -123,6 +123,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.20.3 | **洞不再盖到上层页面**：覆盖层的遮挡判断之前用 `WindowFromPoint`，会命中我们自己 topmost 的覆盖层（以为“目标没被挡”），于是洞会画在目标上方的其他窗口（DSH/微信）上面。改成按 z 序从最上面往下找「包含该点的、不是我们进程的窗口」，不是目标就藏起覆盖层——目标被别的页面盖住时不会再把洞画上去 |
 | 2.20.4 | **洞跟随提到 60fps**：视觉洞定时器 50ms → 16ms，拖动时覆盖层跟手很多，减少「留在原地的重影」；但下层画面仍是静态快照，窗口移到没截过的区域/下层变化时内容会旧——彻底解决要上 GPU 实时采集（DXGI Desktop Duplication / DWM 缩略图） |
 | 2.21.0 | **GPU 实时光洞（DWM 缩略图）**：新增 `gpu_hole` 模块——置顶无边框覆盖层 + `SetWindowRgn` 只留洞区 + `DwmRegisterThumbnail` 把**目标窗口下面那扇窗口**实时贴进洞里，透明度直接用缩略图 opacity，全部由 DWM 在 GPU 上合成（不再 CPU 逐像素）。缩略图注册失败/下层是桌面时自动回退到 2.20.4 的 CPU 快照方案 |
+| 2.21.1 | **洞里浮出自己的面板**：下层快照抓屏时只在「主界面矩形与目标客户区相交」时才藏主界面；但目标 hwnd 可能和面板显示的不是同一个（微信多窗口），相交判断漏掉，主界面被拍进快照，洞里就浮出一块 TransGlass 自己的 UI。改成抓快照前**无条件隐藏主界面** |
 
 ---
 
@@ -272,6 +273,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.20.3 | `dist\installer\TransGlass_2.20.3_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.20.3.zip` | ✅ |
 | v2.20.4 | `dist\installer\TransGlass_2.20.4_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.20.4.zip` | ✅ |
 | v2.21.0 | `dist\installer\TransGlass_2.21.0_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.21.0.zip` | ✅ |
+| v2.21.1 | `dist\installer\TransGlass_2.21.1_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.21.1.zip` | ✅ |
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
 ---
