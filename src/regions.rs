@@ -1404,7 +1404,7 @@ unsafe fn visual_thread() {
     };
     VISUAL_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
     // 50ms：拖动窗口时洞跟得更紧（内容按当前 rect 从整屏快照重裁，不重抓，所以不会闪）
-    SetTimer(hwnd, 1, 50, None);
+    SetTimer(hwnd, 1, 16, None);
 
     let mut msg = MSG::default();
     while GetMessageW(&mut msg, None, 0, 0).as_bool() {

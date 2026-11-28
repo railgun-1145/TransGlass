@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.20.3**
+> 归档时间：2026-11-28　·　对应版本：**v2.20.4**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.20.3** |
+| 当前版本 | **v2.20.4** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -121,6 +121,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.20.1 | **半透明不再"真消失"**：2.20.0 把透明度拉到 100% 时窗口画面整个消失（用户要的是"半透明"）。现在覆盖层在 0<透明度≤100 都显示，窗口画面**保底 30% 不透明度**——拉到 100% 也是"很透但还看得见上层"。另外窗口画面改用**屏幕截取**兜底（Chromium/KOOK 这类 PrintWindow 抓不到），并在挖洞前先抓，保证覆盖层有内容可叠 |
 | 2.20.2 | **回退挖洞，恢复半透明**：2.20.0/2.20.1 的 SetWindowRgn 在部分窗口（微信/Chromium）上要么不生效、要么把窗口画面挖没了，出现"有蒙版不显示"。恢复 2.19.9 的"窗口画面 + 下层快照"混合方案：窗口画面改成**屏幕截取**（Chromium/KOOK 也能抓到），下层最多压到 70%，窗口画面至少保留 30%——任何透明度下都是半透明，不会消失；0% 仍然只点透不改外观 |
 | 2.20.3 | **洞不再盖到上层页面**：覆盖层的遮挡判断之前用 `WindowFromPoint`，会命中我们自己 topmost 的覆盖层（以为“目标没被挡”），于是洞会画在目标上方的其他窗口（DSH/微信）上面。改成按 z 序从最上面往下找「包含该点的、不是我们进程的窗口」，不是目标就藏起覆盖层——目标被别的页面盖住时不会再把洞画上去 |
+| 2.20.4 | **洞跟随提到 60fps**：视觉洞定时器 50ms → 16ms，拖动时覆盖层跟手很多，减少「留在原地的重影」；但下层画面仍是静态快照，窗口移到没截过的区域/下层变化时内容会旧——彻底解决要上 GPU 实时采集（DXGI Desktop Duplication / DWM 缩略图） |
 
 ---
 
@@ -268,6 +269,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.20.1 | `dist\installer\TransGlass_2.20.1_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.20.1.zip` | ✅ |
 | v2.20.2 | `dist\installer\TransGlass_2.20.2_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.20.2.zip` | ✅ |
 | v2.20.3 | `dist\installer\TransGlass_2.20.3_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.20.3.zip` | ✅ |
+| v2.20.4 | `dist\installer\TransGlass_2.20.4_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.20.4.zip` | ✅ |
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
 ---
