@@ -1,6 +1,6 @@
 # TransGlass 项目归档 / 上下文总结
 
-> 归档时间：2026-11-28　·　对应版本：**v2.23.1**
+> 归档时间：2026-11-28　·　对应版本：**v2.23.2**
 > 这篇是给"人"和"AI 助手"共用的：换成新对话、换台机器，读完这份就能接上手。
 
 ---
@@ -13,7 +13,7 @@
 | 仓库 | <https://github.com/railgun-1145/TransGlass>（分支 `unified`，推送目标 `master`） |
 | 发布 | <https://github.com/railgun-1145/TransGlass/releases> |
 | 教程 | [docs/使用教程.md](docs/使用教程.md)（软件里「帮助」按钮直达） |
-| 当前版本 | **v2.23.1** |
+| 当前版本 | **v2.23.2** |
 | 技术栈 | Rust 1.94 + eframe/egui 0.28 + tray-icon 0.19 + windows 0.58 + image 0.25 |
 | 形态 | 单 exe、免登录、本地运行；Inno Setup 安装包（安装路径可选） |
 | 部署目录 | `E:\新建文件夹\TransGlass\`（开发机上的实际运行位置） |
@@ -135,6 +135,7 @@ skins/*.png      9 个皮肤（alex/ari/efe/kai/makena/noor/steve/sunny/zuri）
 | 2.22.4 | **GPU 实时洞属性量级错了**：`DWM_THUMBNAIL_PROPERTIES.opacity` 是 0–255，之前直接把 0–100 的滑块值传进去 → 滑块 100% 实际只有 39% 不透明，40% 只有 16%，所以「效果微乎其微」。修正为 `opacity * 255 / 100` |
 | 2.23.0 | **悬浮球可调蒙版 + 已调节标记 + 抖动治理**：悬浮球面板点「目标行」循环切换滑条调「整窗口 ↔ 蒙版1..N」；主界面卡片对有蒙版的窗口加绿色「● 蒙版 N」标记；`apply_transparency_to_hwnd` 的 SetWindowPos（FRAMECHANGED）改成仅在样式/置顶真变时才调，减少拖滑条时的闪烁 |
 | 2.23.1 | **悬浮球「窗口/蒙版」标签澄清 + 目标行点击优先**：之前目标行显示「【app】蒙版N」只是提示数量，用户以为是蒙版模式；现在 mode=0 显示「【app】窗口」、mode>0 显示「【app】蒙版n」，滑块位置也跟蒙版透明度；目标行命中提到球体之前，面板压住球时也能点到 |
+| 2.23.2 | **洞里悬停转圈**：鼠标钩里每条消息都跑 `enforce_at`（锁 REGIONS/HOLE_STYLES + 跨进程 SetWindowLong），悬停时很贵。现在同点重复直接跳过、限到 ~60Hz；GPU 小窗口增加 WM_SETCURSOR 固定箭头，不再变等待光标 |
 
 ---
 
@@ -296,6 +297,7 @@ gh release create v<版本> "dist\installer\TransGlass_<版本>_Setup.exe" "D:\T
 | v2.22.4 | `dist\installer\TransGlass_2.22.4_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.22.4.zip` | ✅ |
 | v2.23.0 | `dist\installer\TransGlass_2.23.0_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.23.0.zip` | ✅ |
 | v2.23.1 | `dist\installer\TransGlass_2.23.1_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.23.1.zip` | ✅ |
+| v2.23.2 | `dist\installer\TransGlass_2.23.2_Setup.exe` | `D:\TransGlass-dist\TransGlass_2.23.2.zip` | ✅ |
 > 爱发电没有上传 API，需要人工把同一个 `TransGlass_<版本>.zip` 传上去。
 
 ---

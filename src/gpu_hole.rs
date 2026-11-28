@@ -132,6 +132,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             let _ = EndPaint(hwnd, &PAINTSTRUCT::default());
             LRESULT(0)
         }
+        WM_SETCURSOR => {
+            // 光标上去不能变成「转圈/等待」：固定给箭头
+            if let Ok(cur) = LoadCursorW(None, IDC_ARROW) {
+                let _ = SetCursor(cur);
+            }
+            LRESULT(1)
+        }
         WM_TIMER => {
             apply(hwnd);
             LRESULT(0)

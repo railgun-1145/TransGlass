@@ -310,6 +310,25 @@ fn clear_hole_style(hwnd: isize) {
 }
 
 pub fn enforce_at(x: i32, y: i32) {
+    // 鼠标钩里每条消息都跑这个很贵：同一个点重复来就直接跳过，
+    // 并且限制到 ~60Hz，免得转圈/卡顿。洞状态只会在进出洞时变。
+    {
+        static LAST: std::sync::OnceLock<Mutex<(i32, i32, std::time::Instant)>> =
+            std::sync::OnceLock::new();
+        let Ok(mut last) = LAST
+            .get_or_init(|| Mutex::new((i32::MIN, i32::MIN, std::time::Instant::now())))
+            .lock()
+        else {
+            return;
+        };
+        if last.0 == x && last.1 == y {
+            return;
+        }
+        if last.2.elapsed().as_millis() < 16 {
+            return;
+        }
+        *last = (x, y, std::time::Instant::now());
+    }
     let has_any = REGIONS.lock().map(|v| !v.is_empty()).unwrap_or(false);
     if !has_any {
         return;
